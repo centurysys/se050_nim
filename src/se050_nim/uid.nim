@@ -17,6 +17,8 @@
 
 import ./errors
 import ./transport
+import ./apdu
+import ./tlv
 
 # =============================================================================
 # Constants
@@ -27,18 +29,7 @@ const
 
   Se050UniqueIdObjectId* = 0x7FFF0206'u32
 
-  SwSuccess = 0x9000'u16
-
   Tag1 = 0x41'u8
-
-  SelectAppletApdu*: array[22, uint8] = [
-    0x00'u8, 0xA4'u8, 0x04'u8, 0x00'u8, 0x10'u8,
-    0xA0'u8, 0x00'u8, 0x00'u8, 0x03'u8,
-    0x96'u8, 0x54'u8, 0x53'u8, 0x00'u8,
-    0x00'u8, 0x00'u8, 0x01'u8, 0x03'u8,
-    0x00'u8, 0x00'u8, 0x00'u8, 0x00'u8,
-    0x00'u8
-  ]
 
   ReadUidObjectApdu*: array[20, uint8] = [
     0x80'u8, 0x02'u8, 0x00'u8, 0x00'u8, 0x0E'u8,
@@ -76,87 +67,6 @@ proc uidToHex*(uid: openArray[uint8], separator: string = ""): string =
     if i > 0:
       result.add(separator)
     result.add(hexByte(b))
-
-# --------------------------------------------------------------------------------
-# Internal:
-# --------------------------------------------------------------------------------
-
-proc statusWord(response: openArray[uint8]): SE[uint16] =
-  if response.len < 2:
-    return fail[uint16](seInvalidResponse, "APDU response is too short")
-
-  let sw1 = uint16(response[response.len - 2])
-  let sw2 = uint16(response[response.len - 1])
-  result = ok((sw1 shl 8) or sw2)
-
-# --------------------------------------------------------------------------------
-# Internal:
-# --------------------------------------------------------------------------------
-
-proc checkStatus(response: openArray[uint8], context: string): SE[void] =
-  let sw = statusWord(response)
-  if not sw.ok:
-    return fail[void](sw.error.kind, sw.error.message, sw.error.sw)
-
-  if sw.value != SwSuccess:
-    return fail[void](
-      seApduStatusError,
-      context & " failed",
-      sw.value
-    )
-
-  result = ok()
-
-# --------------------------------------------------------------------------------
-# Internal:
-# --------------------------------------------------------------------------------
-
-proc dataWithoutStatus(response: openArray[uint8]): SE[seq[uint8]] =
-  if response.len < 2:
-    return fail[seq[uint8]](seInvalidResponse, "APDU response is too short")
-
-  result = ok(@response[0 ..< response.len - 2])
-
-# --------------------------------------------------------------------------------
-# Internal:
-# --------------------------------------------------------------------------------
-
-proc readTlvLength(data: openArray[uint8], index: int): SE[tuple[length: int, nextIndex: int]] =
-  ## Reads short or extended BER-TLV style length.
-  ##
-  ## Supported forms:
-  ##   12          -> length 0x12
-  ##   81 80       -> length 0x80
-  ##   82 00 12    -> length 0x12
-  if index >= data.len:
-    return fail[tuple[length: int, nextIndex: int]](
-      seInvalidResponse,
-      "TLV length is missing"
-    )
-
-  let first = data[index]
-
-  if (first and 0x80'u8) == 0:
-    return ok((int(first), index + 1))
-
-  let lenBytes = int(first and 0x7F'u8)
-  if lenBytes == 0 or lenBytes > 2:
-    return fail[tuple[length: int, nextIndex: int]](
-      seInvalidResponse,
-      "unsupported TLV length encoding"
-    )
-
-  if index + lenBytes >= data.len:
-    return fail[tuple[length: int, nextIndex: int]](
-      seInvalidResponse,
-      "extended TLV length is truncated"
-    )
-
-  var value = 0
-  for i in 0 ..< lenBytes:
-    value = (value shl 8) or int(data[index + 1 + i])
-
-  result = ok((value, index + 1 + lenBytes))
 
 # --------------------------------------------------------------------------------
 # Internal:
@@ -207,18 +117,6 @@ proc parseUidFromReadObjectResponse(response: openArray[uint8]): SE[array[Se050U
     result.value[i] = data.value[tlvLen.value.nextIndex + i]
 
   result.ok = true
-
-# --------------------------------------------------------------------------------
-# API:
-# --------------------------------------------------------------------------------
-
-proc selectApplet*(se: Se050Transport): SE[void] =
-  ## Selects the SE050 IoT applet.
-  let response = se.transceiveApdu(SelectAppletApdu)
-  if not response.ok:
-    return fail[void](response.error.kind, response.error.message, response.error.sw)
-
-  result = checkStatus(response.value, "SELECT applet")
 
 # --------------------------------------------------------------------------------
 # API:
