@@ -64,6 +64,21 @@ proc parseObjectId(s: string): uint32 =
 
   result = uint32(v)
 
+proc parseHexByte(s: string): uint8 =
+  ## Parses a hexadecimal byte value.
+  var t = s.strip()
+  if t.startsWith("0x") or t.startsWith("0X"):
+    t = t[2 .. ^1]
+
+  if t.len == 0:
+    raise newException(ValueError, "hex byte is empty")
+
+  let v = parseHexInt(t)
+  if v < 0 or v > 0xFF:
+    raise newException(ValueError, &"hex byte must be in range 0x00..0xFF: {s}")
+
+  result = uint8(v)
+
 proc printSe050Error(prefix: string, e: Se050Error) =
   stderr.writeLine &"{prefix}: {e.kind}: {e.message}"
   if e.sw != 0:
@@ -141,6 +156,25 @@ proc runExists(
 
   result = if exists.value: 0 else: 1
 
+proc runList(
+    busText: string,
+    addressText: string,
+    debug: bool,
+    filterText: string
+): int =
+  let filter = parseHexByte(filterText)
+  let se = openAndRequestAtr(busText, addressText, debug)
+
+  let ids = se.listObjectIds(filter = filter, selectFirst = true)
+  if not ids.ok:
+    printSe050Error("ReadIDList failed", ids.error)
+    return 1
+
+  for objectId in ids.value:
+    echo objectIdHex(objectId)
+
+  result = 0
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -179,6 +213,15 @@ proc main(): int =
       flag("-q", "--quiet", help = "Do not print status; use exit code only")
       run:
         quit(runExists(opts.bus, opts.address, opts.debug, opts.id, opts.quiet))
+
+    command("list"):
+      help("List visible SE050 Secure Object identifiers.")
+      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
+      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("--filter", default = some("0xFF"), help = "SecureObjectType filter byte, default: 0xFF for all types")
+      flag("-d", "--debug", help = "Print T=1 over I2C frames")
+      run:
+        quit(runList(opts.bus, opts.address, opts.debug, opts.filter))
 
   try:
     parser.run()
