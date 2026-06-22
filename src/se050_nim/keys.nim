@@ -21,7 +21,6 @@ const
   TagPolicy = 0x11'u8
   Tag1 = 0x41'u8
   Tag2 = 0x42'u8
-  Tag4 = 0x44'u8
   Tag7 = 0x47'u8
 
   # SE05x WriteECKey APDU for generating an EC key pair inside SE050.
@@ -52,8 +51,11 @@ const
   # SecureObjectType constants used by ReadType after key generation.
   Se050TypeEcKeyPair* = 0x01'u8
   Se050TypeEcKeyPairNistP256* = 0x29'u8
+  Se050TypeEcPrivKeyNistP256* = 0x2A'u8
   Se050TypeEcPubKeyNistP256* = 0x2B'u8
   Se050TypeEcKeyPairMontDh25519* = 0x69'u8
+  Se050TypeEcPrivKeyMontDh25519* = 0x6A'u8
+  Se050TypeEcPubKeyMontDh25519* = 0x6B'u8
 
   # Object policy bits from NXP se05x_const.h.
   #
@@ -63,6 +65,8 @@ const
   # (conditions not satisfied) for derive operations.
   PolicyObjAllowKa = 0x04000000'u32
   PolicyObjAllowRead = 0x00200000'u32
+  PolicyObjAllowWrite = 0x00100000'u32
+  PolicyObjAllowGen = 0x00080000'u32
   PolicyObjAllowDelete = 0x00040000'u32
 
   # One default-auth object-policy entry layout used by Plug & Trust:
@@ -116,7 +120,6 @@ const
   EcdhInsCrypto = 0x03'u8
   EcdhP1Ec = 0x01'u8
   EcdhP2Dh = 0x0F'u8
-  EcdhP2DhReverse = 0x59'u8
 
   # On-chip asymmetric key generation can take longer than normal object
   # inspection/random commands. During that time the T=1 over I2C layer may see
@@ -196,12 +199,18 @@ proc buildDevelopmentEcKeyPolicy(): seq[uint8] =
   ##
   ## The policy is deliberately not a production/no-delete policy. It allows:
   ##   - reading the public part of the key pair via ReadObject
+  ##   - overwriting/regenerating while iterating during development
   ##   - deleting the object during development
   ##   - using the private key for key agreement
   ##
   ## Production policy generation belongs in a future provisioning tool, not in
   ## the user-facing se050ctl command.
-  const header = PolicyObjAllowRead or PolicyObjAllowDelete or PolicyObjAllowKa
+  const header =
+    PolicyObjAllowKa or
+    PolicyObjAllowRead or
+    PolicyObjAllowWrite or
+    PolicyObjAllowGen or
+    PolicyObjAllowDelete
 
   result = @[]
   result.add(ObjectPolicyEntryLen)
@@ -292,38 +301,14 @@ proc buildGenerateEcKeyPairApdu(objectId: uint32, curve: EcCurveKind): SE[seq[ui
     result.value.add(b)
   result.ok = true
 
-proc ecdhP2(reverseDh: bool): uint8 =
-  ## Selects the SE05x ECDH APDU variant.
-  ##
-  ## P2_DH is the documented generic ECDH operation. Applet >= 7.2 also
-  ## defines P2_DH_REVERSE, which is useful while validating Montgomery
-  ## curve byte-order handling. Keep this as an explicit option rather than
-  ## silently changing byte order in the library.
-  if reverseDh:
-    result = EcdhP2DhReverse
-  else:
-    result = EcdhP2Dh
-
-proc reversedBytes(data: openArray[uint8]): seq[uint8] =
-  result = newSeq[uint8](data.len)
-  for i in 0 ..< data.len:
-    result[i] = data[data.len - 1 - i]
-
 proc buildEcdhSharedSecretApdu(
     objectId: uint32,
-    peerPublicKey: openArray[uint8],
-    reverseDh: bool,
-    reversePeerPublic: bool
+    peerPublicKey: openArray[uint8]
 ): SE[seq[uint8]] =
   var payload: seq[uint8] = @[]
-  let encodedPeerPublic =
-    if reversePeerPublic:
-      reversedBytes(peerPublicKey)
-    else:
-      @peerPublicKey
 
   payload.appendTlvU32(Tag1, objectId)
-  payload.appendTlvBytes(Tag2, encodedPeerPublic)
+  payload.appendTlvBytes(Tag2, peerPublicKey)
 
   if payload.len > 255:
     return fail[seq[uint8]](
@@ -335,7 +320,7 @@ proc buildEcdhSharedSecretApdu(
     EcdhCla,
     EcdhInsCrypto,
     EcdhP1Ec,
-    ecdhP2(reverseDh),
+    EcdhP2Dh,
     uint8(payload.len)
   ]
   for b in payload:
@@ -454,16 +439,9 @@ proc deriveSharedSecret*(
     se: Se050Transport,
     objectId: uint32,
     peerPublicKey: openArray[uint8],
-    selectFirst: bool = true,
-    reverseDh: bool = false,
-    reversePeerPublic: bool = false
+    selectFirst: bool = true
 ): SE[seq[uint8]] =
   ## Performs ECDH using an SE050 EC key pair/private key and an external public key.
-  ##
-  ## `reversePeerPublic` is a diagnostic/compatibility switch for Montgomery
-  ## curves while validating the byte order expected by a specific applet. It
-  ## reverses only the external public key bytes in TLV[TAG_2]; it does not
-  ## change the returned shared secret.
   ##
   ## This is the raw low-level primitive. It returns the shared secret to the CPU
   ## as TLV[TAG_1] response data. Higher layers are responsible for feeding that
@@ -478,12 +456,7 @@ proc deriveSharedSecret*(
         selected.error.sw
       )
 
-  let apdu = buildEcdhSharedSecretApdu(
-    objectId,
-    peerPublicKey,
-    reverseDh = reverseDh,
-    reversePeerPublic = reversePeerPublic
-  )
+  let apdu = buildEcdhSharedSecretApdu(objectId, peerPublicKey)
   if not apdu.ok:
     return fail[seq[uint8]](apdu.error.kind, apdu.error.message, apdu.error.sw)
 

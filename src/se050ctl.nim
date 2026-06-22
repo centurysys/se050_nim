@@ -181,7 +181,7 @@ proc areaSpecs(): array[5, ObjectAreaSpec] =
       first: CustomerStart,
       last: CustomerEnd,
       creatableBySe050ctl: false,
-      deletableBySe050ctl: true
+      deletableBySe050ctl: false
     ),
     ObjectAreaSpec(
       area: oaDev,
@@ -323,15 +323,10 @@ proc deleteTargetError(objectId: uint32): Option[string] =
   if objectId == 0'u32:
     return some("object id 0x00000000 is not a valid delete target")
 
-  if objectId.isProtectedReservedObjectId():
+  if not objectId.isDevelopmentObjectId():
     return some(
-      &"delete refused: {objectIdHex(objectId)} is in a protected SE050 reserved range"
-    )
-
-  if objectId.isVendorReservedObjectId():
-    return some(
-      &"delete refused: {objectIdHex(objectId)} is in the vendor reserved range; " &
-      "use a dedicated provisioning tool for vendor-reserved objects"
+      &"delete refused: {objectIdHex(objectId)} is outside the se050ctl development range " &
+      &"0x{DevelopmentStart.toHex(8)}..0x{DevelopmentEnd.toHex(8)}"
     )
 
   result = none(string)
@@ -375,16 +370,23 @@ proc isReadableEcPublicObjectType(objectType: uint8): bool =
   else:
     result = false
 
+proc isUnsupportedX25519DeriveObjectType(objectType: uint8): bool =
+  ## X25519 keygen/pubkey can be useful for diagnostics, but on the tested
+  ## SE050 applet 7.2.0 path ECDHGenerateSharedSecret consistently returned
+  ## SW=0x6985. Keep this guard in the CLI so the firmware-envelope path stays
+  ## on the verified P-256 implementation.
+  result = objectType in {
+    Se050TypeEcKeyPairMontDh25519,
+    Se050TypeEcPrivKeyMontDh25519
+  }
+
 proc expectedPeerPublicKeyLength(objectType: uint8): int =
-  ## Returns the raw public-key length accepted by the current derive helper.
+  ## Returns the raw public-key length accepted by the current CLI derive path.
   ##
   ## NIST P-256 public keys are uncompressed points: 0x04 || X || Y.
-  ## X25519 public keys are raw 32-byte Montgomery u-coordinates.
   case objectType
   of Se050TypeEcKeyPair, Se050TypeEcKeyPairNistP256:
     result = 65
-  of Se050TypeEcKeyPairMontDh25519:
-    result = 32
   else:
     result = 0
 
@@ -728,9 +730,7 @@ proc runDerive(
     nameText: string,
     peerPublicPath: string,
     outputPath: string,
-    separator: string,
-    reverseDh: bool,
-    reversePeerPublic: bool
+    separator: string
 ): int =
   let objectRef = resolveObjectRef(idText, areaText, indexText, nameText)
   var peerPublicKey: seq[uint8]
@@ -756,6 +756,13 @@ proc runDerive(
     printSe050Error("ReadType failed", typ.error)
     return 1
 
+  if typ.value.objectType.isUnsupportedX25519DeriveObjectType():
+    stderr.writeLine(
+      "derive refused: X25519 derive is not supported on the tested " &
+      "SE050/Applet 7.2.0 ECDHGenerateSharedSecret path; use P-256"
+    )
+    return 2
+
   if not typ.value.objectType.isDeriveKeyPairObjectType():
     stderr.writeLine &"derive refused: {objectIdHex(objectRef.objectId)} is {typeText(typ.value.objectType)}, not a supported EC key pair for derive"
     return 2
@@ -772,9 +779,7 @@ proc runDerive(
   let sharedSecret = se.deriveSharedSecret(
     objectId = objectRef.objectId,
     peerPublicKey = peerPublicKey,
-    selectFirst = false,
-    reverseDh = reverseDh,
-    reversePeerPublic = reversePeerPublic
+    selectFirst = false
   )
   if not sharedSecret.ok:
     printSe050Error("ECDHGenerateSharedSecret failed", sharedSecret.error)
@@ -784,14 +789,6 @@ proc runDerive(
     writeFile(outputPath, bytesToRawString(sharedSecret.value))
     echo &"{objectIdHex(objectRef.objectId)}: shared secret written to {outputPath}"
     printResolvedObjectRef(objectRef)
-    if reverseDh:
-      echo "dh variant: reverse"
-    else:
-      echo "dh variant: normal"
-    if reversePeerPublic:
-      echo "peer public: reversed before APDU"
-    else:
-      echo "peer public: as-is"
     echo &"length: {sharedSecret.value.len}"
   else:
     echo bytesToHex(sharedSecret.value, separator = separator)
@@ -923,7 +920,7 @@ proc main(): int =
       option("--area", default = some(""), help = "Object area. For keygen, only dev is allowed")
       option("--index", default = some(""), help = "Area-relative object index, decimal or 0x-prefixed hex")
       option("--name", default = some(""), help = "Known object name. Not useful for keygen, but rejected safely")
-      option("--curve", default = some("x25519"), help = "Curve name: x25519 or p256")
+      option("--curve", default = some("p256"), help = "Curve name: p256 or x25519, default: p256")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
         quit(runKeygen(
@@ -970,11 +967,9 @@ proc main(): int =
       option("--area", default = some(""), help = "Object area: dev, customer, vendor, nxp, internal")
       option("--index", default = some(""), help = "Area-relative object index, decimal or 0x-prefixed hex")
       option("--name", default = some(""), help = "Known object name. Must refer to a supported EC key pair")
-      option("--peer-public", required = true, help = "Raw peer public key file: 32 bytes for x25519, 65 bytes for p256")
+      option("--peer-public", required = true, help = "Raw P-256 peer public key file, 65-byte uncompressed point")
       option("-o", "--out", default = some(""), help = "Write raw shared secret bytes to this file instead of printing hex")
       flag("--colon", help = "Print bytes as AA:BB:CC... when not using --out")
-      flag("--reverse-dh", help = "Use SE05x P2_DH_REVERSE variant for Montgomery byte-order validation")
-      flag("--reverse-peer-public", help = "Reverse peer public key bytes before sending TLV[TAG_2] (diagnostic for Montgomery curves)")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
         let separator = if opts.colon: ":" else: ""
@@ -988,9 +983,7 @@ proc main(): int =
           opts.name,
           opts.peer_public,
           opts.out,
-          separator,
-          opts.reverse_dh,
-          opts.reverse_peer_public
+          separator
         ))
 
     command("delete"):
