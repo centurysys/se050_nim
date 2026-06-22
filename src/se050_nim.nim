@@ -3,6 +3,7 @@ import se050_nim/[
   transport,
   apdu,
   tlv,
-  uid
+  uid,
+  random
 ]
-export errors, transport, apdu, tlv, uid
+export errors, transport, apdu, tlv, uid, random

@@ -40,6 +40,12 @@ proc parseI2cAddress(s: string): uint8 =
 
   result = uint8(v)
 
+proc parseLength(s: string, minValue: int, maxValue: int): int =
+  let v = parseInt(s.strip())
+  if v < minValue or v > maxValue:
+    raise newException(ValueError, &"length must be in range {minValue}..{maxValue}: {s}")
+  result = v
+
 proc printSe050Error(prefix: string, e: Se050Error) =
   stderr.writeLine &"{prefix}: {e.kind}: {e.message}"
   if e.sw != 0:
@@ -49,16 +55,19 @@ proc printSe050Error(prefix: string, e: Se050Error) =
 # Commands
 # =============================================================================
 
-proc runUid(busText: string, addressText: string, debug: bool, separator: string): int =
+proc openAndRequestAtr(busText: string, addressText: string, debug: bool): Se050Transport =
   let bus = parseBusNumber(busText)
   let address = parseI2cAddress(addressText)
 
-  let se = openSe050(bus, address = address, debug = debug)
+  result = openSe050(bus, address = address, debug = debug)
 
-  let atr = se.requestAtr()
+  let atr = result.requestAtr()
   if not atr.ok:
     printSe050Error("ATR failed", atr.error)
-    return 1
+    quit(1)
+
+proc runUid(busText: string, addressText: string, debug: bool, separator: string): int =
+  let se = openAndRequestAtr(busText, addressText, debug)
 
   let uid = se.readUidHex(separator = separator, selectFirst = true)
   if not uid.ok:
@@ -66,6 +75,28 @@ proc runUid(busText: string, addressText: string, debug: bool, separator: string
     return 1
 
   echo uid.value
+  result = 0
+
+proc runRandom(
+    busText: string,
+    addressText: string,
+    debug: bool,
+    lengthText: string,
+    separator: string
+): int =
+  let length = parseLength(lengthText, 1, Se050MaxRandomLength)
+  let se = openAndRequestAtr(busText, addressText, debug)
+
+  let randomHex = se.getRandomHex(
+    length = length,
+    separator = separator,
+    selectFirst = true
+  )
+  if not randomHex.ok:
+    printSe050Error("GetRandom failed", randomHex.error)
+    return 1
+
+  echo randomHex.value
   result = 0
 
 # =============================================================================
@@ -85,6 +116,17 @@ proc main(): int =
       run:
         let separator = if opts.colon: ":" else: ""
         quit(runUid(opts.bus, opts.address, opts.debug, separator))
+
+    command("random"):
+      help("Generate random bytes using SE050 GetRandom.")
+      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
+      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-l", "--len", required = true, help = "Random byte length, 1..255")
+      flag("-d", "--debug", help = "Print T=1 over I2C frames")
+      flag("--colon", help = "Print bytes as AA:BB:CC...")
+      run:
+        let separator = if opts.colon: ":" else: ""
+        quit(runRandom(opts.bus, opts.address, opts.debug, opts.len, separator))
 
   try:
     parser.run()
