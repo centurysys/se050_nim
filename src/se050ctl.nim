@@ -46,10 +46,31 @@ proc parseLength(s: string, minValue: int, maxValue: int): int =
     raise newException(ValueError, &"length must be in range {minValue}..{maxValue}: {s}")
   result = v
 
+proc parseObjectId(s: string): uint32 =
+  ## Parses an SE050 Secure Object identifier.
+  ##
+  ## The value is treated as hexadecimal. Both "10000100" and "0x10000100"
+  ## mean 0x10000100.
+  var t = s.strip()
+  if t.startsWith("0x") or t.startsWith("0X"):
+    t = t[2 .. ^1]
+
+  if t.len == 0:
+    raise newException(ValueError, "object id is empty")
+
+  let v = parseHexInt(t)
+  if v < 0:
+    raise newException(ValueError, &"object id must be >= 0: {s}")
+
+  result = uint32(v)
+
 proc printSe050Error(prefix: string, e: Se050Error) =
   stderr.writeLine &"{prefix}: {e.kind}: {e.message}"
   if e.sw != 0:
     stderr.writeLine &"SW=0x{e.sw.toHex(4)}"
+
+proc objectIdHex(objectId: uint32): string =
+  result = &"0x{objectId.toHex(8)}"
 
 # =============================================================================
 # Commands
@@ -99,6 +120,27 @@ proc runRandom(
   echo randomHex.value
   result = 0
 
+proc runExists(
+    busText: string,
+    addressText: string,
+    debug: bool,
+    objectIdText: string,
+    quiet: bool
+): int =
+  let objectId = parseObjectId(objectIdText)
+  let se = openAndRequestAtr(busText, addressText, debug)
+
+  let exists = se.objectExists(objectId = objectId, selectFirst = true)
+  if not exists.ok:
+    printSe050Error("CheckObjectExists failed", exists.error)
+    return 1
+
+  if not quiet:
+    let statusText = if exists.value: "exists" else: "missing"
+    echo &"{objectIdHex(objectId)}: {statusText}"
+
+  result = if exists.value: 0 else: 1
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -127,6 +169,16 @@ proc main(): int =
       run:
         let separator = if opts.colon: ":" else: ""
         quit(runRandom(opts.bus, opts.address, opts.debug, opts.len, separator))
+
+    command("exists"):
+      help("Check whether an SE050 Secure Object identifier exists.")
+      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
+      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("--id", required = true, help = "Secure Object ID in hex, e.g. 0x10000100")
+      flag("-d", "--debug", help = "Print T=1 over I2C frames")
+      flag("-q", "--quiet", help = "Do not print status; use exit code only")
+      run:
+        quit(runExists(opts.bus, opts.address, opts.debug, opts.id, opts.quiet))
 
   try:
     parser.run()
