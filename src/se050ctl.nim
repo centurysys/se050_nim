@@ -87,6 +87,16 @@ proc printSe050Error(prefix: string, e: Se050Error) =
 proc objectIdHex(objectId: uint32): string =
   result = &"0x{objectId.toHex(8)}"
 
+proc typeText(objectType: uint8): string =
+  result = &"0x{objectType.toHex(2)} ({objectTypeName(objectType)})"
+
+proc transientText(indicator: Option[uint8]): string =
+  if indicator.isSome:
+    let v = indicator.get()
+    result = &"0x{v.toHex(2)} ({transientIndicatorName(v)})"
+  else:
+    result = "n/a"
+
 # =============================================================================
 # Commands
 # =============================================================================
@@ -156,6 +166,46 @@ proc runExists(
 
   result = if exists.value: 0 else: 1
 
+proc runInfo(
+    busText: string,
+    addressText: string,
+    debug: bool,
+    objectIdText: string
+): int =
+  let objectId = parseObjectId(objectIdText)
+  let se = openAndRequestAtr(busText, addressText, debug)
+
+  let exists = se.objectExists(objectId = objectId, selectFirst = true)
+  if not exists.ok:
+    printSe050Error("CheckObjectExists failed", exists.error)
+    return 1
+
+  echo &"id: {objectIdHex(objectId)}"
+  let existsText = if exists.value: "yes" else: "no"
+  echo &"exists: {existsText}"
+
+  if not exists.value:
+    return 1
+
+  let typ = se.readObjectType(objectId = objectId, selectFirst = false)
+  if not typ.ok:
+    printSe050Error("ReadType failed", typ.error)
+    return 1
+
+  echo &"type: {typeText(typ.value.objectType)}"
+  echo &"transient: {transientText(typ.value.transientIndicator)}"
+
+  let size = se.readObjectSize(objectId = objectId, selectFirst = false)
+  if size.ok:
+    echo &"size: {size.value}"
+  else:
+    echo "size: unavailable"
+    stderr.writeLine &"ReadSize failed: {size.error.kind}: {size.error.message}"
+    if size.error.sw != 0:
+      stderr.writeLine &"SW=0x{size.error.sw.toHex(4)}"
+
+  result = 0
+
 proc runList(
     busText: string,
     addressText: string,
@@ -213,6 +263,15 @@ proc main(): int =
       flag("-q", "--quiet", help = "Do not print status; use exit code only")
       run:
         quit(runExists(opts.bus, opts.address, opts.debug, opts.id, opts.quiet))
+
+    command("info"):
+      help("Read type and size information for an SE050 Secure Object identifier.")
+      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
+      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("--id", required = true, help = "Secure Object ID in hex, e.g. 0x10000100")
+      flag("-d", "--debug", help = "Print T=1 over I2C frames")
+      run:
+        quit(runInfo(opts.bus, opts.address, opts.debug, opts.id))
 
     command("list"):
       help("List visible SE050 Secure Object identifiers.")
