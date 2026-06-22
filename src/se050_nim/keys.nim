@@ -1,0 +1,477 @@
+# =============================================================================
+# SE050 key management helpers
+# =============================================================================
+#
+# Low-level helpers for creating SE050 key objects and using EC key objects.
+#
+# This module intentionally exposes SE050 primitive operations. Product policy,
+# factory provisioning records, firmware envelope handling, and CLI safety
+# guards belong in higher layers.
+
+import ./errors
+import ./transport
+import ./apdu
+import ./tlv
+
+# =============================================================================
+# Constants
+# =============================================================================
+
+const
+  TagPolicy = 0x11'u8
+  Tag1 = 0x41'u8
+  Tag2 = 0x42'u8
+  Tag7 = 0x47'u8
+
+  # SE05x WriteECKey APDU for generating an EC key pair inside SE050.
+  #
+  # NXP Plug & Trust names this command:
+  #   CLA = 0x80
+  #   INS = INS_WRITE = 0x01
+  #   P1  = P1_KEY_PAIR | P1_EC = 0x60 | 0x01 = 0x61
+  #   P2  = P2_DEFAULT = 0x00
+  #
+  # Command data for internal key generation:
+  #   TAG_POLICY: development policy allowing read/delete/key-agreement
+  #   TAG_1     : 4-byte Secure Object identifier
+  #   TAG_2     : 1-byte ECCurve identifier
+  #
+  # TAG_3 private key and TAG_4 public key are deliberately omitted. For
+  # P1_KEY_PAIR, omitting both TAG_3 and TAG_4 requests key generation inside
+  # the SE050.
+  WriteEcKeyCla = 0x80'u8
+  WriteEcKeyIns = 0x01'u8
+  WriteEcKeyP1KeyPairEc = 0x61'u8
+  WriteEcKeyP2Default = 0x00'u8
+
+  # ECCurve constants.
+  Se050CurveNistP256* = 0x03'u8
+  Se050CurveX25519* = 0x41'u8
+
+  # SecureObjectType constants used by ReadType after key generation.
+  Se050TypeEcKeyPair* = 0x01'u8
+  Se050TypeEcKeyPairNistP256* = 0x29'u8
+  Se050TypeEcPrivKeyNistP256* = 0x2A'u8
+  Se050TypeEcPubKeyNistP256* = 0x2B'u8
+  Se050TypeEcKeyPairMontDh25519* = 0x69'u8
+  Se050TypeEcPrivKeyMontDh25519* = 0x6A'u8
+  Se050TypeEcPubKeyMontDh25519* = 0x6B'u8
+
+  # Object policy bits from NXP se05x_const.h.
+  #
+  # se050ctl is a development/diagnostic CLI and intentionally creates only
+  # deletable development keys. Explicitly adding ALLOW_KA is required for
+  # ECDHGenerateSharedSecret; otherwise the applet may return SW=0x6985
+  # (conditions not satisfied) for derive operations.
+  PolicyObjAllowKa = 0x04000000'u32
+  PolicyObjAllowRead = 0x00200000'u32
+  PolicyObjAllowWrite = 0x00100000'u32
+  PolicyObjAllowGen = 0x00080000'u32
+  PolicyObjAllowDelete = 0x00040000'u32
+
+  # One default-auth object-policy entry layout used by Plug & Trust:
+  #   byte 0      : length of the policy entry excluding this length byte
+  #   bytes 1..4  : auth object ID (0 means default/no auth object)
+  #   bytes 5..8  : access-rule header bits
+  #
+  # This is later wrapped as TLV[TAG_POLICY].
+  ObjectPolicyEntryLen = 0x08'u8
+  DefaultAuthObjectId = 0x00000000'u32
+
+  # SE05x ReadObject APDU.
+  #
+  # NXP AN12413 describes ReadObject as:
+  #   CLA = 0x80
+  #   INS = INS_READ   = 0x02
+  #   P1  = P1_DEFAULT = 0x00
+  #   P2  = P2_DEFAULT = 0x00
+  #
+  # Command data:
+  #   TAG_1: 4-byte Secure Object identifier
+  #
+  # Response data:
+  #   TAG_1: Data read from the Secure Object
+  #
+  # For an EC key pair or EC public key, ReadObject returns the public key.
+  ReadObjectCla = 0x80'u8
+  ReadObjectIns = 0x02'u8
+  ReadObjectP1 = 0x00'u8
+  ReadObjectP2 = 0x00'u8
+
+  # SE05x ECDHGenerateSharedSecret APDU.
+  #
+  # NXP Plug & Trust names this command:
+  #   CLA = 0x80
+  #   INS = INS_CRYPTO = 0x03
+  #   P1  = P1_EC     = 0x01
+  #   P2  = P2_DH     = 0x0F
+  #
+  # Command data:
+  #   TAG_1: 4-byte identifier of the key pair or private key
+  #   TAG_2: external public key
+  #
+  # The AN12413 ECDHGenerateSharedSecret APDU defines only TAG_1 and TAG_2
+  # in the C-APDU payload. Do not add TAG_4 here; that tag belongs to other
+  # crypto commands and causes SW=0x6985 on this applet.
+  #
+  # Response data, when TAG_7 output object is not supplied:
+  #   TAG_1: returned shared secret
+  EcdhCla = 0x80'u8
+  EcdhInsCrypto = 0x03'u8
+  EcdhP1Ec = 0x01'u8
+  EcdhP2Dh = 0x0F'u8
+
+  # On-chip asymmetric key generation can take longer than normal object
+  # inspection/random commands. During that time the T=1 over I2C layer may see
+  # empty reads before the SE050 emits WTX or the final response. Keep the
+  # extended wait local to key generation so quick commands keep failing fast.
+  KeyGenerationMaxReadRetries = 200
+  CryptoOperationMaxReadRetries = 200
+
+# =============================================================================
+# Types
+# =============================================================================
+
+type
+  EcCurveKind* = enum
+    ecCurveP256,
+    ecCurveX25519
+
+# =============================================================================
+# Internal helpers
+# =============================================================================
+
+proc appendU32Be(buf: var seq[uint8], value: uint32) =
+  buf.add(uint8((value shr 24) and 0xFF))
+  buf.add(uint8((value shr 16) and 0xFF))
+  buf.add(uint8((value shr 8) and 0xFF))
+  buf.add(uint8(value and 0xFF))
+
+proc appendTlvU32(buf: var seq[uint8], tag: uint8, value: uint32) =
+  buf.add(tag)
+  buf.add(0x04'u8)
+  buf.appendU32Be(value)
+
+proc appendTlvU8(buf: var seq[uint8], tag: uint8, value: uint8) =
+  buf.add(tag)
+  buf.add(0x01'u8)
+  buf.add(value)
+
+proc appendTlvBytes(buf: var seq[uint8], tag: uint8, value: openArray[uint8]) =
+  buf.add(tag)
+  if value.len < 0x80:
+    buf.add(uint8(value.len))
+  elif value.len <= 0xFF:
+    buf.add(0x81'u8)
+    buf.add(uint8(value.len))
+  elif value.len <= 0xFFFF:
+    buf.add(0x82'u8)
+    buf.add(uint8((value.len shr 8) and 0xFF))
+    buf.add(uint8(value.len and 0xFF))
+  else:
+    # The current short APDU path cannot carry this anyway, but keep the helper
+    # total and let the APDU builder return seApduTooLarge with command context.
+    buf.add(0x83'u8)
+    buf.add(uint8((value.len shr 16) and 0xFF))
+    buf.add(uint8((value.len shr 8) and 0xFF))
+    buf.add(uint8(value.len and 0xFF))
+
+  for b in value:
+    buf.add(b)
+
+proc curveId*(curve: EcCurveKind): uint8 =
+  result = case curve
+  of ecCurveP256: Se050CurveNistP256
+  of ecCurveX25519: Se050CurveX25519
+
+proc curveName*(curve: EcCurveKind): string =
+  result = case curve
+  of ecCurveP256: "p256"
+  of ecCurveX25519: "x25519"
+
+proc expectedKeyPairType*(curve: EcCurveKind): uint8 =
+  result = case curve
+  of ecCurveP256: Se050TypeEcKeyPairNistP256
+  of ecCurveX25519: Se050TypeEcKeyPairMontDh25519
+
+proc buildDevelopmentEcKeyPolicy(): seq[uint8] =
+  ## Builds a single object-policy entry for development EC key pairs.
+  ##
+  ## The policy is deliberately not a production/no-delete policy. It allows:
+  ##   - reading the public part of the key pair via ReadObject
+  ##   - overwriting/regenerating while iterating during development
+  ##   - deleting the object during development
+  ##   - using the private key for key agreement
+  ##
+  ## Production policy generation belongs in a future provisioning tool, not in
+  ## the user-facing se050ctl command.
+  const header =
+    PolicyObjAllowKa or
+    PolicyObjAllowRead or
+    PolicyObjAllowWrite or
+    PolicyObjAllowGen or
+    PolicyObjAllowDelete
+
+  result = @[]
+  result.add(ObjectPolicyEntryLen)
+  result.appendU32Be(DefaultAuthObjectId)
+  result.appendU32Be(header)
+
+proc buildReadObjectApdu(objectId: uint32): seq[uint8] =
+  result = @[
+    ReadObjectCla,
+    ReadObjectIns,
+    ReadObjectP1,
+    ReadObjectP2,
+    0x06'u8,
+
+    # TAG_1: 4-byte Secure Object identifier
+    Tag1,
+    0x04'u8
+  ]
+  result.appendU32Be(objectId)
+
+  # Le
+  result.add(0x00'u8)
+
+proc parseTag1Value(response: openArray[uint8], commandName: string): SE[seq[uint8]] =
+  let st = checkStatus(response, commandName)
+  if not st.ok:
+    return fail[seq[uint8]](st.error.kind, st.error.message, st.error.sw)
+
+  let data = dataWithoutStatus(response)
+  if not data.ok:
+    return fail[seq[uint8]](data.error.kind, data.error.message, data.error.sw)
+
+  if data.value.len < 3:
+    return fail[seq[uint8]](
+      seInvalidResponse,
+      commandName & " response does not contain TAG/LEN/VALUE"
+    )
+
+  if data.value[0] != Tag1:
+    return fail[seq[uint8]](
+      seInvalidResponse,
+      commandName & " response does not start with TAG_1"
+    )
+
+  let tlvLen = readTlvLength(data.value, 1)
+  if not tlvLen.ok:
+    return fail[seq[uint8]](tlvLen.error.kind, tlvLen.error.message, tlvLen.error.sw)
+
+  let valueStart = tlvLen.value.nextIndex
+  let valueEnd = valueStart + tlvLen.value.length
+  if valueEnd > data.value.len:
+    return fail[seq[uint8]](
+      seInvalidResponse,
+      commandName & " response value is shorter than expected"
+    )
+
+  let value = data.value[valueStart ..< valueEnd]
+  result = ok(value)
+
+proc parseReadObjectValue(response: openArray[uint8]): SE[seq[uint8]] =
+  result = parseTag1Value(response, "ReadObject")
+
+proc buildGenerateEcKeyPairApdu(objectId: uint32, curve: EcCurveKind): SE[seq[uint8]] =
+  var payload: seq[uint8] = @[]
+
+  # Put TAG_POLICY first, matching the order shown in the SE05x APDU
+  # specification. The applet is generally TLV-based, but keeping the specified
+  # order makes the raw APDU easier to compare with Plug & Trust logs.
+  let policy = buildDevelopmentEcKeyPolicy()
+  payload.appendTlvBytes(TagPolicy, policy)
+  payload.appendTlvU32(Tag1, objectId)
+  payload.appendTlvU8(Tag2, curve.curveId())
+
+  if payload.len > 255:
+    return fail[seq[uint8]](
+      seApduTooLarge,
+      "WriteECKey payload is too large for a short APDU"
+    )
+
+  result.value = @[
+    WriteEcKeyCla,
+    WriteEcKeyIns,
+    WriteEcKeyP1KeyPairEc,
+    WriteEcKeyP2Default,
+    uint8(payload.len)
+  ]
+  for b in payload:
+    result.value.add(b)
+  result.ok = true
+
+proc buildEcdhSharedSecretApdu(
+    objectId: uint32,
+    peerPublicKey: openArray[uint8]
+): SE[seq[uint8]] =
+  var payload: seq[uint8] = @[]
+
+  payload.appendTlvU32(Tag1, objectId)
+  payload.appendTlvBytes(Tag2, peerPublicKey)
+
+  if payload.len > 255:
+    return fail[seq[uint8]](
+      seApduTooLarge,
+      "ECDHGenerateSharedSecret payload is too large for a short APDU"
+    )
+
+  result.value = @[
+    EcdhCla,
+    EcdhInsCrypto,
+    EcdhP1Ec,
+    EcdhP2Dh,
+    uint8(payload.len)
+  ]
+  for b in payload:
+    result.value.add(b)
+
+  # Le: request the shared secret as TLV[TAG_1] in the response.
+  result.value.add(0x00'u8)
+  result.ok = true
+
+# =============================================================================
+# API
+# =============================================================================
+
+proc generateEcKeyPair*(
+    se: Se050Transport,
+    objectId: uint32,
+    curve: EcCurveKind,
+    selectFirst: bool = true
+): SE[void] =
+  ## Generates an EC key pair inside the selected SE050 applet.
+  ##
+  ## This is the raw low-level primitive. It does not check whether the target
+  ## ID is in a safe development range, whether it already exists, or whether it
+  ## belongs to a vendor-reserved namespace. CLI/provisioning tools must enforce
+  ## those policies before calling this function.
+  ##
+  ## A development object policy is attached here so the generated key remains
+  ## deletable/readable and is allowed to perform key agreement. Production
+  ## policy generation belongs in a dedicated provisioning tool.
+  if selectFirst:
+    let selected = se.selectApplet()
+    if not selected.ok:
+      return fail[void](
+        selected.error.kind,
+        selected.error.message,
+        selected.error.sw
+      )
+
+  let apdu = buildGenerateEcKeyPairApdu(objectId = objectId, curve = curve)
+  if not apdu.ok:
+    return fail[void](apdu.error.kind, apdu.error.message, apdu.error.sw)
+
+  let oldMaxRetries = se.maxRetries
+  if se.maxRetries < KeyGenerationMaxReadRetries:
+    se.maxRetries = KeyGenerationMaxReadRetries
+
+  let response = se.transceiveApdu(apdu.value)
+  se.maxRetries = oldMaxRetries
+
+  if not response.ok:
+    return fail[void](
+      response.error.kind,
+      response.error.message,
+      response.error.sw
+    )
+
+  result = checkStatus(response.value, "WriteECKey")
+
+proc generateX25519KeyPair*(
+    se: Se050Transport,
+    objectId: uint32,
+    selectFirst: bool = true
+): SE[void] =
+  ## Generates an X25519 key pair inside SE050.
+  result = se.generateEcKeyPair(
+    objectId = objectId,
+    curve = ecCurveX25519,
+    selectFirst = selectFirst
+  )
+
+proc generateP256KeyPair*(
+    se: Se050Transport,
+    objectId: uint32,
+    selectFirst: bool = true
+): SE[void] =
+  ## Generates a NIST P-256 key pair inside SE050.
+  result = se.generateEcKeyPair(
+    objectId = objectId,
+    curve = ecCurveP256,
+    selectFirst = selectFirst
+  )
+
+
+proc readPublicKey*(
+    se: Se050Transport,
+    objectId: uint32,
+    selectFirst: bool = true
+): SE[seq[uint8]] =
+  ## Reads the public key material from an SE050 EC key pair or EC public key.
+  ##
+  ## This is a raw ReadObject helper. The SE050 returns the public key for EC
+  ## key-pair and EC-public-key objects. The caller is responsible for checking
+  ## the Secure Object type before calling this helper if it needs stricter
+  ## semantics.
+  if selectFirst:
+    let selected = se.selectApplet()
+    if not selected.ok:
+      return fail[seq[uint8]](
+        selected.error.kind,
+        selected.error.message,
+        selected.error.sw
+      )
+
+  let response = se.transceiveApdu(buildReadObjectApdu(objectId))
+  if not response.ok:
+    return fail[seq[uint8]](
+      response.error.kind,
+      response.error.message,
+      response.error.sw
+    )
+
+  result = parseReadObjectValue(response.value)
+
+
+proc deriveSharedSecret*(
+    se: Se050Transport,
+    objectId: uint32,
+    peerPublicKey: openArray[uint8],
+    selectFirst: bool = true
+): SE[seq[uint8]] =
+  ## Performs ECDH using an SE050 EC key pair/private key and an external public key.
+  ##
+  ## This is the raw low-level primitive. It returns the shared secret to the CPU
+  ## as TLV[TAG_1] response data. Higher layers are responsible for feeding that
+  ## value into HKDF or storing the result into another SE050 object when that is
+  ## desired.
+  if selectFirst:
+    let selected = se.selectApplet()
+    if not selected.ok:
+      return fail[seq[uint8]](
+        selected.error.kind,
+        selected.error.message,
+        selected.error.sw
+      )
+
+  let apdu = buildEcdhSharedSecretApdu(objectId, peerPublicKey)
+  if not apdu.ok:
+    return fail[seq[uint8]](apdu.error.kind, apdu.error.message, apdu.error.sw)
+
+  let oldMaxRetries = se.maxRetries
+  if se.maxRetries < CryptoOperationMaxReadRetries:
+    se.maxRetries = CryptoOperationMaxReadRetries
+
+  let response = se.transceiveApdu(apdu.value)
+  se.maxRetries = oldMaxRetries
+
+  if not response.ok:
+    return fail[seq[uint8]](
+      response.error.kind,
+      response.error.message,
+      response.error.sw
+    )
+
+  result = parseTag1Value(response.value, "ECDHGenerateSharedSecret")

@@ -1,80 +1,168 @@
 # se050_nim
 
-Lightweight Nim library for accessing NXP SE050 secure element over T=1 over I2C.
+Lightweight Nim library and diagnostic CLI for accessing an NXP SE050 secure element over T=1 over I2C.
 
-## Overview
+The project intentionally avoids NXP Plug & Trust Middleware and exposes small SE050 primitives that are useful for embedded Linux products, firmware-envelope experiments, and production provisioning tools built on top of this library.
 
-`se050_nim` provides a minimal, dependency-free interface to communicate with SE050 devices.
+## Current status
 
-It focuses on:
-- Small footprint
-- Simple API
-- No dependency on NXP Plug & Trust middleware
+Verified on the currently tested SE050 applet path:
 
-## Features (current)
+- UID read from object `0x7FFF0206`
+- SE050 applet version/config read
+- random byte generation
+- Secure Object existence/type/size/list/delete helpers
+- development EC key generation
+- public-key readout from EC key objects
+- P-256 ECDH shared-secret derivation
 
-- T=1 over I2C transport
-- ATR handling
-- APDU exchange
-- UID read (Object ID: `0x7FFF0206`)
-- CLI example (`se050_uid`)
+The practical firmware-envelope key-agreement path is:
 
-## Example
-
-```
-import se050_nim
-
-let se = openSe050(0)
-
-discard se.requestAtr()
-
-let uid = se.readUidHex()
-echo uid.get()
+```text
+P-256 ECDH + HKDF-SHA256 + AES-256-GCM
 ```
 
-## CLI Tool
+X25519 key generation and public-key export may work on the tested SE050 applet 7.2.0 environment, but `ECDHGenerateSharedSecret` consistently returned `SW=0x6985` during the investigation. Because P-256 works through the same ECDH APDU family, the CLI treats X25519 derive as unsupported and keeps P-256 as the mainline path.
 
-```
-se050_uid -b 0
-se050_uid -b 0 --colon
-se050_uid -b 0 -d
-```
+## CLI
 
-## Design
+The installed command is:
 
-```
-transport (T=1 over I2C)
-  ↓
-APDU
-  ↓
-high-level modules (uid, future: object, crypto)
+```sh
+se050ctl
 ```
 
-Low-level I2C is intentionally hidden.
+Common options:
 
-## Future Work
+```sh
+-b, --bus <n>          I2C bus number, e.g. 0 for /dev/i2c-0
+-a, --address <hex>    SE050 I2C address, default: 0x48
+-d, --debug            Print T=1 over I2C frames
+```
 
-Planned features:
+### UID
 
-- ReadObject / WriteObject
-- Random number generation
-- ECC key generation
-- ECDSA signing / verification
-- Public key retrieval
-- Secure storage utilities
+```sh
+se050ctl uid -b 0
+se050ctl uid -b 0 --colon
+```
 
-Long-term:
+### Version and feature bitmap
 
-- Device authentication workflows
-- Cloud integration helpers (Azure / AWS)
-- Secure boot / firmware verification support
+```sh
+se050ctl version -b 0
+```
 
-## Philosophy
+### Random
 
-- Keep it minimal
-- Avoid heavy middleware
-- Focus on embedded Linux use-cases
-- Provide building blocks, not frameworks
+```sh
+se050ctl random -b 0 --len 32
+se050ctl random -b 0 --len 32 --colon
+```
+
+### Secure Object inspection
+
+Object references can be specified in one of these forms:
+
+```sh
+--id 0x30000100
+--area dev --index 0x100
+--name uid
+```
+
+Examples:
+
+```sh
+se050ctl exists -b 0 --name uid
+se050ctl info -b 0 --name uid
+se050ctl list -b 0 --annotate
+se050ctl list -b 0 --area dev --annotate
+```
+
+### Development P-256 key agreement
+
+`se050ctl keygen` defaults to P-256.
+
+```sh
+se050ctl delete -b 0 --area dev --index 0x110 || true
+se050ctl delete -b 0 --area dev --index 0x111 || true
+
+se050ctl keygen -b 0 --area dev --index 0x110
+se050ctl keygen -b 0 --area dev --index 0x111
+
+se050ctl pubkey -b 0 --area dev --index 0x110 --out p256_a.bin
+se050ctl pubkey -b 0 --area dev --index 0x111 --out p256_b.bin
+
+se050ctl derive -b 0 --area dev --index 0x110 \
+  --peer-public p256_b.bin \
+  --out p256_secret_ab.bin
+
+se050ctl derive -b 0 --area dev --index 0x111 \
+  --peer-public p256_a.bin \
+  --out p256_secret_ba.bin
+
+sha256sum p256_secret_ab.bin p256_secret_ba.bin
+cmp p256_secret_ab.bin p256_secret_ba.bin
+```
+
+Expected shape:
+
+- P-256 public keys are 65-byte uncompressed points: `0x04 || X(32) || Y(32)`
+- ECDH shared secrets are 32 bytes
+- A→B and B→A shared secrets must match
+
+## Object ID policy used by `se050ctl`
+
+`se050ctl` is a development and diagnostic tool, not a production provisioning tool. Creation and deletion are intentionally limited to the development range.
+
+| Area | Range | `se050ctl` create/delete |
+|---|---:|---|
+| vendor | `0x10000000..0x10000FFF` | no |
+| customer | `0x20000000..0x2000FFFF` | no |
+| dev | `0x30000000..0x3000FFFF` | yes |
+| nxp | `0x7FFF0000..0x7FFFFFFF` | no |
+| internal | `0xF0000000..0xFFFFFFFF` | no |
+
+Future production tooling should be split from this CLI, for example:
+
+- `se050-provision`: production object creation and no-delete policy management
+- `fwkeys` / `fw-envelope`: manifest/envelope processing
+- `fw-update`: A/B firmware update application
+
+## Library layout
+
+```text
+src/se050_nim.nim
+src/se050_nim/apdu.nim
+src/se050_nim/errors.nim
+src/se050_nim/i2c.nim
+src/se050_nim/keys.nim
+src/se050_nim/management.nim
+src/se050_nim/objects.nim
+src/se050_nim/random.nim
+src/se050_nim/tlv.nim
+src/se050_nim/transport.nim
+src/se050_nim/uid.nim
+src/se050ctl.nim
+```
+
+The library layer provides low-level primitives. Product policy, firmware package parsing, envelope formats, signing policy, and A/B update logic should live above it.
+
+## Build
+
+```sh
+nimble build
+```
+
+Dependencies are intentionally small:
+
+```nim
+requires "nim >= 2.2.10"
+requires "results >= 0.5.1"
+requires "argparse >= 4.0.2"
+```
+
+Keep the `results` dependency as `>= 0.5.1`; using `> 0.5.1` can prevent builds when `0.5.1` is the available version.
 
 ## License
 

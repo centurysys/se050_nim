@@ -8,6 +8,9 @@ type
   Se050ErrorKind* = enum
     seOk,
 
+    # API / caller errors
+    seInvalidArgument,
+
     # I2C / transport errors
     seI2cWriteFailed,
     seI2cReadFailed,
