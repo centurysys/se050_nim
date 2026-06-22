@@ -11,6 +11,7 @@
 import ./errors
 import ./transport
 import ./apdu
+import ./tlv
 
 # =============================================================================
 # Constants
@@ -45,6 +46,26 @@ const
 
   # SecureObjectType constants used by ReadType after key generation.
   Se050TypeEcKeyPairMontDh25519* = 0x69'u8
+
+  # SE05x ReadObject APDU.
+  #
+  # NXP AN12413 describes ReadObject as:
+  #   CLA = 0x80
+  #   INS = INS_READ   = 0x02
+  #   P1  = P1_DEFAULT = 0x00
+  #   P2  = P2_DEFAULT = 0x00
+  #
+  # Command data:
+  #   TAG_1: 4-byte Secure Object identifier
+  #
+  # Response data:
+  #   TAG_1: Data read from the Secure Object
+  #
+  # For an EC key pair or EC public key, ReadObject returns the public key.
+  ReadObjectCla = 0x80'u8
+  ReadObjectIns = 0x02'u8
+  ReadObjectP1 = 0x00'u8
+  ReadObjectP2 = 0x00'u8
 
   # On-chip asymmetric key generation can take longer than normal object
   # inspection/random commands. During that time the T=1 over I2C layer may see
@@ -91,6 +112,59 @@ proc curveName*(curve: EcCurveKind): string =
 proc expectedKeyPairType*(curve: EcCurveKind): uint8 =
   result = case curve
   of ecCurveX25519: Se050TypeEcKeyPairMontDh25519
+
+proc buildReadObjectApdu(objectId: uint32): seq[uint8] =
+  result = @[
+    ReadObjectCla,
+    ReadObjectIns,
+    ReadObjectP1,
+    ReadObjectP2,
+    0x06'u8,
+
+    # TAG_1: 4-byte Secure Object identifier
+    Tag1,
+    0x04'u8
+  ]
+  result.appendU32Be(objectId)
+
+  # Le
+  result.add(0x00'u8)
+
+proc parseReadObjectValue(response: openArray[uint8]): SE[seq[uint8]] =
+  let st = checkStatus(response, "ReadObject")
+  if not st.ok:
+    return fail[seq[uint8]](st.error.kind, st.error.message, st.error.sw)
+
+  let data = dataWithoutStatus(response)
+  if not data.ok:
+    return fail[seq[uint8]](data.error.kind, data.error.message, data.error.sw)
+
+  if data.value.len < 3:
+    return fail[seq[uint8]](
+      seInvalidResponse,
+      "ReadObject response does not contain TAG/LEN/VALUE"
+    )
+
+  if data.value[0] != Tag1:
+    return fail[seq[uint8]](
+      seInvalidResponse,
+      "ReadObject response does not start with TAG_1"
+    )
+
+  let tlvLen = readTlvLength(data.value, 1)
+  if not tlvLen.ok:
+    return fail[seq[uint8]](tlvLen.error.kind, tlvLen.error.message, tlvLen.error.sw)
+
+  let valueStart = tlvLen.value.nextIndex
+  let valueEnd = valueStart + tlvLen.value.length
+  if valueEnd > data.value.len:
+    return fail[seq[uint8]](
+      seInvalidResponse,
+      "ReadObject response value is shorter than expected"
+    )
+
+  let value = data.value[valueStart ..< valueEnd]
+  result = ok(value)
 
 proc buildGenerateEcKeyPairApdu(objectId: uint32, curve: EcCurveKind): SE[seq[uint8]] =
   var payload: seq[uint8] = @[]
@@ -173,3 +247,34 @@ proc generateX25519KeyPair*(
     curve = ecCurveX25519,
     selectFirst = selectFirst
   )
+
+
+proc readPublicKey*(
+    se: Se050Transport,
+    objectId: uint32,
+    selectFirst: bool = true
+): SE[seq[uint8]] =
+  ## Reads the public key material from an SE050 EC key pair or EC public key.
+  ##
+  ## This is a raw ReadObject helper. The SE050 returns the public key for EC
+  ## key-pair and EC-public-key objects. The caller is responsible for checking
+  ## the Secure Object type before calling this helper if it needs stricter
+  ## semantics.
+  if selectFirst:
+    let selected = se.selectApplet()
+    if not selected.ok:
+      return fail[seq[uint8]](
+        selected.error.kind,
+        selected.error.message,
+        selected.error.sw
+      )
+
+  let response = se.transceiveApdu(buildReadObjectApdu(objectId))
+  if not response.ok:
+    return fail[seq[uint8]](
+      response.error.kind,
+      response.error.message,
+      response.error.sw
+    )
+
+  result = parseReadObjectValue(response.value)

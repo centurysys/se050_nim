@@ -364,6 +364,21 @@ proc parseCurveKind(s: string): EcCurveKind =
   else:
     raise newException(ValueError, &"unsupported curve for se050ctl keygen: {s}")
 
+proc isReadableEcPublicObjectType(objectType: uint8): bool =
+  ## Returns true for EC key-pair/public-key object types whose public key can
+  ## be read using ReadObject.
+  case objectType
+  of 0x01, 0x03, 0x65, 0x67, 0x69, 0x6B, 0x71, 0x73:
+    result = true
+  else:
+    result = false
+
+proc bytesToRawString(data: openArray[uint8]): string =
+  ## Converts raw bytes to a Nim string without changing byte values.
+  result = newString(data.len)
+  for i, b in data:
+    result[i] = char(b)
+
 proc typeText(objectType: uint8): string =
   result = &"0x{objectType.toHex(2)} ({objectTypeName(objectType)})"
 
@@ -605,6 +620,52 @@ proc runKeygen(
 
   result = 0
 
+proc runPubkey(
+    busText: string,
+    addressText: string,
+    debug: bool,
+    idText: string,
+    areaText: string,
+    indexText: string,
+    nameText: string,
+    outputPath: string,
+    separator: string
+): int =
+  let objectRef = resolveObjectRef(idText, areaText, indexText, nameText)
+  let se = openAndRequestAtr(busText, addressText, debug)
+
+  let exists = se.objectExists(objectId = objectRef.objectId, selectFirst = true)
+  if not exists.ok:
+    printSe050Error("CheckObjectExists failed", exists.error)
+    return 1
+
+  if not exists.value:
+    stderr.writeLine &"pubkey failed: {objectIdHex(objectRef.objectId)} does not exist"
+    return 1
+
+  let typ = se.readObjectType(objectId = objectRef.objectId, selectFirst = false)
+  if not typ.ok:
+    printSe050Error("ReadType failed", typ.error)
+    return 1
+
+  if not typ.value.objectType.isReadableEcPublicObjectType():
+    stderr.writeLine &"pubkey refused: {objectIdHex(objectRef.objectId)} is {typeText(typ.value.objectType)}, not an EC key pair/public key"
+    return 2
+
+  let publicKey = se.readPublicKey(objectId = objectRef.objectId, selectFirst = false)
+  if not publicKey.ok:
+    printSe050Error("ReadObject failed", publicKey.error)
+    return 1
+
+  if outputPath.strip().len > 0:
+    writeFile(outputPath, bytesToRawString(publicKey.value))
+    echo &"{objectIdHex(objectRef.objectId)}: public key written to {outputPath}"
+    echo &"length: {publicKey.value.len}"
+  else:
+    echo bytesToHex(publicKey.value, separator = separator)
+
+  result = 0
+
 proc runDelete(
     busText: string,
     addressText: string,
@@ -734,6 +795,31 @@ proc main(): int =
           opts.index,
           opts.name,
           opts.curve
+        ))
+
+    command("pubkey"):
+      help("Read the public key from an SE050 EC key pair or EC public key object.")
+      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
+      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("--id", default = some(""), help = "Secure Object ID in hex, e.g. 0x30000100")
+      option("--area", default = some(""), help = "Object area: dev, customer, vendor, nxp, internal")
+      option("--index", default = some(""), help = "Area-relative object index, decimal or 0x-prefixed hex")
+      option("--name", default = some(""), help = "Known object name. Must refer to an EC key object")
+      option("-o", "--out", default = some(""), help = "Write raw public key bytes to this file instead of printing hex")
+      flag("--colon", help = "Print bytes as AA:BB:CC... when not using --out")
+      flag("-d", "--debug", help = "Print T=1 over I2C frames")
+      run:
+        let separator = if opts.colon: ":" else: ""
+        quit(runPubkey(
+          opts.bus,
+          opts.address,
+          opts.debug,
+          opts.id,
+          opts.area,
+          opts.index,
+          opts.name,
+          opts.out,
+          separator
         ))
 
     command("delete"):
