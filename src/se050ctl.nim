@@ -16,6 +16,22 @@ import argparse
 import se050_nim
 
 # =============================================================================
+# Safety policy for destructive CLI operations
+# =============================================================================
+
+const
+  VendorReservedStart = 0x10000000'u32
+  VendorReservedEnd = 0x10000FFF'u32
+
+  # NXP-reserved applet objects such as 0x7FFF0206 unique ID live here.
+  NxpReservedStart = 0x7FFF0000'u32
+  NxpReservedEnd = 0x7FFFFFFF'u32
+
+  # Objects observed in this range are treated as internal/platform objects.
+  InternalReservedStart = 0xF0000000'u32
+  InternalReservedEnd = 0xFFFFFFFF'u32
+
+# =============================================================================
 # Utility
 # =============================================================================
 
@@ -86,6 +102,34 @@ proc printSe050Error(prefix: string, e: Se050Error) =
 
 proc objectIdHex(objectId: uint32): string =
   result = &"0x{objectId.toHex(8)}"
+
+proc isInRange(value: uint32, first: uint32, last: uint32): bool =
+  result = value >= first and value <= last
+
+proc isVendorReservedObjectId(objectId: uint32): bool =
+  result = objectId.isInRange(VendorReservedStart, VendorReservedEnd)
+
+proc isProtectedReservedObjectId(objectId: uint32): bool =
+  result =
+    objectId.isInRange(NxpReservedStart, NxpReservedEnd) or
+    objectId.isInRange(InternalReservedStart, InternalReservedEnd)
+
+proc deleteTargetError(objectId: uint32): Option[string] =
+  if objectId == 0'u32:
+    return some("object id 0x00000000 is not a valid delete target")
+
+  if objectId.isProtectedReservedObjectId():
+    return some(
+      &"delete refused: {objectIdHex(objectId)} is in a protected SE050 reserved range"
+    )
+
+  if objectId.isVendorReservedObjectId():
+    return some(
+      &"delete refused: {objectIdHex(objectId)} is in the vendor reserved range; " &
+      "use a dedicated provisioning tool for vendor-reserved objects"
+    )
+
+  result = none(string)
 
 proc typeText(objectType: uint8): string =
   result = &"0x{objectType.toHex(2)} ({objectTypeName(objectType)})"
@@ -225,6 +269,47 @@ proc runList(
 
   result = 0
 
+proc runDelete(
+    busText: string,
+    addressText: string,
+    debug: bool,
+    objectIdText: string
+): int =
+  let objectId = parseObjectId(objectIdText)
+
+  let guard = deleteTargetError(objectId = objectId)
+  if guard.isSome:
+    stderr.writeLine guard.get()
+    return 2
+
+  let se = openAndRequestAtr(busText, addressText, debug)
+
+  let exists = se.objectExists(objectId = objectId, selectFirst = true)
+  if not exists.ok:
+    printSe050Error("CheckObjectExists failed", exists.error)
+    return 1
+
+  if not exists.value:
+    echo &"{objectIdHex(objectId)}: missing"
+    return 1
+
+  let deleted = se.deleteSecureObject(objectId = objectId, selectFirst = false)
+  if not deleted.ok:
+    printSe050Error("DeleteSecureObject failed", deleted.error)
+    return 1
+
+  let after = se.objectExists(objectId = objectId, selectFirst = false)
+  if not after.ok:
+    printSe050Error("Delete verification failed", after.error)
+    return 1
+
+  if after.value:
+    stderr.writeLine &"DeleteSecureObject returned success, but {objectIdHex(objectId)} still exists"
+    return 1
+
+  echo &"{objectIdHex(objectId)}: deleted"
+  result = 0
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -281,6 +366,20 @@ proc main(): int =
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
         quit(runList(opts.bus, opts.address, opts.debug, opts.filter))
+
+    command("delete"):
+      help("Delete an SE050 Secure Object identifier. Destructive operation; reserved ranges are always guarded.")
+      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
+      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("--id", required = true, help = "Secure Object ID in hex, e.g. 0x30000100")
+      flag("-d", "--debug", help = "Print T=1 over I2C frames")
+      run:
+        quit(runDelete(
+          opts.bus,
+          opts.address,
+          opts.debug,
+          opts.id
+        ))
 
   try:
     parser.run()

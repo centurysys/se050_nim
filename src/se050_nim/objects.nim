@@ -112,6 +112,24 @@ const
   ReadSizeP1 = 0x00'u8
   ReadSizeP2 = 0x07'u8
 
+  # SE05x DeleteSecureObject APDU.
+  #
+  # NXP AN12413 names this command:
+  #   CLA = 0x80
+  #   INS = INS_MGMT          = 0x04
+  #   P1  = P1_DEFAULT        = 0x00
+  #   P2  = P2_DELETE_OBJECT  = 0x28
+  #
+  # Command data:
+  #   TAG_1: 4-byte existing Secure Object identifier
+  #
+  # Response data:
+  #   none, only SW1/SW2
+  DeleteObjectCla = 0x80'u8
+  DeleteObjectIns = 0x04'u8
+  DeleteObjectP1 = 0x00'u8
+  DeleteObjectP2 = 0x28'u8
+
   TransientPersistent = 0x01'u8
   TransientObject = 0x02'u8
 
@@ -235,6 +253,22 @@ proc buildReadSizeApdu(objectId: uint32): seq[uint8] =
     p2 = ReadSizeP2,
     objectId = objectId
   )
+
+proc buildDeleteObjectApdu(objectId: uint32): seq[uint8] =
+  result = @[
+    DeleteObjectCla,
+    DeleteObjectIns,
+    DeleteObjectP1,
+    DeleteObjectP2,
+    0x06'u8,
+
+    # TAG_1: 4-byte Secure Object identifier
+    Tag1,
+    0x04'u8
+  ]
+  result.appendU32Be(objectId)
+
+  # DeleteSecureObject has no Le field.
 
 proc parseExistsResponse(response: openArray[uint8]): SE[bool] =
   let st = checkStatus(response, "CheckObjectExists")
@@ -627,6 +661,37 @@ proc readObjectSize*(
     )
 
   result = parseReadSizeResponse(response.value)
+
+proc deleteSecureObject*(
+    se: Se050Transport,
+    objectId: uint32,
+    selectFirst: bool = true
+): SE[void] =
+  ## Deletes a Secure Object identifier from the selected SE050 applet.
+  ##
+  ## This is the raw low-level primitive. User-facing safety policy, such as
+  ## refusing to delete reserved object ranges, belongs in CLI/provisioning
+  ## tools rather than in this library function. The SE050 object policy may
+  ## still reject deletion.
+  if selectFirst:
+    let selected = se.selectApplet()
+    if not selected.ok:
+      return fail[void](
+        selected.error.kind,
+        selected.error.message,
+        selected.error.sw
+      )
+
+  let apdu = buildDeleteObjectApdu(objectId)
+  let response = se.transceiveApdu(apdu)
+  if not response.ok:
+    return fail[void](
+      response.error.kind,
+      response.error.message,
+      response.error.sw
+    )
+
+  result = checkStatus(response.value, "DeleteSecureObject")
 
 proc listObjectIds*(
     se: Se050Transport,
