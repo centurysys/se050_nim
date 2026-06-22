@@ -359,6 +359,8 @@ proc keygenTargetError(objectId: uint32): Option[string] =
 
 proc parseCurveKind(s: string): EcCurveKind =
   case s.strip().toLowerAscii()
+  of "p256", "prime256v1", "nist-p256", "nist_p256", "secp256r1":
+    result = ecCurveP256
   of "x25519", "mont-dh-25519", "mont25519", "ecc-mont-dh-25519":
     result = ecCurveX25519
   else:
@@ -368,16 +370,38 @@ proc isReadableEcPublicObjectType(objectType: uint8): bool =
   ## Returns true for EC key-pair/public-key object types whose public key can
   ## be read using ReadObject.
   case objectType
-  of 0x01, 0x03, 0x65, 0x67, 0x69, 0x6B, 0x71, 0x73:
+  of 0x01, 0x03, 0x29, 0x2B, 0x65, 0x67, 0x69, 0x6B, 0x71, 0x73:
     result = true
   else:
     result = false
+
+proc expectedPeerPublicKeyLength(objectType: uint8): int =
+  ## Returns the raw public-key length accepted by the current derive helper.
+  ##
+  ## NIST P-256 public keys are uncompressed points: 0x04 || X || Y.
+  ## X25519 public keys are raw 32-byte Montgomery u-coordinates.
+  case objectType
+  of Se050TypeEcKeyPair, Se050TypeEcKeyPairNistP256:
+    result = 65
+  of Se050TypeEcKeyPairMontDh25519:
+    result = 32
+  else:
+    result = 0
+
+proc isDeriveKeyPairObjectType(objectType: uint8): bool =
+  result = expectedPeerPublicKeyLength(objectType) > 0
 
 proc bytesToRawString(data: openArray[uint8]): string =
   ## Converts raw bytes to a Nim string without changing byte values.
   result = newString(data.len)
   for i, b in data:
     result[i] = char(b)
+
+proc rawStringToBytes(data: string): seq[uint8] =
+  ## Converts a Nim string read from a file into raw bytes.
+  result = newSeq[uint8](data.len)
+  for i, ch in data:
+    result[i] = uint8(ord(ch))
 
 proc typeText(objectType: uint8): string =
   result = &"0x{objectType.toHex(2)} ({objectTypeName(objectType)})"
@@ -439,6 +463,34 @@ proc runRandom(
     return 1
 
   echo randomHex.value
+  result = 0
+
+proc runVersion(
+    busText: string,
+    addressText: string,
+    debug: bool
+): int =
+  let se = openAndRequestAtr(busText, addressText, debug)
+
+  let version = se.getVersionInfo(selectFirst = true)
+  if not version.ok:
+    printSe050Error("GetVersion failed", version.error)
+    return 1
+
+  let v = version.value
+  echo &"applet version: {v.major}.{v.minor}.{v.patch}"
+  echo &"applet config: 0x{v.appletConfig.toHex(4)}"
+  echo &"secure box version: {v.secureBoxMajor}.{v.secureBoxMinor}"
+  echo "features:"
+  for bit in knownFeatureBits():
+    let mark = if v.hasFeature(bit): "yes" else: "no"
+    echo &"  {featureName(bit)}: {mark}"
+
+  if not v.hasFeature(ConfigFipsModeDisabled):
+    echo "notes:"
+    echo "  CONFIG_FIPS_MODE_DISABLED is not set."
+    echo "  SE050 may reject ECDHGenerateSharedSecret with SW=0x6985 on this applet configuration."
+
   result = 0
 
 proc runExists(
@@ -666,6 +718,86 @@ proc runPubkey(
 
   result = 0
 
+proc runDerive(
+    busText: string,
+    addressText: string,
+    debug: bool,
+    idText: string,
+    areaText: string,
+    indexText: string,
+    nameText: string,
+    peerPublicPath: string,
+    outputPath: string,
+    separator: string,
+    reverseDh: bool,
+    reversePeerPublic: bool
+): int =
+  let objectRef = resolveObjectRef(idText, areaText, indexText, nameText)
+  var peerPublicKey: seq[uint8]
+  try:
+    peerPublicKey = rawStringToBytes(readFile(peerPublicPath))
+  except CatchableError as e:
+    stderr.writeLine &"derive failed: cannot read peer public key file {peerPublicPath}: {e.msg}"
+    return 1
+
+  let se = openAndRequestAtr(busText, addressText, debug)
+
+  let exists = se.objectExists(objectId = objectRef.objectId, selectFirst = true)
+  if not exists.ok:
+    printSe050Error("CheckObjectExists failed", exists.error)
+    return 1
+
+  if not exists.value:
+    stderr.writeLine &"derive failed: {objectIdHex(objectRef.objectId)} does not exist"
+    return 1
+
+  let typ = se.readObjectType(objectId = objectRef.objectId, selectFirst = false)
+  if not typ.ok:
+    printSe050Error("ReadType failed", typ.error)
+    return 1
+
+  if not typ.value.objectType.isDeriveKeyPairObjectType():
+    stderr.writeLine &"derive refused: {objectIdHex(objectRef.objectId)} is {typeText(typ.value.objectType)}, not a supported EC key pair for derive"
+    return 2
+
+  let expectedPeerLen = expectedPeerPublicKeyLength(typ.value.objectType)
+  if peerPublicKey.len != expectedPeerLen:
+    stderr.writeLine &"derive refused: peer public key length mismatch for {typeText(typ.value.objectType)}: expected {expectedPeerLen} bytes, got {peerPublicKey.len}"
+    return 2
+
+  if typ.value.objectType in {Se050TypeEcKeyPair, Se050TypeEcKeyPairNistP256} and peerPublicKey.len > 0 and peerPublicKey[0] != 0x04'u8:
+    stderr.writeLine "derive refused: P-256 peer public key must be an uncompressed point starting with 0x04"
+    return 2
+
+  let sharedSecret = se.deriveSharedSecret(
+    objectId = objectRef.objectId,
+    peerPublicKey = peerPublicKey,
+    selectFirst = false,
+    reverseDh = reverseDh,
+    reversePeerPublic = reversePeerPublic
+  )
+  if not sharedSecret.ok:
+    printSe050Error("ECDHGenerateSharedSecret failed", sharedSecret.error)
+    return 1
+
+  if outputPath.strip().len > 0:
+    writeFile(outputPath, bytesToRawString(sharedSecret.value))
+    echo &"{objectIdHex(objectRef.objectId)}: shared secret written to {outputPath}"
+    printResolvedObjectRef(objectRef)
+    if reverseDh:
+      echo "dh variant: reverse"
+    else:
+      echo "dh variant: normal"
+    if reversePeerPublic:
+      echo "peer public: reversed before APDU"
+    else:
+      echo "peer public: as-is"
+    echo &"length: {sharedSecret.value.len}"
+  else:
+    echo bytesToHex(sharedSecret.value, separator = separator)
+
+  result = 0
+
 proc runDelete(
     busText: string,
     addressText: string,
@@ -739,6 +871,14 @@ proc main(): int =
         let separator = if opts.colon: ":" else: ""
         quit(runRandom(opts.bus, opts.address, opts.debug, opts.len, separator))
 
+    command("version"):
+      help("Read SE050 applet version and feature configuration.")
+      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
+      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      flag("-d", "--debug", help = "Print T=1 over I2C frames")
+      run:
+        quit(runVersion(opts.bus, opts.address, opts.debug))
+
     command("exists"):
       help("Check whether an SE050 Secure Object identifier exists.")
       option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
@@ -783,7 +923,7 @@ proc main(): int =
       option("--area", default = some(""), help = "Object area. For keygen, only dev is allowed")
       option("--index", default = some(""), help = "Area-relative object index, decimal or 0x-prefixed hex")
       option("--name", default = some(""), help = "Known object name. Not useful for keygen, but rejected safely")
-      option("--curve", default = some("x25519"), help = "Curve name, currently: x25519")
+      option("--curve", default = some("x25519"), help = "Curve name: x25519 or p256")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
         quit(runKeygen(
@@ -820,6 +960,37 @@ proc main(): int =
           opts.name,
           opts.out,
           separator
+        ))
+
+    command("derive"):
+      help("Derive an ECDH shared secret using an SE050 EC key pair and a peer public key file.")
+      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
+      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("--id", default = some(""), help = "Secure Object ID in hex, e.g. 0x30000100")
+      option("--area", default = some(""), help = "Object area: dev, customer, vendor, nxp, internal")
+      option("--index", default = some(""), help = "Area-relative object index, decimal or 0x-prefixed hex")
+      option("--name", default = some(""), help = "Known object name. Must refer to a supported EC key pair")
+      option("--peer-public", required = true, help = "Raw peer public key file: 32 bytes for x25519, 65 bytes for p256")
+      option("-o", "--out", default = some(""), help = "Write raw shared secret bytes to this file instead of printing hex")
+      flag("--colon", help = "Print bytes as AA:BB:CC... when not using --out")
+      flag("--reverse-dh", help = "Use SE05x P2_DH_REVERSE variant for Montgomery byte-order validation")
+      flag("--reverse-peer-public", help = "Reverse peer public key bytes before sending TLV[TAG_2] (diagnostic for Montgomery curves)")
+      flag("-d", "--debug", help = "Print T=1 over I2C frames")
+      run:
+        let separator = if opts.colon: ":" else: ""
+        quit(runDerive(
+          opts.bus,
+          opts.address,
+          opts.debug,
+          opts.id,
+          opts.area,
+          opts.index,
+          opts.name,
+          opts.peer_public,
+          opts.out,
+          separator,
+          opts.reverse_dh,
+          opts.reverse_peer_public
         ))
 
     command("delete"):
