@@ -16,12 +16,21 @@ import argparse
 import se050_nim
 
 # =============================================================================
-# Safety policy for destructive CLI operations
+# SE050 object namespace policy used by this CLI
 # =============================================================================
 
 const
   VendorReservedStart = 0x10000000'u32
   VendorReservedEnd = 0x10000FFF'u32
+
+  CustomerStart = 0x20000000'u32
+  CustomerEnd = 0x2000FFFF'u32
+
+  # se050ctl intentionally keeps key creation in this shallow-water development
+  # range. Vendor-reserved IDs are left to a dedicated provisioning tool, not
+  # this user-facing diagnostic CLI.
+  DevelopmentStart = 0x30000000'u32
+  DevelopmentEnd = 0x3000FFFF'u32
 
   # NXP-reserved applet objects such as 0x7FFF0206 unique ID live here.
   NxpReservedStart = 0x7FFF0000'u32
@@ -31,11 +40,34 @@ const
   InternalReservedStart = 0xF0000000'u32
   InternalReservedEnd = 0xFFFFFFFF'u32
 
-  # se050ctl intentionally keeps key creation/deletion in this shallow-water
-  # development range. Vendor-reserved IDs are left to a dedicated provisioning
-  # tool, not this user-facing diagnostic CLI.
-  DevelopmentStart = 0x30000000'u32
-  DevelopmentEnd = 0x3000FFFF'u32
+  # Known NXP/pre-provisioned object IDs whose role is already confirmed by the
+  # current low-level implementation.
+  KnownUidObjectId = 0x7FFF0206'u32
+
+# =============================================================================
+# Types
+# =============================================================================
+
+type
+  ObjectArea = enum
+    oaVendor,
+    oaCustomer,
+    oaDev,
+    oaNxp,
+    oaInternal,
+    oaOther
+
+  ObjectAreaSpec = object
+    area: ObjectArea
+    name: string
+    first: uint32
+    last: uint32
+    creatableBySe050ctl: bool
+    deletableBySe050ctl: bool
+
+  ObjectRef = object
+    objectId: uint32
+    source: string
 
 # =============================================================================
 # Utility
@@ -86,6 +118,27 @@ proc parseObjectId(s: string): uint32 =
 
   result = uint32(v)
 
+proc parseIndex(s: string): uint32 =
+  ## Parses an area-relative object index.
+  ##
+  ## Decimal is accepted by default, and 0x-prefixed values are accepted as
+  ## hexadecimal. This keeps `--index 0, 1, 2...` convenient while still allowing
+  ## values such as `--index 0x100` during low-level work.
+  let trimmed = s.strip()
+  if trimmed.len == 0:
+    raise newException(ValueError, "object index is empty")
+
+  let v =
+    if trimmed.startsWith("0x") or trimmed.startsWith("0X"):
+      parseHexInt(trimmed[2 .. ^1])
+    else:
+      parseInt(trimmed)
+
+  if v < 0:
+    raise newException(ValueError, &"object index must be >= 0: {s}")
+
+  result = uint32(v)
+
 proc parseHexByte(s: string): uint8 =
   ## Parses a hexadecimal byte value.
   var t = s.strip()
@@ -112,16 +165,159 @@ proc objectIdHex(objectId: uint32): string =
 proc isInRange(value: uint32, first: uint32, last: uint32): bool =
   result = value >= first and value <= last
 
+proc areaSpecs(): array[5, ObjectAreaSpec] =
+  result = [
+    ObjectAreaSpec(
+      area: oaVendor,
+      name: "vendor",
+      first: VendorReservedStart,
+      last: VendorReservedEnd,
+      creatableBySe050ctl: false,
+      deletableBySe050ctl: false
+    ),
+    ObjectAreaSpec(
+      area: oaCustomer,
+      name: "customer",
+      first: CustomerStart,
+      last: CustomerEnd,
+      creatableBySe050ctl: false,
+      deletableBySe050ctl: true
+    ),
+    ObjectAreaSpec(
+      area: oaDev,
+      name: "dev",
+      first: DevelopmentStart,
+      last: DevelopmentEnd,
+      creatableBySe050ctl: true,
+      deletableBySe050ctl: true
+    ),
+    ObjectAreaSpec(
+      area: oaNxp,
+      name: "nxp",
+      first: NxpReservedStart,
+      last: NxpReservedEnd,
+      creatableBySe050ctl: false,
+      deletableBySe050ctl: false
+    ),
+    ObjectAreaSpec(
+      area: oaInternal,
+      name: "internal",
+      first: InternalReservedStart,
+      last: InternalReservedEnd,
+      creatableBySe050ctl: false,
+      deletableBySe050ctl: false
+    )
+  ]
+
+proc areaName(area: ObjectArea): string =
+  case area
+  of oaVendor: "vendor"
+  of oaCustomer: "customer"
+  of oaDev: "dev"
+  of oaNxp: "nxp"
+  of oaInternal: "internal"
+  of oaOther: "other"
+
+proc findAreaSpec(name: string): Option[ObjectAreaSpec] =
+  let normalized = name.strip().toLowerAscii()
+  for spec in areaSpecs():
+    if spec.name == normalized:
+      return some(spec)
+  result = none(ObjectAreaSpec)
+
+proc classifyArea(objectId: uint32): ObjectArea =
+  for spec in areaSpecs():
+    if objectId.isInRange(spec.first, spec.last):
+      return spec.area
+  result = oaOther
+
+proc areaLabel(objectId: uint32): string =
+  result = objectId.classifyArea().areaName()
+
 proc isVendorReservedObjectId(objectId: uint32): bool =
-  result = objectId.isInRange(VendorReservedStart, VendorReservedEnd)
+  result = objectId.classifyArea() == oaVendor
 
 proc isProtectedReservedObjectId(objectId: uint32): bool =
-  result =
-    objectId.isInRange(NxpReservedStart, NxpReservedEnd) or
-    objectId.isInRange(InternalReservedStart, InternalReservedEnd)
+  let area = objectId.classifyArea()
+  result = area == oaNxp or area == oaInternal
 
 proc isDevelopmentObjectId(objectId: uint32): bool =
-  result = objectId.isInRange(DevelopmentStart, DevelopmentEnd)
+  result = objectId.classifyArea() == oaDev
+
+proc knownObjectName(objectId: uint32): string =
+  case objectId
+  of KnownUidObjectId:
+    result = "uid"
+  else:
+    result = "-"
+
+proc objectIdForKnownName(name: string): uint32 =
+  case name.strip().toLowerAscii()
+  of "uid", "unique-id", "unique_id":
+    result = KnownUidObjectId
+  else:
+    raise newException(ValueError, &"unknown object name: {name}")
+
+proc sourceCount(idText: string, areaText: string, indexText: string, nameText: string): int =
+  if idText.strip().len > 0:
+    inc result
+  if nameText.strip().len > 0:
+    inc result
+  if areaText.strip().len > 0 or indexText.strip().len > 0:
+    inc result
+
+proc resolveObjectRef(
+    idText: string,
+    areaText: string,
+    indexText: string,
+    nameText: string
+): ObjectRef =
+  ## Resolves one object reference from exactly one of:
+  ##   --id 0x30000100
+  ##   --area dev --index 0x100
+  ##   --name uid
+  let count = sourceCount(idText, areaText, indexText, nameText)
+  if count == 0:
+    raise newException(
+      ValueError,
+      "object reference is required: use --id, --area/--index, or --name"
+    )
+  if count > 1:
+    raise newException(
+      ValueError,
+      "--id, --area/--index, and --name are mutually exclusive"
+    )
+
+  if idText.strip().len > 0:
+    result.objectId = parseObjectId(idText)
+    result.source = "id"
+    return
+
+  if nameText.strip().len > 0:
+    result.objectId = objectIdForKnownName(nameText)
+    result.source = &"name:{nameText.strip().toLowerAscii()}"
+    return
+
+  if areaText.strip().len == 0 or indexText.strip().len == 0:
+    raise newException(ValueError, "--area and --index must be specified together")
+
+  let spec = findAreaSpec(areaText)
+  if spec.isNone:
+    raise newException(
+      ValueError,
+      &"unknown area: {areaText}. Supported areas: vendor, customer, dev, nxp, internal"
+    )
+
+  let index = parseIndex(indexText)
+  let maxIndex = spec.get().last - spec.get().first
+  if index > maxIndex:
+    raise newException(
+      ValueError,
+      &"index out of range for area {spec.get().name}: 0..0x{maxIndex.toHex(8)}"
+    )
+
+  result.objectId = spec.get().first + index
+  result.source = &"area:{spec.get().name}[0x{index.toHex(8)}]"
 
 proc deleteTargetError(objectId: uint32): Option[string] =
   if objectId == 0'u32:
@@ -178,6 +374,10 @@ proc transientText(indicator: Option[uint8]): string =
   else:
     result = "n/a"
 
+proc printResolvedObjectRef(objectRef: ObjectRef) =
+  if objectRef.source != "id":
+    echo &"ref: {objectRef.source}"
+
 # =============================================================================
 # Commands
 # =============================================================================
@@ -230,20 +430,23 @@ proc runExists(
     busText: string,
     addressText: string,
     debug: bool,
-    objectIdText: string,
+    idText: string,
+    areaText: string,
+    indexText: string,
+    nameText: string,
     quiet: bool
 ): int =
-  let objectId = parseObjectId(objectIdText)
+  let objectRef = resolveObjectRef(idText, areaText, indexText, nameText)
   let se = openAndRequestAtr(busText, addressText, debug)
 
-  let exists = se.objectExists(objectId = objectId, selectFirst = true)
+  let exists = se.objectExists(objectId = objectRef.objectId, selectFirst = true)
   if not exists.ok:
     printSe050Error("CheckObjectExists failed", exists.error)
     return 1
 
   if not quiet:
     let statusText = if exists.value: "exists" else: "missing"
-    echo &"{objectIdHex(objectId)}: {statusText}"
+    echo &"{objectIdHex(objectRef.objectId)}: {statusText}"
 
   result = if exists.value: 0 else: 1
 
@@ -251,24 +454,33 @@ proc runInfo(
     busText: string,
     addressText: string,
     debug: bool,
-    objectIdText: string
+    idText: string,
+    areaText: string,
+    indexText: string,
+    nameText: string
 ): int =
-  let objectId = parseObjectId(objectIdText)
+  let objectRef = resolveObjectRef(idText, areaText, indexText, nameText)
   let se = openAndRequestAtr(busText, addressText, debug)
 
-  let exists = se.objectExists(objectId = objectId, selectFirst = true)
+  let exists = se.objectExists(objectId = objectRef.objectId, selectFirst = true)
   if not exists.ok:
     printSe050Error("CheckObjectExists failed", exists.error)
     return 1
 
-  echo &"id: {objectIdHex(objectId)}"
+  echo &"id: {objectIdHex(objectRef.objectId)}"
+  printResolvedObjectRef(objectRef)
+  echo &"area: {areaLabel(objectRef.objectId)}"
+  let knownName = knownObjectName(objectRef.objectId)
+  if knownName != "-":
+    echo &"name: {knownName}"
+
   let existsText = if exists.value: "yes" else: "no"
   echo &"exists: {existsText}"
 
   if not exists.value:
     return 1
 
-  let typ = se.readObjectType(objectId = objectId, selectFirst = false)
+  let typ = se.readObjectType(objectId = objectRef.objectId, selectFirst = false)
   if not typ.ok:
     printSe050Error("ReadType failed", typ.error)
     return 1
@@ -276,7 +488,7 @@ proc runInfo(
   echo &"type: {typeText(typ.value.objectType)}"
   echo &"transient: {transientText(typ.value.transientIndicator)}"
 
-  let size = se.readObjectSize(objectId = objectId, selectFirst = false)
+  let size = se.readObjectSize(objectId = objectRef.objectId, selectFirst = false)
   if size.ok:
     echo &"size: {size.value}"
   else:
@@ -291,9 +503,23 @@ proc runList(
     busText: string,
     addressText: string,
     debug: bool,
-    filterText: string
+    filterText: string,
+    areaText: string,
+    annotate: bool
 ): int =
   let filter = parseHexByte(filterText)
+  let areaFilter =
+    if areaText.strip().len > 0:
+      let spec = findAreaSpec(areaText)
+      if spec.isNone:
+        raise newException(
+          ValueError,
+          &"unknown area: {areaText}. Supported areas: vendor, customer, dev, nxp, internal"
+        )
+      some(spec.get().area)
+    else:
+      none(ObjectArea)
+
   let se = openAndRequestAtr(busText, addressText, debug)
 
   let ids = se.listObjectIds(filter = filter, selectFirst = true)
@@ -302,7 +528,14 @@ proc runList(
     return 1
 
   for objectId in ids.value:
-    echo objectIdHex(objectId)
+    let area = objectId.classifyArea()
+    if areaFilter.isSome and area != areaFilter.get():
+      continue
+
+    if annotate:
+      echo &"{objectIdHex(objectId)}  {area.areaName()}  {knownObjectName(objectId)}"
+    else:
+      echo objectIdHex(objectId)
 
   result = 0
 
@@ -310,30 +543,33 @@ proc runKeygen(
     busText: string,
     addressText: string,
     debug: bool,
-    objectIdText: string,
+    idText: string,
+    areaText: string,
+    indexText: string,
+    nameText: string,
     curveText: string
 ): int =
-  let objectId = parseObjectId(objectIdText)
+  let objectRef = resolveObjectRef(idText, areaText, indexText, nameText)
   let curve = parseCurveKind(curveText)
 
-  let guard = keygenTargetError(objectId = objectId)
+  let guard = keygenTargetError(objectId = objectRef.objectId)
   if guard.isSome:
     stderr.writeLine guard.get()
     return 2
 
   let se = openAndRequestAtr(busText, addressText, debug)
 
-  let exists = se.objectExists(objectId = objectId, selectFirst = true)
+  let exists = se.objectExists(objectId = objectRef.objectId, selectFirst = true)
   if not exists.ok:
     printSe050Error("CheckObjectExists failed", exists.error)
     return 1
 
   if exists.value:
-    stderr.writeLine &"keygen refused: {objectIdHex(objectId)} already exists"
+    stderr.writeLine &"keygen refused: {objectIdHex(objectRef.objectId)} already exists"
     return 1
 
   let generated = se.generateEcKeyPair(
-    objectId = objectId,
+    objectId = objectRef.objectId,
     curve = curve,
     selectFirst = false
   )
@@ -341,16 +577,16 @@ proc runKeygen(
     printSe050Error("WriteECKey failed", generated.error)
     return 1
 
-  let after = se.objectExists(objectId = objectId, selectFirst = false)
+  let after = se.objectExists(objectId = objectRef.objectId, selectFirst = false)
   if not after.ok:
     printSe050Error("Keygen verification failed", after.error)
     return 1
 
   if not after.value:
-    stderr.writeLine &"WriteECKey returned success, but {objectIdHex(objectId)} does not exist"
+    stderr.writeLine &"WriteECKey returned success, but {objectIdHex(objectRef.objectId)} does not exist"
     return 1
 
-  let typ = se.readObjectType(objectId = objectId, selectFirst = false)
+  let typ = se.readObjectType(objectId = objectRef.objectId, selectFirst = false)
   if not typ.ok:
     printSe050Error("ReadType after keygen failed", typ.error)
     return 1
@@ -360,7 +596,9 @@ proc runKeygen(
     stderr.writeLine &"keygen verification failed: expected type 0x{expectedType.toHex(2)}, got {typeText(typ.value.objectType)}"
     return 1
 
-  echo &"{objectIdHex(objectId)}: created"
+  echo &"{objectIdHex(objectRef.objectId)}: created"
+  printResolvedObjectRef(objectRef)
+  echo &"area: {areaLabel(objectRef.objectId)}"
   echo &"curve: {curveName(curve)}"
   echo &"type: {typeText(typ.value.objectType)}"
   echo &"transient: {transientText(typ.value.transientIndicator)}"
@@ -371,41 +609,44 @@ proc runDelete(
     busText: string,
     addressText: string,
     debug: bool,
-    objectIdText: string
+    idText: string,
+    areaText: string,
+    indexText: string,
+    nameText: string
 ): int =
-  let objectId = parseObjectId(objectIdText)
+  let objectRef = resolveObjectRef(idText, areaText, indexText, nameText)
 
-  let guard = deleteTargetError(objectId = objectId)
+  let guard = deleteTargetError(objectId = objectRef.objectId)
   if guard.isSome:
     stderr.writeLine guard.get()
     return 2
 
   let se = openAndRequestAtr(busText, addressText, debug)
 
-  let exists = se.objectExists(objectId = objectId, selectFirst = true)
+  let exists = se.objectExists(objectId = objectRef.objectId, selectFirst = true)
   if not exists.ok:
     printSe050Error("CheckObjectExists failed", exists.error)
     return 1
 
   if not exists.value:
-    echo &"{objectIdHex(objectId)}: missing"
+    echo &"{objectIdHex(objectRef.objectId)}: missing"
     return 1
 
-  let deleted = se.deleteSecureObject(objectId = objectId, selectFirst = false)
+  let deleted = se.deleteSecureObject(objectId = objectRef.objectId, selectFirst = false)
   if not deleted.ok:
     printSe050Error("DeleteSecureObject failed", deleted.error)
     return 1
 
-  let after = se.objectExists(objectId = objectId, selectFirst = false)
+  let after = se.objectExists(objectId = objectRef.objectId, selectFirst = false)
   if not after.ok:
     printSe050Error("Delete verification failed", after.error)
     return 1
 
   if after.value:
-    stderr.writeLine &"DeleteSecureObject returned success, but {objectIdHex(objectId)} still exists"
+    stderr.writeLine &"DeleteSecureObject returned success, but {objectIdHex(objectRef.objectId)} still exists"
     return 1
 
-  echo &"{objectIdHex(objectId)}: deleted"
+  echo &"{objectIdHex(objectRef.objectId)}: deleted"
   result = 0
 
 # =============================================================================
@@ -441,35 +682,46 @@ proc main(): int =
       help("Check whether an SE050 Secure Object identifier exists.")
       option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
       option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
-      option("--id", required = true, help = "Secure Object ID in hex, e.g. 0x10000100")
+      option("--id", default = some(""), help = "Secure Object ID in hex, e.g. 0x30000100")
+      option("--area", default = some(""), help = "Object area: dev, customer, vendor, nxp, internal")
+      option("--index", default = some(""), help = "Area-relative object index, decimal or 0x-prefixed hex")
+      option("--name", default = some(""), help = "Known object name, currently: uid")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       flag("-q", "--quiet", help = "Do not print status; use exit code only")
       run:
-        quit(runExists(opts.bus, opts.address, opts.debug, opts.id, opts.quiet))
+        quit(runExists(opts.bus, opts.address, opts.debug, opts.id, opts.area, opts.index, opts.name, opts.quiet))
 
     command("info"):
       help("Read type and size information for an SE050 Secure Object identifier.")
       option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
       option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
-      option("--id", required = true, help = "Secure Object ID in hex, e.g. 0x10000100")
+      option("--id", default = some(""), help = "Secure Object ID in hex, e.g. 0x30000100")
+      option("--area", default = some(""), help = "Object area: dev, customer, vendor, nxp, internal")
+      option("--index", default = some(""), help = "Area-relative object index, decimal or 0x-prefixed hex")
+      option("--name", default = some(""), help = "Known object name, currently: uid")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
-        quit(runInfo(opts.bus, opts.address, opts.debug, opts.id))
+        quit(runInfo(opts.bus, opts.address, opts.debug, opts.id, opts.area, opts.index, opts.name))
 
     command("list"):
       help("List visible SE050 Secure Object identifiers.")
       option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
       option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
       option("--filter", default = some("0xFF"), help = "SecureObjectType filter byte, default: 0xFF for all types")
+      option("--area", default = some(""), help = "Only show IDs in an area: dev, customer, vendor, nxp, internal")
+      flag("--annotate", help = "Print area and known-name columns")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
-        quit(runList(opts.bus, opts.address, opts.debug, opts.filter))
+        quit(runList(opts.bus, opts.address, opts.debug, opts.filter, opts.area, opts.annotate))
 
     command("keygen"):
-      help("Generate a development SE050 key pair. Only 0x30000000..0x3000FFFF is allowed by this CLI.")
+      help("Generate a development SE050 key pair. Only area dev is allowed by this CLI.")
       option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
       option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
-      option("--id", required = true, help = "Development Secure Object ID in hex, e.g. 0x30000100")
+      option("--id", default = some(""), help = "Development Secure Object ID in hex, e.g. 0x30000100")
+      option("--area", default = some(""), help = "Object area. For keygen, only dev is allowed")
+      option("--index", default = some(""), help = "Area-relative object index, decimal or 0x-prefixed hex")
+      option("--name", default = some(""), help = "Known object name. Not useful for keygen, but rejected safely")
       option("--curve", default = some("x25519"), help = "Curve name, currently: x25519")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
@@ -478,6 +730,9 @@ proc main(): int =
           opts.address,
           opts.debug,
           opts.id,
+          opts.area,
+          opts.index,
+          opts.name,
           opts.curve
         ))
 
@@ -485,14 +740,20 @@ proc main(): int =
       help("Delete an SE050 Secure Object identifier. Destructive operation; reserved ranges are always guarded.")
       option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
       option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
-      option("--id", required = true, help = "Secure Object ID in hex, e.g. 0x30000100")
+      option("--id", default = some(""), help = "Secure Object ID in hex, e.g. 0x30000100")
+      option("--area", default = some(""), help = "Object area: dev, customer, vendor, nxp, internal")
+      option("--index", default = some(""), help = "Area-relative object index, decimal or 0x-prefixed hex")
+      option("--name", default = some(""), help = "Known object name. Reserved names are rejected by delete guards")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
         quit(runDelete(
           opts.bus,
           opts.address,
           opts.debug,
-          opts.id
+          opts.id,
+          opts.area,
+          opts.index,
+          opts.name
         ))
 
   try:
