@@ -5,6 +5,7 @@ import se050_nim/[
   tlv,
   uid,
   random,
-  objects
+  objects,
+  keys
 ]
-export errors, transport, apdu, tlv, uid, random, objects
+export errors, transport, apdu, tlv, uid, random, objects, keys

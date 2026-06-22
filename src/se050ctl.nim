@@ -31,6 +31,12 @@ const
   InternalReservedStart = 0xF0000000'u32
   InternalReservedEnd = 0xFFFFFFFF'u32
 
+  # se050ctl intentionally keeps key creation/deletion in this shallow-water
+  # development range. Vendor-reserved IDs are left to a dedicated provisioning
+  # tool, not this user-facing diagnostic CLI.
+  DevelopmentStart = 0x30000000'u32
+  DevelopmentEnd = 0x3000FFFF'u32
+
 # =============================================================================
 # Utility
 # =============================================================================
@@ -114,6 +120,9 @@ proc isProtectedReservedObjectId(objectId: uint32): bool =
     objectId.isInRange(NxpReservedStart, NxpReservedEnd) or
     objectId.isInRange(InternalReservedStart, InternalReservedEnd)
 
+proc isDevelopmentObjectId(objectId: uint32): bool =
+  result = objectId.isInRange(DevelopmentStart, DevelopmentEnd)
+
 proc deleteTargetError(objectId: uint32): Option[string] =
   if objectId == 0'u32:
     return some("object id 0x00000000 is not a valid delete target")
@@ -130,6 +139,34 @@ proc deleteTargetError(objectId: uint32): Option[string] =
     )
 
   result = none(string)
+
+proc keygenTargetError(objectId: uint32): Option[string] =
+  if objectId == 0'u32:
+    return some("object id 0x00000000 is not a valid key generation target")
+
+  if objectId.isProtectedReservedObjectId():
+    return some(
+      &"keygen refused: {objectIdHex(objectId)} is in a protected SE050 reserved range"
+    )
+
+  if objectId.isVendorReservedObjectId():
+    return some(
+      &"keygen refused: {objectIdHex(objectId)} is in the vendor reserved range; use a dedicated provisioning tool for vendor-reserved objects"
+    )
+
+  if not objectId.isDevelopmentObjectId():
+    return some(
+      &"keygen refused: {objectIdHex(objectId)} is outside the se050ctl development range 0x{DevelopmentStart.toHex(8)}..0x{DevelopmentEnd.toHex(8)}"
+    )
+
+  result = none(string)
+
+proc parseCurveKind(s: string): EcCurveKind =
+  case s.strip().toLowerAscii()
+  of "x25519", "mont-dh-25519", "mont25519", "ecc-mont-dh-25519":
+    result = ecCurveX25519
+  else:
+    raise newException(ValueError, &"unsupported curve for se050ctl keygen: {s}")
 
 proc typeText(objectType: uint8): string =
   result = &"0x{objectType.toHex(2)} ({objectTypeName(objectType)})"
@@ -269,6 +306,67 @@ proc runList(
 
   result = 0
 
+proc runKeygen(
+    busText: string,
+    addressText: string,
+    debug: bool,
+    objectIdText: string,
+    curveText: string
+): int =
+  let objectId = parseObjectId(objectIdText)
+  let curve = parseCurveKind(curveText)
+
+  let guard = keygenTargetError(objectId = objectId)
+  if guard.isSome:
+    stderr.writeLine guard.get()
+    return 2
+
+  let se = openAndRequestAtr(busText, addressText, debug)
+
+  let exists = se.objectExists(objectId = objectId, selectFirst = true)
+  if not exists.ok:
+    printSe050Error("CheckObjectExists failed", exists.error)
+    return 1
+
+  if exists.value:
+    stderr.writeLine &"keygen refused: {objectIdHex(objectId)} already exists"
+    return 1
+
+  let generated = se.generateEcKeyPair(
+    objectId = objectId,
+    curve = curve,
+    selectFirst = false
+  )
+  if not generated.ok:
+    printSe050Error("WriteECKey failed", generated.error)
+    return 1
+
+  let after = se.objectExists(objectId = objectId, selectFirst = false)
+  if not after.ok:
+    printSe050Error("Keygen verification failed", after.error)
+    return 1
+
+  if not after.value:
+    stderr.writeLine &"WriteECKey returned success, but {objectIdHex(objectId)} does not exist"
+    return 1
+
+  let typ = se.readObjectType(objectId = objectId, selectFirst = false)
+  if not typ.ok:
+    printSe050Error("ReadType after keygen failed", typ.error)
+    return 1
+
+  let expectedType = expectedKeyPairType(curve)
+  if typ.value.objectType != expectedType:
+    stderr.writeLine &"keygen verification failed: expected type 0x{expectedType.toHex(2)}, got {typeText(typ.value.objectType)}"
+    return 1
+
+  echo &"{objectIdHex(objectId)}: created"
+  echo &"curve: {curveName(curve)}"
+  echo &"type: {typeText(typ.value.objectType)}"
+  echo &"transient: {transientText(typ.value.transientIndicator)}"
+
+  result = 0
+
 proc runDelete(
     busText: string,
     addressText: string,
@@ -366,6 +464,22 @@ proc main(): int =
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
         quit(runList(opts.bus, opts.address, opts.debug, opts.filter))
+
+    command("keygen"):
+      help("Generate a development SE050 key pair. Only 0x30000000..0x3000FFFF is allowed by this CLI.")
+      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
+      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("--id", required = true, help = "Development Secure Object ID in hex, e.g. 0x30000100")
+      option("--curve", default = some("x25519"), help = "Curve name, currently: x25519")
+      flag("-d", "--debug", help = "Print T=1 over I2C frames")
+      run:
+        quit(runKeygen(
+          opts.bus,
+          opts.address,
+          opts.debug,
+          opts.id,
+          opts.curve
+        ))
 
     command("delete"):
       help("Delete an SE050 Secure Object identifier. Destructive operation; reserved ranges are always guarded.")

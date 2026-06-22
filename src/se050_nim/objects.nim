@@ -133,6 +133,12 @@ const
   TransientPersistent = 0x01'u8
   TransientObject = 0x02'u8
 
+  # Object deletion can take longer than normal inspection commands, especially
+  # when removing key objects. During that time the T=1 over I2C layer may see
+  # empty reads before the SE050 emits WTX or the final response. Keep the
+  # extended wait local to deletion so quick commands keep failing fast.
+  DeleteOperationMaxReadRetries = 200
+
 # =============================================================================
 # Types
 # =============================================================================
@@ -683,7 +689,14 @@ proc deleteSecureObject*(
       )
 
   let apdu = buildDeleteObjectApdu(objectId)
+
+  let oldMaxRetries = se.maxRetries
+  if se.maxRetries < DeleteOperationMaxReadRetries:
+    se.maxRetries = DeleteOperationMaxReadRetries
+
   let response = se.transceiveApdu(apdu)
+  se.maxRetries = oldMaxRetries
+
   if not response.ok:
     return fail[void](
       response.error.kind,
