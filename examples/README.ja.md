@@ -13,6 +13,7 @@ nim c examples/random_bytes.nim
 nim c examples/object_info.nim
 nim c examples/p256_keygen_pubkey.nim
 nim c examples/p256_derive_secret.nim
+nim c examples/p256_keygen_explicit_policy.nim
 ```
 
 既存の `examples/config.nims` により、`../src` が Nim の module search path に追加されます。
@@ -34,7 +35,25 @@ nim c examples/p256_derive_secret.nim
 
 # dev key pair 2組を生成または再利用し、P-256 ECDH を双方向で確認する
 ./examples/p256_derive_secret 0 0x110 0x111
+
+# EC key policy を明示的に渡して P-256 key pair を生成する
+./examples/p256_keygen_explicit_policy 0 0x120 development p256_120_pub.bin
 ```
+
+## 明示policy指定のサンプル
+
+`p256_keygen_explicit_policy.nim` は、policy指定付き key generation API の使い方を示すサンプルです。
+通常は `development` policy を使います。この場合、作成したobjectは `se050ctl` で削除可能なままです。
+
+`device` / `one-time` policy は、WRITE / GEN / DELETE 権限を意図的に含みません。
+そのため、development range に作成した場合でも、`se050ctl` では削除できないobjectになる可能性があります。
+このサンプルでは、これらのpolicyを使う場合に `--allow-sticky` を必須にしています。
+
+```sh
+./examples/p256_keygen_explicit_policy 0 0x121 device p256_121_pub.bin --allow-sticky
+```
+
+sticky policy mode は、消せなくなってもよい development object ID でだけ使ってください。
 
 ## 安全方針
 

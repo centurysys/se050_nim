@@ -13,6 +13,7 @@ nim c examples/random_bytes.nim
 nim c examples/object_info.nim
 nim c examples/p256_keygen_pubkey.nim
 nim c examples/p256_derive_secret.nim
+nim c examples/p256_keygen_explicit_policy.nim
 ```
 
 The existing `examples/config.nims` adds `../src` to the Nim module search path.
@@ -34,7 +35,27 @@ The existing `examples/config.nims` adds `../src` to the Nim module search path.
 
 # Generate or reuse two P-256 development key pairs and verify ECDH both ways
 ./examples/p256_derive_secret 0 0x110 0x111
+
+# Generate one P-256 key pair while passing an EC key policy explicitly
+./examples/p256_keygen_explicit_policy 0 0x120 development p256_120_pub.bin
 ```
+
+## Explicit policy example
+
+`p256_keygen_explicit_policy.nim` demonstrates the policy-aware key generation
+API. By default, use the `development` policy so the object remains removable
+by `se050ctl`.
+
+The `device` and `one-time` policy modes intentionally omit WRITE, GEN, and
+DELETE permissions. Objects created with those policies may not be removable by
+`se050ctl`, even in the development range. The example therefore requires
+`--allow-sticky` for those modes:
+
+```sh
+./examples/p256_keygen_explicit_policy 0 0x121 device p256_121_pub.bin --allow-sticky
+```
+
+Use sticky policy modes only with disposable development object IDs.
 
 ## Safety policy
 
