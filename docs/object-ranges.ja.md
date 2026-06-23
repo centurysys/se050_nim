@@ -68,7 +68,13 @@ Production provisioning では、まったく別の性質が必要です。
 
 これは診断には便利ですが、production policyではありません。
 
-## Production policy は別ツールで扱う
+## ライブラリの自由度とCLIの安全性
+
+`se050_nim` はライブラリであり、すべての製品フローを安全側に包むラッパーではありません。raw primitive は、呼び出し側が指定した object ID をそのまま受け取ります。`customer` / `vendor` range も扱える必要があります。上位の kitting/provisioning tool が、production object を意図的に書き込むためです。
+
+一方で `se050ctl` は別です。`se050ctl` は製品に同梱される可能性がある診断CLIなので、write/delete系コマンドは development range に制限したままにします。ライブラリがraw操作を実行できるからといって、`se050ctl` にproduction policy用の近道を追加しないほうが安全です。
+
+## Production policy は provisioning tool で扱う
 
 将来のprovisioning toolでは、production policyを明示的に設計・レビューできるようにします。例:
 
@@ -79,7 +85,14 @@ Production provisioning では、まったく別の性質が必要です。
 - finalization後のwrite/overwriteを避ける
 - 必要であればauthenticated sessionやplatform policyを使う
 
-生のライブラリが任意IDへ書けるからといって、`se050ctl` にproduction policy用の近道を足さないほうが安全です。`se050_nim` は低レベルprimitiveを提供し、安全ポリシーは各ユーザー向けツール側で強制します。
+このため、ライブラリは `EcKeyPolicy` builder を提供します。
+
+- `developmentEcKeyPolicy()` は scratch/dev key 用
+- `deviceEcKeyPolicy()` は provision済みdevice key 用
+- `oneTimeDeviceKeyPolicy()` は final one-time device key作成の意図を表すため
+- `customEcKeyPolicy(header)` は raw policy header が必要なadvanced caller用
+
+production操作でどのobject rangeとpolicyを許可するかは、`se050ctl` ではなく provisioning tool 側で判断します。
 
 ## 将来のproduction配置案
 

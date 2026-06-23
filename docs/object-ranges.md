@@ -68,7 +68,13 @@ The current policy allows:
 
 This policy is useful for diagnostics, but it is not a production policy.
 
-## Production policy belongs elsewhere
+## Library freedom and CLI safety
+
+`se050_nim` is a library, not a safety wrapper for every product workflow. Its raw primitives accept caller-provided object IDs, including `customer` and `vendor` ranges, because higher-level kitting/provisioning tools must be able to write production objects intentionally.
+
+`se050ctl` is different. It is a diagnostic CLI that may be shipped with products, so its write/delete commands remain restricted to the development range. Do not add production policy shortcuts to `se050ctl` simply because the library can perform the raw operation.
+
+## Production policy belongs in provisioning tools
 
 A future provisioning tool should make production policy explicit and reviewable. Examples:
 
@@ -79,7 +85,14 @@ A future provisioning tool should make production policy explicit and reviewable
 - avoid write/overwrite after finalization
 - optionally use authenticated sessions or platform policy when available
 
-Do not add production policy shortcuts to `se050ctl` simply because the raw library can write arbitrary IDs. `se050_nim` exports low-level primitives; safety belongs in each user-facing tool.
+The library provides `EcKeyPolicy` builders for this purpose:
+
+- `developmentEcKeyPolicy()` for scratch/dev keys
+- `deviceEcKeyPolicy()` for provisioned device keys
+- `oneTimeDeviceKeyPolicy()` to express final one-time device-key creation intent
+- `customEcKeyPolicy(header)` for advanced callers that need raw policy headers
+
+The provisioning tool, not `se050ctl`, should decide which object range and policy are valid for each production operation.
 
 ## Suggested future production layout
 

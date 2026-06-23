@@ -162,8 +162,11 @@ let created = se.generateP256KeyPair(0x30000100'u32)
 関連API:
 
 - `generateEcKeyPair(se, objectId, curve, selectFirst = true): SE[void]`
+- `generateEcKeyPair(se, objectId, curve, policy, selectFirst = true): SE[void]`
 - `generateP256KeyPair(se, objectId, selectFirst = true): SE[void]`
+- `generateP256KeyPair(se, objectId, policy, selectFirst = true): SE[void]`
 - `generateX25519KeyPair(se, objectId, selectFirst = true): SE[void]`
+- `generateX25519KeyPair(se, objectId, policy, selectFirst = true): SE[void]`
 - `curveId(curve): uint8`
 - `curveName(curve): string`
 - `expectedKeyPairType(curve): uint8`
@@ -173,7 +176,56 @@ let created = se.generateP256KeyPair(0x30000100'u32)
 - `ecCurveP256`
 - `ecCurveX25519`
 
-現在の鍵生成は開発用ポリシーを付与します。key agreement、公開鍵読み出し、開発中の上書き/再生成、削除を許可します。production向けの one-time/no-delete policy は、別の provisioning tool 側で扱います。
+policyを指定しない鍵生成helperは、従来通り開発用EC key policyを使います。このpolicyでは、key agreement、公開鍵読み出し、開発中のwrite/generate、deleteを許可します。
+
+上位のprovisioning / kitting toolは、明示的に `EcKeyPolicy` を渡すことでproduction向けの権限で鍵を作成できます。`se050ctl` には、このproduction policy操作を意図的に公開しません。
+
+## EC key policy API
+
+`EcKeyPolicy` は、EC key object作成時にSE050へ渡すEC key policy headerを表します。
+
+```nim
+type
+  EcKeyPolicy* = object
+    header*: uint32
+```
+
+policy builder API:
+
+- `developmentEcKeyPolicy(): EcKeyPolicy`
+- `deviceEcKeyPolicy(): EcKeyPolicy`
+- `oneTimeDeviceKeyPolicy(): EcKeyPolicy`
+- `customEcKeyPolicy(header): EcKeyPolicy`
+- `policyHeader(policy): uint32`
+
+開発用の典型例:
+
+```nim
+let policy = developmentEcKeyPolicy()
+let r = se.generateP256KeyPair(0x30000120'u32, policy)
+```
+
+provisioning tool側の典型例:
+
+```nim
+let policy = oneTimeDeviceKeyPolicy()
+let r = se.generateP256KeyPair(0x20000100'u32, policy)
+```
+
+ライブラリは、呼び出し側が指定したobject IDをそのまま扱います。rawな鍵生成primitiveでは `dev` range 制限を強制しません。production kitting toolが `customer` / `vendor` rangeへ意図的に書き込める必要があるためです。ユーザー向けツール側で、それぞれの安全ポリシーを強制してください。
+
+現在の定義済みpolicy:
+
+| Policy | 用途 | 許可するもの | 意図的に避けるもの |
+| --- | --- | --- | --- |
+| `developmentEcKeyPolicy()` | 開発・診断 | key agreement、公開鍵read、write/generate、delete | production finalization |
+| `deviceEcKeyPolicy()` | provision済みdevice key | key agreement、公開鍵read | write/generate/delete |
+| `oneTimeDeviceKeyPolicy()` | 最終device key作成 | 現時点では `deviceEcKeyPolicy()` と同じ実効権限 | write/generate/delete |
+| `customEcKeyPolicy(header)` | advanced caller | 呼び出し側定義 | raw header以上の検証はしない |
+
+`oneTimeDeviceKeyPolicy()` は、現時点では `deviceEcKeyPolicy()` と同じ実効権限ですが、kitting code側で「one-timeとして作る」という意図を明確にするために別APIにしています。将来、Applet固有のone-time表現が必要になっても、呼び出し側コードを変えずに拡張できます。
+
+sticky policyのテストには注意してください。deleteやoverwriteを許可しないpolicyで作ったobjectは、別の認可済み経路で消せない限りSE050上に残る可能性があります。production相当policyは、まず予約済みのdevelopment object IDで確認してください。
 
 ## 公開鍵読み出し
 

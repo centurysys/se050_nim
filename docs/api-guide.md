@@ -162,8 +162,11 @@ let created = se.generateP256KeyPair(0x30000100'u32)
 Relevant APIs:
 
 - `generateEcKeyPair(se, objectId, curve, selectFirst = true): SE[void]`
+- `generateEcKeyPair(se, objectId, curve, policy, selectFirst = true): SE[void]`
 - `generateP256KeyPair(se, objectId, selectFirst = true): SE[void]`
+- `generateP256KeyPair(se, objectId, policy, selectFirst = true): SE[void]`
 - `generateX25519KeyPair(se, objectId, selectFirst = true): SE[void]`
+- `generateX25519KeyPair(se, objectId, policy, selectFirst = true): SE[void]`
 - `curveId(curve): uint8`
 - `curveName(curve): string`
 - `expectedKeyPairType(curve): uint8`
@@ -173,7 +176,56 @@ Supported curve enum values:
 - `ecCurveP256`
 - `ecCurveX25519`
 
-The current development key policy allows key agreement, public-key read, write/generate during iteration, and delete. Production one-time/no-delete policy belongs in a separate provisioning tool.
+The policy-free key generation helpers keep the historical behavior: they use the development EC key policy. This policy allows key agreement, public-key read, write/generate during development iteration, and delete.
+
+Higher-level provisioning and kitting tools can pass an explicit `EcKeyPolicy` to create keys with production-style permissions. `se050ctl` intentionally does not expose these production policy controls.
+
+## EC key policy API
+
+`EcKeyPolicy` represents the SE050 EC key policy header used when creating EC key objects.
+
+```nim
+type
+  EcKeyPolicy* = object
+    header*: uint32
+```
+
+Policy builder APIs:
+
+- `developmentEcKeyPolicy(): EcKeyPolicy`
+- `deviceEcKeyPolicy(): EcKeyPolicy`
+- `oneTimeDeviceKeyPolicy(): EcKeyPolicy`
+- `customEcKeyPolicy(header): EcKeyPolicy`
+- `policyHeader(policy): uint32`
+
+Typical development usage:
+
+```nim
+let policy = developmentEcKeyPolicy()
+let r = se.generateP256KeyPair(0x30000120'u32, policy)
+```
+
+Typical provisioning-tool usage:
+
+```nim
+let policy = oneTimeDeviceKeyPolicy()
+let r = se.generateP256KeyPair(0x20000100'u32, policy)
+```
+
+The library accepts the caller-provided object ID. It does not enforce the `dev` range for raw key-generation primitives, because production kitting tools must intentionally write to `customer` or `vendor` ranges. User-facing tools must enforce their own safety policy.
+
+Current predefined policies:
+
+| Policy | Intended use | Allows | Intentionally avoids |
+| --- | --- | --- | --- |
+| `developmentEcKeyPolicy()` | development and diagnostics | key agreement, public-key read, write/generate, delete | production finalization |
+| `deviceEcKeyPolicy()` | provisioned device key | key agreement, public-key read | write/generate/delete |
+| `oneTimeDeviceKeyPolicy()` | final device key creation | same effective permissions as `deviceEcKeyPolicy()` for now | write/generate/delete |
+| `customEcKeyPolicy(header)` | advanced callers | caller-defined | no validation beyond the raw header |
+
+`oneTimeDeviceKeyPolicy()` is kept separate from `deviceEcKeyPolicy()` so that kitting code can express provisioning intent clearly and so the library can later adopt any applet-specific one-time encoding without changing caller code.
+
+Be careful when testing sticky policies. If a policy does not allow delete or overwrite, the object may remain on the SE050 until the chip is reset/provisioned by another authorized path. Test production-style policies first in a reserved development object ID.
 
 ## Public key export
 
