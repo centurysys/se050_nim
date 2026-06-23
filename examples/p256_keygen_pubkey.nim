@@ -77,10 +77,12 @@ proc requireOk[T](label: string, r: SE[T]): T =
   if not r.ok:
     echo label, " failed: ", r.error.kind, ": ", r.error.errorMessage()
     quit(1)
-  when T is void:
-    discard
-  else:
-    result = r.value
+  result = r.value
+
+proc requireVoidOk(label: string, r: SE[void]) =
+  if not r.ok:
+    echo label, " failed: ", r.error.kind, ": ", r.error.errorMessage()
+    quit(1)
 
 proc main(): int =
   let args = commandLineParams()
@@ -112,7 +114,7 @@ proc main(): int =
     echo "delete it explicitly with se050ctl or choose another dev-index"
     return 2
 
-  discard requireOk("generateP256KeyPair", se.generateP256KeyPair(objectId))
+  requireVoidOk("generateP256KeyPair", se.generateP256KeyPair(objectId))
 
   let typeInfo = requireOk("readObjectType", se.readObjectType(objectId))
   echo &"created: 0x{objectId.toHex(8)}"
