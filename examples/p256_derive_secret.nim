@@ -80,10 +80,12 @@ proc requireOk[T](label: string, r: SE[T]): T =
   if not r.ok:
     echo label, " failed: ", r.error.kind, ": ", r.error.errorMessage()
     quit(1)
-  when T is void:
-    discard
-  else:
-    result = r.value
+  result = r.value
+
+proc requireVoidOk(label: string, r: SE[void]) =
+  if not r.ok:
+    echo label, " failed: ", r.error.kind, ": ", r.error.errorMessage()
+    quit(1)
 
 proc ensureP256Key(se: Se050Transport, objectId: uint32) =
   let exists = requireOk("objectExists", se.objectExists(objectId))
@@ -95,7 +97,7 @@ proc ensureP256Key(se: Se050Transport, objectId: uint32) =
       quit(2)
     echo &"reuse: 0x{objectId.toHex(8)} ({objectTypeName(typeInfo.objectType)})"
   else:
-    discard requireOk("generateP256KeyPair", se.generateP256KeyPair(objectId))
+    requireVoidOk("generateP256KeyPair", se.generateP256KeyPair(objectId))
     echo &"created: 0x{objectId.toHex(8)}"
 
 proc writeBytes(path: string, data: openArray[uint8]) =

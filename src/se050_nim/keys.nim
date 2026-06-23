@@ -59,8 +59,9 @@ const
 
   # Object policy bits from NXP se05x_const.h.
   #
-  # se050ctl is a development/diagnostic CLI and intentionally creates only
-  # deletable development keys. Explicitly adding ALLOW_KA is required for
+  # These constants are intentionally kept private. Library users should build
+  # object policies through the EcKeyPolicy helpers below instead of composing
+  # access-rule bits directly. Explicitly adding ALLOW_KA is required for
   # ECDHGenerateSharedSecret; otherwise the applet may return SW=0x6985
   # (conditions not satisfied) for derive operations.
   PolicyObjAllowKa = 0x04000000'u32
@@ -137,6 +138,18 @@ type
     ecCurveP256,
     ecCurveX25519
 
+  EcKeyPolicy* = object
+    ## Access-rule header for an SE050 EC key object policy entry.
+    ##
+    ## The current helpers create a single default-auth policy entry
+    ## (auth object ID 0). The value is the 32-bit access-rule header used by
+    ## Plug & Trust object policies.
+    ##
+    ## se050ctl intentionally keeps using only development policies. Higher-level
+    ## provisioning/kitting tools may import this library and choose stricter
+    ## policies for customer/vendor object ranges.
+    header*: uint32
+
 # =============================================================================
 # Internal helpers
 # =============================================================================
@@ -194,28 +207,72 @@ proc expectedKeyPairType*(curve: EcCurveKind): uint8 =
   of ecCurveP256: Se050TypeEcKeyPairNistP256
   of ecCurveX25519: Se050TypeEcKeyPairMontDh25519
 
-proc buildDevelopmentEcKeyPolicy(): seq[uint8] =
-  ## Builds a single object-policy entry for development EC key pairs.
+proc developmentEcKeyPolicy*(): EcKeyPolicy =
+  ## Returns the default development EC key policy.
   ##
-  ## The policy is deliberately not a production/no-delete policy. It allows:
-  ##   - reading the public part of the key pair via ReadObject
-  ##   - overwriting/regenerating while iterating during development
-  ##   - deleting the object during development
-  ##   - using the private key for key agreement
-  ##
-  ## Production policy generation belongs in a future provisioning tool, not in
-  ## the user-facing se050ctl command.
-  const header =
-    PolicyObjAllowKa or
-    PolicyObjAllowRead or
-    PolicyObjAllowWrite or
-    PolicyObjAllowGen or
-    PolicyObjAllowDelete
+  ## This policy is intentionally permissive enough for iterative development:
+  ## it allows public-key read/export, key agreement, overwrite/regeneration,
+  ## and deletion. se050ctl uses this policy for development-range keys.
+  result = EcKeyPolicy(
+    header:
+      PolicyObjAllowKa or
+      PolicyObjAllowRead or
+      PolicyObjAllowWrite or
+      PolicyObjAllowGen or
+      PolicyObjAllowDelete
+  )
 
+proc deviceEcKeyPolicy*(): EcKeyPolicy =
+  ## Returns a production-style device EC key policy.
+  ##
+  ## This policy is suitable for a device identity/key-agreement key that should
+  ## be usable for P-256 ECDH and public-key export, but should not be
+  ## overwritten, regenerated, or deleted by ordinary unauthenticated commands.
+  ##
+  ## Test this policy in a disposable development object ID before using it in a
+  ## customer/vendor production range.
+  result = EcKeyPolicy(
+    header:
+      PolicyObjAllowKa or
+      PolicyObjAllowRead
+  )
+
+proc oneTimeDeviceKeyPolicy*(): EcKeyPolicy =
+  ## Returns a one-time-write style production EC key policy.
+  ##
+  ## For internally generated EC key pairs, the initial WriteECKey command creates
+  ## the object and installs this policy. Because the resulting object does not
+  ## allow WRITE, GEN, or DELETE, later overwrite/regeneration/deletion attempts
+  ## should be rejected by the applet.
+  ##
+  ## In the current raw policy model this is equivalent to deviceEcKeyPolicy().
+  ## It is kept as a separate API name so provisioning code can state its intent
+  ## clearly and so future applet-specific one-time attributes can be added
+  ## without changing callers.
+  result = deviceEcKeyPolicy()
+
+proc customEcKeyPolicy*(header: uint32): EcKeyPolicy =
+  ## Builds an EC key policy from a raw Plug & Trust access-rule header.
+  ##
+  ## Use this only when the predefined helpers are not sufficient. The caller is
+  ## responsible for validating that the supplied bit mask is correct for the
+  ## target applet and object type.
+  result = EcKeyPolicy(header: header)
+
+proc policyHeader*(policy: EcKeyPolicy): uint32 =
+  ## Returns the raw 32-bit access-rule header used by this policy.
+  result = policy.header
+
+proc encodeEcKeyPolicy(policy: EcKeyPolicy): seq[uint8] =
+  ## Builds a single default-auth object-policy entry for WriteECKey.
   result = @[]
   result.add(ObjectPolicyEntryLen)
   result.appendU32Be(DefaultAuthObjectId)
-  result.appendU32Be(header)
+  result.appendU32Be(policy.header)
+
+proc buildDevelopmentEcKeyPolicy(): seq[uint8] =
+  ## Builds the current default development policy entry for existing callers.
+  result = encodeEcKeyPolicy(developmentEcKeyPolicy())
 
 proc buildReadObjectApdu(objectId: uint32): seq[uint8] =
   result = @[
@@ -273,14 +330,17 @@ proc parseTag1Value(response: openArray[uint8], commandName: string): SE[seq[uin
 proc parseReadObjectValue(response: openArray[uint8]): SE[seq[uint8]] =
   result = parseTag1Value(response, "ReadObject")
 
-proc buildGenerateEcKeyPairApdu(objectId: uint32, curve: EcCurveKind): SE[seq[uint8]] =
+proc buildGenerateEcKeyPairApdu(
+    objectId: uint32,
+    curve: EcCurveKind,
+    policy: EcKeyPolicy
+): SE[seq[uint8]] =
   var payload: seq[uint8] = @[]
 
   # Put TAG_POLICY first, matching the order shown in the SE05x APDU
   # specification. The applet is generally TLV-based, but keeping the specified
   # order makes the raw APDU easier to compare with Plug & Trust logs.
-  let policy = buildDevelopmentEcKeyPolicy()
-  payload.appendTlvBytes(TagPolicy, policy)
+  payload.appendTlvBytes(TagPolicy, encodeEcKeyPolicy(policy))
   payload.appendTlvU32(Tag1, objectId)
   payload.appendTlvU8(Tag2, curve.curveId())
 
@@ -338,18 +398,21 @@ proc generateEcKeyPair*(
     se: Se050Transport,
     objectId: uint32,
     curve: EcCurveKind,
+    policy: EcKeyPolicy,
     selectFirst: bool = true
 ): SE[void] =
-  ## Generates an EC key pair inside the selected SE050 applet.
+  ## Generates an EC key pair inside the selected SE050 applet with an explicit
+  ## object policy.
   ##
   ## This is the raw low-level primitive. It does not check whether the target
   ## ID is in a safe development range, whether it already exists, or whether it
   ## belongs to a vendor-reserved namespace. CLI/provisioning tools must enforce
   ## those policies before calling this function.
   ##
-  ## A development object policy is attached here so the generated key remains
-  ## deletable/readable and is allowed to perform key agreement. Production
-  ## policy generation belongs in a dedicated provisioning tool.
+  ## Use developmentEcKeyPolicy() for disposable development objects. Use
+  ## deviceEcKeyPolicy() or oneTimeDeviceKeyPolicy() only after validating the
+  ## policy in a disposable range, because restrictive policies may prevent
+  ## overwrite/regeneration/deletion.
   if selectFirst:
     let selected = se.selectApplet()
     if not selected.ok:
@@ -359,7 +422,11 @@ proc generateEcKeyPair*(
         selected.error.sw
       )
 
-  let apdu = buildGenerateEcKeyPairApdu(objectId = objectId, curve = curve)
+  let apdu = buildGenerateEcKeyPairApdu(
+    objectId = objectId,
+    curve = curve,
+    policy = policy
+  )
   if not apdu.ok:
     return fail[void](apdu.error.kind, apdu.error.message, apdu.error.sw)
 
@@ -379,15 +446,61 @@ proc generateEcKeyPair*(
 
   result = checkStatus(response.value, "WriteECKey")
 
+proc generateEcKeyPair*(
+    se: Se050Transport,
+    objectId: uint32,
+    curve: EcCurveKind,
+    selectFirst: bool = true
+): SE[void] =
+  ## Generates an EC key pair with the default development policy.
+  ##
+  ## This wrapper preserves the historical se050_nim behavior for se050ctl,
+  ## examples, and existing callers. Higher-level provisioning tools should call
+  ## the overload that accepts EcKeyPolicy explicitly.
+  result = se.generateEcKeyPair(
+    objectId = objectId,
+    curve = curve,
+    policy = developmentEcKeyPolicy(),
+    selectFirst = selectFirst
+  )
+
+proc generateX25519KeyPair*(
+    se: Se050Transport,
+    objectId: uint32,
+    policy: EcKeyPolicy,
+    selectFirst: bool = true
+): SE[void] =
+  ## Generates an X25519 key pair inside SE050 with an explicit object policy.
+  result = se.generateEcKeyPair(
+    objectId = objectId,
+    curve = ecCurveX25519,
+    policy = policy,
+    selectFirst = selectFirst
+  )
+
 proc generateX25519KeyPair*(
     se: Se050Transport,
     objectId: uint32,
     selectFirst: bool = true
 ): SE[void] =
-  ## Generates an X25519 key pair inside SE050.
+  ## Generates an X25519 key pair inside SE050 with the development policy.
+  result = se.generateX25519KeyPair(
+    objectId = objectId,
+    policy = developmentEcKeyPolicy(),
+    selectFirst = selectFirst
+  )
+
+proc generateP256KeyPair*(
+    se: Se050Transport,
+    objectId: uint32,
+    policy: EcKeyPolicy,
+    selectFirst: bool = true
+): SE[void] =
+  ## Generates a NIST P-256 key pair inside SE050 with an explicit object policy.
   result = se.generateEcKeyPair(
     objectId = objectId,
-    curve = ecCurveX25519,
+    curve = ecCurveP256,
+    policy = policy,
     selectFirst = selectFirst
   )
 
@@ -396,10 +509,10 @@ proc generateP256KeyPair*(
     objectId: uint32,
     selectFirst: bool = true
 ): SE[void] =
-  ## Generates a NIST P-256 key pair inside SE050.
-  result = se.generateEcKeyPair(
+  ## Generates a NIST P-256 key pair inside SE050 with the development policy.
+  result = se.generateP256KeyPair(
     objectId = objectId,
-    curve = ecCurveP256,
+    policy = developmentEcKeyPolicy(),
     selectFirst = selectFirst
   )
 
