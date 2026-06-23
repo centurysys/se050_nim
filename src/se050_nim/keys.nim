@@ -330,14 +330,17 @@ proc parseTag1Value(response: openArray[uint8], commandName: string): SE[seq[uin
 proc parseReadObjectValue(response: openArray[uint8]): SE[seq[uint8]] =
   result = parseTag1Value(response, "ReadObject")
 
-proc buildGenerateEcKeyPairApdu(objectId: uint32, curve: EcCurveKind): SE[seq[uint8]] =
+proc buildGenerateEcKeyPairApdu(
+    objectId: uint32,
+    curve: EcCurveKind,
+    policy: EcKeyPolicy
+): SE[seq[uint8]] =
   var payload: seq[uint8] = @[]
 
   # Put TAG_POLICY first, matching the order shown in the SE05x APDU
   # specification. The applet is generally TLV-based, but keeping the specified
   # order makes the raw APDU easier to compare with Plug & Trust logs.
-  let policy = buildDevelopmentEcKeyPolicy()
-  payload.appendTlvBytes(TagPolicy, policy)
+  payload.appendTlvBytes(TagPolicy, encodeEcKeyPolicy(policy))
   payload.appendTlvU32(Tag1, objectId)
   payload.appendTlvU8(Tag2, curve.curveId())
 
@@ -395,18 +398,21 @@ proc generateEcKeyPair*(
     se: Se050Transport,
     objectId: uint32,
     curve: EcCurveKind,
+    policy: EcKeyPolicy,
     selectFirst: bool = true
 ): SE[void] =
-  ## Generates an EC key pair inside the selected SE050 applet.
+  ## Generates an EC key pair inside the selected SE050 applet with an explicit
+  ## object policy.
   ##
   ## This is the raw low-level primitive. It does not check whether the target
   ## ID is in a safe development range, whether it already exists, or whether it
   ## belongs to a vendor-reserved namespace. CLI/provisioning tools must enforce
   ## those policies before calling this function.
   ##
-  ## A development object policy is attached here so the generated key remains
-  ## deletable/readable and is allowed to perform key agreement. Production
-  ## policy generation belongs in a dedicated provisioning tool.
+  ## Use developmentEcKeyPolicy() for disposable development objects. Use
+  ## deviceEcKeyPolicy() or oneTimeDeviceKeyPolicy() only after validating the
+  ## policy in a disposable range, because restrictive policies may prevent
+  ## overwrite/regeneration/deletion.
   if selectFirst:
     let selected = se.selectApplet()
     if not selected.ok:
@@ -416,7 +422,11 @@ proc generateEcKeyPair*(
         selected.error.sw
       )
 
-  let apdu = buildGenerateEcKeyPairApdu(objectId = objectId, curve = curve)
+  let apdu = buildGenerateEcKeyPairApdu(
+    objectId = objectId,
+    curve = curve,
+    policy = policy
+  )
   if not apdu.ok:
     return fail[void](apdu.error.kind, apdu.error.message, apdu.error.sw)
 
@@ -436,15 +446,61 @@ proc generateEcKeyPair*(
 
   result = checkStatus(response.value, "WriteECKey")
 
+proc generateEcKeyPair*(
+    se: Se050Transport,
+    objectId: uint32,
+    curve: EcCurveKind,
+    selectFirst: bool = true
+): SE[void] =
+  ## Generates an EC key pair with the default development policy.
+  ##
+  ## This wrapper preserves the historical se050_nim behavior for se050ctl,
+  ## examples, and existing callers. Higher-level provisioning tools should call
+  ## the overload that accepts EcKeyPolicy explicitly.
+  result = se.generateEcKeyPair(
+    objectId = objectId,
+    curve = curve,
+    policy = developmentEcKeyPolicy(),
+    selectFirst = selectFirst
+  )
+
+proc generateX25519KeyPair*(
+    se: Se050Transport,
+    objectId: uint32,
+    policy: EcKeyPolicy,
+    selectFirst: bool = true
+): SE[void] =
+  ## Generates an X25519 key pair inside SE050 with an explicit object policy.
+  result = se.generateEcKeyPair(
+    objectId = objectId,
+    curve = ecCurveX25519,
+    policy = policy,
+    selectFirst = selectFirst
+  )
+
 proc generateX25519KeyPair*(
     se: Se050Transport,
     objectId: uint32,
     selectFirst: bool = true
 ): SE[void] =
-  ## Generates an X25519 key pair inside SE050.
+  ## Generates an X25519 key pair inside SE050 with the development policy.
+  result = se.generateX25519KeyPair(
+    objectId = objectId,
+    policy = developmentEcKeyPolicy(),
+    selectFirst = selectFirst
+  )
+
+proc generateP256KeyPair*(
+    se: Se050Transport,
+    objectId: uint32,
+    policy: EcKeyPolicy,
+    selectFirst: bool = true
+): SE[void] =
+  ## Generates a NIST P-256 key pair inside SE050 with an explicit object policy.
   result = se.generateEcKeyPair(
     objectId = objectId,
-    curve = ecCurveX25519,
+    curve = ecCurveP256,
+    policy = policy,
     selectFirst = selectFirst
   )
 
@@ -453,10 +509,10 @@ proc generateP256KeyPair*(
     objectId: uint32,
     selectFirst: bool = true
 ): SE[void] =
-  ## Generates a NIST P-256 key pair inside SE050.
-  result = se.generateEcKeyPair(
+  ## Generates a NIST P-256 key pair inside SE050 with the development policy.
+  result = se.generateP256KeyPair(
     objectId = objectId,
-    curve = ecCurveP256,
+    policy = developmentEcKeyPolicy(),
     selectFirst = selectFirst
   )
 
