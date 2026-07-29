@@ -913,6 +913,12 @@ proc runAttestVerify(
   ## provisioned device certificate to explicit trust anchors, and confirms
   ## that the certificate public key matches the attestation key object.
   let objectRef = resolveObjectRef(idText, areaText, indexText, nameText)
+  let profileMatch = kittingProfileForObjectId(objectRef.objectId)
+  if profileMatch.isNone:
+    stderr.writeLine &"attest-verify refused: {objectIdHex(objectRef.objectId)} is not a configured kitting key object"
+    return 2
+  let profile = profileMatch.get()
+
   let freshness = parseHexBytes(freshnessText)
   if freshness.len != KittingFreshnessLength:
     stderr.writeLine &"attest-verify requires exactly {KittingFreshnessLength} freshness bytes; got {freshness.len}"
@@ -1005,6 +1011,13 @@ proc runAttestVerify(
     printSe050Error("Attestation signature verification failed", verified.error)
     return 1
 
+  let semantics = verifyKittingAttestationSemantics(attested.value, profile)
+  if not semantics.ok:
+    printSe050Error("Kitting attestation semantic validation failed", semantics.error)
+    return 1
+
+  let signedPolicy = semantics.value.attributes.policies[0]
+
   echo &"id: {objectIdHex(objectRef.objectId)}"
   printResolvedObjectRef(objectRef)
   echo &"type: {typeText(typ.value.objectType)}"
@@ -1016,6 +1029,18 @@ proc runAttestVerify(
   echo &"certificate intermediates: {chain.value.intermediateCount}"
   echo "certificate trust chain: valid"
   echo "attestation signature: valid"
+  echo &"kitting profile: {semantics.value.profile.name}"
+  echo &"attribute object id: {objectIdHex(semantics.value.attributes.objectId)}"
+  echo &"attribute object type: 0x{semantics.value.attributes.objectType.toHex(2)}"
+  echo &"attribute auth: {objectAuthenticationIndicatorName(semantics.value.attributes.authAttribute)}"
+  echo &"attribute owner auth object: {objectIdHex(semantics.value.attributes.ownerAuthObjectId)}"
+  echo &"attribute origin: {objectOriginName(semantics.value.attributes.origin)}"
+  echo &"attribute version: 0x{semantics.value.attributes.objectVersion.toHex(8)}"
+  echo &"policy count: {semantics.value.attributes.policies.len}"
+  echo &"policy auth object: {objectIdHex(signedPolicy.authObjectId)}"
+  echo &"policy header: 0x{signedPolicy.header.toHex(8)}"
+  echo &"object size: {semantics.value.objectSize}"
+  echo "kitting semantics: valid"
 
   result = 0
 
@@ -1297,7 +1322,7 @@ proc main(): int =
         ))
 
     command("attest-verify"):
-      help("Verify a live SE050 attestation signature using the provisioned device certificate.")
+      help("Verify a configured kitting key, its NXP certificate chain, attestation signature, and signed object attributes.")
       option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
       option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
       option("--id", default = some(""), help = "Secure Object ID in hex, e.g. 0x30000100")

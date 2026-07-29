@@ -1,3 +1,4 @@
+import std/options
 import std/unittest
 
 import se050_nim
@@ -55,3 +56,16 @@ suite "SE050 kitting profiles":
     profile = productionKittingProfile()
     profile.name = "test"
     check not profile.isValid()
+
+  test "resolves fixed profiles from their object IDs":
+    let testProfile = kittingProfileForObjectId(KittingTestFirmwareKexObjectId)
+    check testProfile.isSome
+    check testProfile.get().kind == kpTest
+
+    let productionProfile = kittingProfileForObjectId(
+      KittingProductionFirmwareKexObjectId
+    )
+    check productionProfile.isSome
+    check productionProfile.get().kind == kpProduction
+
+    check kittingProfileForObjectId(0x30000101'u32).isNone

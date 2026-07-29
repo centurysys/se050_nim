@@ -10,6 +10,8 @@
 # certificate parsing, CSV records, and envelope handling are implemented by
 # higher layers added in later development steps.
 
+import std/options
+
 import ./keys
 
 # =============================================================================
@@ -92,6 +94,16 @@ proc testKittingProfile*(): KittingProfile =
 proc productionKittingProfile*(): KittingProfile =
   ## Returns the one-time factory production profile.
   result = kittingProfile(kpProduction)
+
+proc kittingProfileForObjectId*(objectId: uint32): Option[KittingProfile] =
+  ## Resolves one of the fixed kitting profiles from its Secure Object ID.
+  if objectId == KittingTestFirmwareKexObjectId:
+    return some(testKittingProfile())
+
+  if objectId == KittingProductionFirmwareKexObjectId:
+    return some(productionKittingProfile())
+
+  result = none(KittingProfile)
 
 proc isProduction*(profile: KittingProfile): bool =
   result = profile.kind == kpProduction

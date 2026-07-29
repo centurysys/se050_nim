@@ -32,7 +32,8 @@ type
     # Host cryptographic verification errors
     seCryptoError,
     seSignatureInvalid,
-    seCertificateUntrusted
+    seCertificateUntrusted,
+    seKittingValidationFailed
 
   Se050Error* = object
     kind*: Se050ErrorKind
