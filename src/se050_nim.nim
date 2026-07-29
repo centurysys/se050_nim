@@ -20,6 +20,7 @@ import se050_nim/[
   board_identity,
   kitting_record,
   kitting_csv,
-  kitting_verify
+  kitting_verify,
+  kitting_local_verify
 ]
-export errors, transport, apdu, tlv, uid, random, objects, keys, management, kitting_profile, attestation_cert, attestation, crypto_verify, x509_verify, attestation_verify, attestation_attributes, kitting_attestation_verify, binary_encoding, board_identity, kitting_record, kitting_csv, kitting_verify
+export errors, transport, apdu, tlv, uid, random, objects, keys, management, kitting_profile, attestation_cert, attestation, crypto_verify, x509_verify, attestation_verify, attestation_attributes, kitting_attestation_verify, binary_encoding, board_identity, kitting_record, kitting_csv, kitting_verify, kitting_local_verify

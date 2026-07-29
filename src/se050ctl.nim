@@ -1044,6 +1044,129 @@ proc runAttestVerify(
 
   result = 0
 
+proc runKittingVerify(
+    busText: string,
+    addressText: string,
+    debug: bool,
+    inputPath: string,
+    profileText: string,
+    trustAnchorsPath: string,
+    intermediatesPath: string
+): int =
+  ## Selects this board's CSV row, performs every offline trust check, and then
+  ## confirms that the live SE050 UID, object type, persistence, and public key
+  ## still match the attested record.
+  let profileMatch = kittingProfileForName(profileText.strip().toLowerAscii())
+  if profileMatch.isNone:
+    stderr.writeLine &"kitting-verify refused: unknown profile {profileText}"
+    return 2
+  let profile = profileMatch.get()
+
+  let boardSerial = readBoardSerialNumber()
+  if not boardSerial.ok:
+    printSe050Error("Read board serial number failed", boardSerial.error)
+    return 2
+
+  var csvText: string
+  try:
+    csvText = readFile(inputPath)
+  except CatchableError as e:
+    stderr.writeLine &"kitting-verify failed: cannot read CSV file {inputPath}: {e.msg}"
+    return 2
+
+  let trustAnchors = readDerCertificateBundleFile(
+    trustAnchorsPath,
+    "trust-anchor bundle"
+  )
+  if not trustAnchors.ok:
+    printSe050Error("Load trust anchors failed", trustAnchors.error)
+    return 2
+
+  var intermediates: seq[seq[uint8]] = @[]
+  if intermediatesPath.strip().len > 0:
+    let loadedIntermediates = readDerCertificateBundleFile(
+      intermediatesPath,
+      "intermediate-certificate bundle"
+    )
+    if not loadedIntermediates.ok:
+      printSe050Error("Load intermediate certificates failed", loadedIntermediates.error)
+      return 2
+    intermediates = loadedIntermediates.value
+
+  let verified = verifyKittingCsvRecord(
+    csvText = csvText,
+    serialNumber = boardSerial.value,
+    profileKind = profile.kind,
+    trustAnchorsDer = trustAnchors.value,
+    intermediatesDer = intermediates
+  )
+  if not verified.ok:
+    printSe050Error("Kitting CSV verification failed", verified.error)
+    return 1
+
+  let se = openAndRequestAtr(busText, addressText, debug)
+
+  let liveUidRaw = se.readUidRaw(selectFirst = true)
+  if not liveUidRaw.ok:
+    printSe050Error("Read live SE050 UID failed", liveUidRaw.error)
+    return 6
+
+  var liveUid = newSeq[uint8](Se050UidLength)
+  for index, value in liveUidRaw.value:
+    liveUid[index] = value
+
+  let objectType = se.readObjectType(
+    objectId = verified.value.record.keyObjectId,
+    selectFirst = false
+  )
+  if not objectType.ok:
+    printSe050Error("Read live kitting key type failed", objectType.error)
+    return 6
+
+  let publicKey = se.readPublicKey(
+    objectId = verified.value.record.keyObjectId,
+    selectFirst = false
+  )
+  if not publicKey.ok:
+    printSe050Error("Read live kitting public key failed", publicKey.error)
+    return 6
+
+  let local = verifyLocalKittingIdentity(
+    verified = verified.value,
+    boardSerialNumber = boardSerial.value,
+    liveSe050Uid = liveUid,
+    liveObjectType = objectType.value.objectType,
+    liveTransientIndicator = objectType.value.transientIndicator,
+    livePublicKey = publicKey.value
+  )
+  if not local.ok:
+    printSe050Error("Local kitting identity verification failed", local.error)
+    return 5
+
+  let signedPolicy = local.value.verified.semantics.attributes.policies[0]
+
+  echo &"serialno: {local.value.boardSerialNumber}"
+  echo &"profile: {profile.name}"
+  echo &"created at: {local.value.verified.record.createdAt}"
+  echo &"key role: {local.value.verified.record.keyRole}"
+  echo &"key object id: {objectIdHex(local.value.verified.record.keyObjectId)}"
+  echo &"SE050 UID: {bytesToHex(local.value.liveSe050Uid)}"
+  echo &"certificate sha256: {bytesToHex(local.value.verified.signature.certificateSha256)}"
+  echo &"certificate trust anchors: {local.value.verified.certificateChain.trustAnchorCount}"
+  echo &"certificate intermediates: {local.value.verified.certificateChain.intermediateCount}"
+  echo "certificate trust chain: valid"
+  echo "attestation signature: valid"
+  echo &"attribute origin: {objectOriginName(local.value.verified.semantics.attributes.origin)}"
+  echo &"policy header: 0x{signedPolicy.header.toHex(8)}"
+  echo &"live object type: {typeText(local.value.liveObjectType)}"
+  echo "live object persistence: persistent"
+  echo "local board serial: match"
+  echo "local SE050 UID: match"
+  echo "local public key: match"
+  echo "kitting record: valid"
+
+  result = 0
+
 proc runDerive(
     busText: string,
     addressText: string,
@@ -1343,6 +1466,26 @@ proc main(): int =
           opts.index,
           opts.name,
           opts.freshness,
+          opts.trust_anchors,
+          opts.intermediates
+        ))
+
+    command("kitting-verify"):
+      help("Verify this unit against an attested multi-device kitting CSV.")
+      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
+      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("--input", required = true, help = "Multi-device kitting CSV file")
+      option("--profile", default = some("production"), help = "Kitting profile: production or test, default: production")
+      option("--trust-anchors", required = true, help = "DER file containing one or more trusted CA certificates")
+      option("--intermediates", default = some(""), help = "Optional DER file containing concatenated intermediate certificates")
+      flag("-d", "--debug", help = "Print T=1 over I2C frames")
+      run:
+        quit(runKittingVerify(
+          opts.bus,
+          opts.address,
+          opts.debug,
+          opts.input,
+          opts.profile,
           opts.trust_anchors,
           opts.intermediates
         ))
