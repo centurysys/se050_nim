@@ -24,6 +24,7 @@ const
   KittingCsvFormatVersion* = 1'u16
   KittingKeyRoleFirmwareKex* = "firmware-kex"
   KittingFreshnessLength* = 16
+  KittingNonceLength* = 16
 
   # NXP pre-provisioned die-individual ECC attestation objects.
   Se050AttestationKeyObjectId* = 0xF0000012'u32
@@ -95,6 +96,16 @@ proc productionKittingProfile*(): KittingProfile =
   ## Returns the one-time factory production profile.
   result = kittingProfile(kpProduction)
 
+proc kittingProfileForName*(name: string): Option[KittingProfile] =
+  ## Resolves one of the fixed kitting profiles from its CSV name.
+  case name
+  of "test":
+    result = some(testKittingProfile())
+  of "production":
+    result = some(productionKittingProfile())
+  else:
+    result = none(KittingProfile)
+
 proc kittingProfileForObjectId*(objectId: uint32): Option[KittingProfile] =
   ## Resolves one of the fixed kitting profiles from its Secure Object ID.
   if objectId == KittingTestFirmwareKexObjectId:
@@ -146,6 +157,7 @@ proc isValid*(profile: KittingProfile): bool =
 
 static:
   doAssert KittingFreshnessLength == 16
+  doAssert KittingNonceLength == 16
   doAssert KittingTestFirmwareKexObjectId >= DevelopmentObjectStart
   doAssert KittingTestFirmwareKexObjectId <= DevelopmentObjectEnd
   doAssert KittingProductionFirmwareKexObjectId >= CustomerObjectStart

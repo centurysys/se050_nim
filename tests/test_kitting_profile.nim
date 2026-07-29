@@ -69,3 +69,19 @@ suite "SE050 kitting profiles":
     check productionProfile.get().kind == kpProduction
 
     check kittingProfileForObjectId(0x30000101'u32).isNone
+
+suite "SE050 kitting profile names":
+  test "resolves CSV profile names":
+    let testProfile = kittingProfileForName("test")
+    check testProfile.isSome
+    check testProfile.get().kind == kpTest
+
+    let productionProfile = kittingProfileForName("production")
+    check productionProfile.isSome
+    check productionProfile.get().kind == kpProduction
+
+    check kittingProfileForName("development").isNone
+
+  test "uses independent 16-byte nonce and freshness values":
+    check KittingNonceLength == 16
+    check KittingFreshnessLength == 16
