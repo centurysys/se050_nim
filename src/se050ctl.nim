@@ -443,6 +443,30 @@ proc writeRawBytes(path: string, data: openArray[uint8], context: string): bool 
     stderr.writeLine &"{context}: cannot write {path}: {e.msg}"
     result = false
 
+proc readDerCertificateBundleFile(
+    path: string,
+    label: string
+): SE[seq[seq[uint8]]] =
+  ## Reads one or more concatenated DER X.509 certificates from a file.
+  var raw: seq[uint8]
+  try:
+    raw = rawStringToBytes(readFile(path))
+  except CatchableError as e:
+    return fail[seq[seq[uint8]]](
+      seInvalidArgument,
+      &"cannot read {label} file {path}: {e.msg}"
+    )
+
+  let parsed = parseDerCertificateBundle(raw)
+  if not parsed.ok:
+    return fail[seq[seq[uint8]]](
+      parsed.error.kind,
+      &"invalid {label} file {path}: {parsed.error.message}",
+      parsed.error.sw
+    )
+
+  result = parsed
+
 proc typeText(objectType: uint8): string =
   result = &"0x{objectType.toHex(2)} ({objectTypeName(objectType)})"
 
@@ -881,18 +905,37 @@ proc runAttestVerify(
     areaText: string,
     indexText: string,
     nameText: string,
-    freshnessText: string
+    freshnessText: string,
+    trustAnchorsPath: string,
+    intermediatesPath: string
 ): int =
-  ## Verifies the live ReadObject-with-Attestation signature using the device
-  ## certificate and confirms that the certificate public key matches the
-  ## pre-provisioned attestation key object.
-  ##
-  ## This command does not yet verify the certificate chain to an NXP CA.
+  ## Verifies the live ReadObject-with-Attestation signature, validates the
+  ## provisioned device certificate to explicit trust anchors, and confirms
+  ## that the certificate public key matches the attestation key object.
   let objectRef = resolveObjectRef(idText, areaText, indexText, nameText)
   let freshness = parseHexBytes(freshnessText)
   if freshness.len != KittingFreshnessLength:
     stderr.writeLine &"attest-verify requires exactly {KittingFreshnessLength} freshness bytes; got {freshness.len}"
     return 2
+
+  let trustAnchors = readDerCertificateBundleFile(
+    trustAnchorsPath,
+    "trust-anchor bundle"
+  )
+  if not trustAnchors.ok:
+    printSe050Error("Load trust anchors failed", trustAnchors.error)
+    return 2
+
+  var intermediates: seq[seq[uint8]] = @[]
+  if intermediatesPath.strip().len > 0:
+    let loadedIntermediates = readDerCertificateBundleFile(
+      intermediatesPath,
+      "intermediate-certificate bundle"
+    )
+    if not loadedIntermediates.ok:
+      printSe050Error("Load intermediate certificates failed", loadedIntermediates.error)
+      return 2
+    intermediates = loadedIntermediates.value
 
   let se = openAndRequestAtr(busText, addressText, debug)
 
@@ -917,6 +960,15 @@ proc runAttestVerify(
   let certificate = se.readAttestationCertificate(selectFirst = false)
   if not certificate.ok:
     printSe050Error("Read attestation certificate failed", certificate.error)
+    return 1
+
+  let chain = verifyCertificateChain(
+    certificate.value,
+    trustAnchors.value,
+    intermediates
+  )
+  if not chain.ok:
+    printSe050Error("Attestation certificate chain verification failed", chain.error)
     return 1
 
   let certificatePublicKey = extractCertificateEcPublicKey(certificate.value)
@@ -960,8 +1012,10 @@ proc runAttestVerify(
   echo &"chip uid: {bytesToHex(attested.value.response.chipId)}"
   echo &"certificate sha256: {bytesToHex(verified.value.certificateSha256)}"
   echo &"certificate key matches {objectIdHex(Se050AttestationKeyObjectId)}: yes"
+  echo &"certificate trust anchors: {chain.value.trustAnchorCount}"
+  echo &"certificate intermediates: {chain.value.intermediateCount}"
+  echo "certificate trust chain: valid"
   echo "attestation signature: valid"
-  echo "certificate trust chain: not verified"
 
   result = 0
 
@@ -1251,6 +1305,8 @@ proc main(): int =
       option("--index", default = some(""), help = "Area-relative object index, decimal or 0x-prefixed hex")
       option("--name", default = some(""), help = "Known object name. Must refer to an EC key object")
       option("--freshness", required = true, help = "16-byte freshness as hexadecimal text")
+      option("--trust-anchors", required = true, help = "DER file containing one or more trusted CA certificates")
+      option("--intermediates", default = some(""), help = "Optional DER file containing concatenated intermediate certificates")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
         quit(runAttestVerify(
@@ -1261,7 +1317,9 @@ proc main(): int =
           opts.area,
           opts.index,
           opts.name,
-          opts.freshness
+          opts.freshness,
+          opts.trust_anchors,
+          opts.intermediates
         ))
 
     command("derive"):
