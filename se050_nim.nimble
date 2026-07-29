@@ -8,7 +8,7 @@ srcDir        = "src"
 binDir        = "bin"
 bin           = @["se050ctl", "se050_kitting_export"]
 namedBin["se050_kitting_export"] = "se050-kitting-export"
-installExt    = @["nim"]
+installExt    = @["nim", "der"]
 
 
 # Dependencies
@@ -16,3 +16,5 @@ installExt    = @["nim"]
 requires "nim >= 2.2.10"
 requires "results >= 0.5.1"
 requires "argparse >= 4.0.2"
+
+

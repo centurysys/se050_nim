@@ -1049,9 +1049,7 @@ proc runKittingVerify(
     addressText: string,
     debug: bool,
     inputPath: string,
-    profileText: string,
-    trustAnchorsPath: string,
-    intermediatesPath: string
+    profileText: string
 ): int =
   ## Selects this board's CSV row, performs every offline trust check, and then
   ## confirms that the live SE050 UID, object type, persistence, and public key
@@ -1074,30 +1072,14 @@ proc runKittingVerify(
     stderr.writeLine &"kitting-verify failed: cannot read CSV file {inputPath}: {e.msg}"
     return 2
 
-  let trustAnchors = readDerCertificateBundleFile(
-    trustAnchorsPath,
-    "trust-anchor bundle"
-  )
-  if not trustAnchors.ok:
-    printSe050Error("Load trust anchors failed", trustAnchors.error)
-    return 2
-
-  var intermediates: seq[seq[uint8]] = @[]
-  if intermediatesPath.strip().len > 0:
-    let loadedIntermediates = readDerCertificateBundleFile(
-      intermediatesPath,
-      "intermediate-certificate bundle"
-    )
-    if not loadedIntermediates.ok:
-      printSe050Error("Load intermediate certificates failed", loadedIntermediates.error)
-      return 2
-    intermediates = loadedIntermediates.value
+  let trustAnchors = nxpAttestationTrustAnchors()
+  let intermediates = nxpAttestationIntermediates()
 
   let verified = verifyKittingCsvRecord(
     csvText = csvText,
     serialNumber = boardSerial.value,
     profileKind = profile.kind,
-    trustAnchorsDer = trustAnchors.value,
+    trustAnchorsDer = trustAnchors,
     intermediatesDer = intermediates
   )
   if not verified.ok:
@@ -1476,8 +1458,6 @@ proc main(): int =
       option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
       option("--input", required = true, help = "Multi-device kitting CSV file")
       option("--profile", default = some("production"), help = "Kitting profile: production or test, default: production")
-      option("--trust-anchors", required = true, help = "DER file containing one or more trusted CA certificates")
-      option("--intermediates", default = some(""), help = "Optional DER file containing concatenated intermediate certificates")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
         quit(runKittingVerify(
@@ -1485,9 +1465,7 @@ proc main(): int =
           opts.address,
           opts.debug,
           opts.input,
-          opts.profile,
-          opts.trust_anchors,
-          opts.intermediates
+          opts.profile
         ))
 
     command("derive"):

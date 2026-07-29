@@ -2,10 +2,10 @@
 # se050-kitting-export
 # =============================================================================
 #
-# Factory/development-only exporter for an Attestation-backed, multi-device CSV.
-# This executable is intentionally not part of the package's normal `bin` list.
+# Factory/development exporter for an Attestation-backed, multi-device CSV.
 # The first implementation supports only the disposable test profile. A later
-# production-only build adds the one-time customer-range provisioning command.
+# step adds the one-time production profile while deployment packaging decides
+# whether this executable is included in a target image.
 
 import std/options
 import std/os
@@ -39,34 +39,6 @@ proc printError(prefix: string, error: Se050Error) =
   stderr.writeLine &"{prefix}: {error.kind}: {error.message}"
   if error.sw != 0:
     stderr.writeLine &"SW=0x{error.sw.toHex(4)}"
-
-proc rawStringToBytes(data: string): seq[uint8] =
-  result = newSeq[uint8](data.len)
-  for i, ch in data:
-    result[i] = uint8(ord(ch))
-
-proc readDerCertificateBundleFile(
-    path: string,
-    label: string
-): SE[seq[seq[uint8]]] =
-  var raw: seq[uint8]
-  try:
-    raw = rawStringToBytes(readFile(path))
-  except CatchableError as error:
-    return fail[seq[seq[uint8]]](
-      seInvalidArgument,
-      &"cannot read {label} file {path}: {error.msg}"
-    )
-
-  let parsed = parseDerCertificateBundle(raw)
-  if not parsed.ok:
-    return fail[seq[seq[uint8]]](
-      parsed.error.kind,
-      &"invalid {label} file {path}: {parsed.error.message}",
-      parsed.error.sw
-    )
-
-  result = parsed
 
 proc readOptionalCsv(path: string): SE[Option[string]] =
   if not fileExists(path):
@@ -222,30 +194,11 @@ proc runTestExport(
     busText: string,
     addressText: string,
     csvPath: string,
-    trustAnchorPath: string,
-    intermediatePath: string,
     debug: bool
 ): int =
   let profile = testKittingProfile()
-
-  let trustAnchors = readDerCertificateBundleFile(
-    trustAnchorPath,
-    "trust anchor"
-  )
-  if not trustAnchors.ok:
-    printError("Read trust anchors failed", trustAnchors.error)
-    return 2
-
-  var intermediates: seq[seq[uint8]] = @[]
-  if intermediatePath.len > 0:
-    let loaded = readDerCertificateBundleFile(
-      intermediatePath,
-      "intermediate certificate"
-    )
-    if not loaded.ok:
-      printError("Read intermediate certificates failed", loaded.error)
-      return 2
-    intermediates = loaded.value
+  let trustAnchors = nxpAttestationTrustAnchors()
+  let intermediates = nxpAttestationIntermediates()
 
   let serial = readBoardSerialNumber()
   if not serial.ok:
@@ -309,7 +262,7 @@ proc runTestExport(
 
     let verified = verifyExistingRecords(
       existingRecords,
-      trustAnchors.value,
+      trustAnchors,
       intermediates
     )
     if not verified.ok:
@@ -382,7 +335,7 @@ proc runTestExport(
 
   let verified = verifyKittingRecord(
     record.value,
-    trustAnchors.value,
+    trustAnchors,
     intermediates
   )
   if not verified.ok:
@@ -424,7 +377,7 @@ proc runTestExport(
     csvText = reread.value.get(),
     serialNumber = serial.value,
     profileKind = profile.kind,
-    trustAnchorsDer = trustAnchors.value,
+    trustAnchorsDer = trustAnchors,
     intermediatesDer = intermediates,
     keyRole = profile.keyRole
   )
@@ -469,16 +422,12 @@ proc main(): int =
       option("-b", "--bus", required = true, help = "I2C bus number")
       option("-a", "--address", default = some("0x48"), help = "SE050 I2C address")
       option("--append", required = true, help = "Multi-device kitting CSV path")
-      option("--trust-anchors", required = true, help = "Concatenated DER trust-anchor bundle")
-      option("--intermediates", default = some(""), help = "Concatenated DER intermediate bundle")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
         quit(runTestExport(
           opts.bus,
           opts.address,
           opts.append,
-          opts.trust_anchors,
-          opts.intermediates,
           opts.debug
         ))
 
