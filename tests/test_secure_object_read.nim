@@ -69,3 +69,22 @@ suite "SE050 generic Secure Object read parsing":
 
     check not parsed.ok
     check parsed.error.kind == seInvalidResponse
+
+  test "builds an explicit BinaryFile range read APDU":
+    let apdu = buildReadObjectRangeApdu(
+      objectId = 0xF0000013'u32,
+      offset = 0x00E0'u16,
+      length = 0x00E0'u16
+    )
+
+    check apdu == @[
+      0x80'u8, 0x02'u8, 0x00'u8, 0x00'u8, 0x0E'u8,
+      0x41'u8, 0x04'u8, 0xF0'u8, 0x00'u8, 0x00'u8, 0x13'u8,
+      0x42'u8, 0x02'u8, 0x00'u8, 0xE0'u8,
+      0x43'u8, 0x02'u8, 0x00'u8, 0xE0'u8,
+      0x00'u8
+    ]
+
+  test "uses a one-frame default BinaryFile chunk size":
+    check DefaultBinaryReadChunkSize == 224
+

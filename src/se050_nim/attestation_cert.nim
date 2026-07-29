@@ -111,8 +111,9 @@ proc readAttestationCertificate*(
       objectSize.error.sw
     )
 
-  let certificate = se.readSecureObject(
+  let certificate = se.readBinaryObject(
     objectId = Se050AttestationCertificateObjectId,
+    objectSize = objectSize.value,
     selectFirst = false
   )
   if not certificate.ok:

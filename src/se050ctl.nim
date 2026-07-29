@@ -873,6 +873,98 @@ proc runAttestRead(
 
   result = 0
 
+proc runAttestVerify(
+    busText: string,
+    addressText: string,
+    debug: bool,
+    idText: string,
+    areaText: string,
+    indexText: string,
+    nameText: string,
+    freshnessText: string
+): int =
+  ## Verifies the live ReadObject-with-Attestation signature using the device
+  ## certificate and confirms that the certificate public key matches the
+  ## pre-provisioned attestation key object.
+  ##
+  ## This command does not yet verify the certificate chain to an NXP CA.
+  let objectRef = resolveObjectRef(idText, areaText, indexText, nameText)
+  let freshness = parseHexBytes(freshnessText)
+  if freshness.len != KittingFreshnessLength:
+    stderr.writeLine &"attest-verify requires exactly {KittingFreshnessLength} freshness bytes; got {freshness.len}"
+    return 2
+
+  let se = openAndRequestAtr(busText, addressText, debug)
+
+  let exists = se.objectExists(objectId = objectRef.objectId, selectFirst = true)
+  if not exists.ok:
+    printSe050Error("CheckObjectExists failed", exists.error)
+    return 1
+
+  if not exists.value:
+    stderr.writeLine &"attest-verify failed: {objectIdHex(objectRef.objectId)} does not exist"
+    return 1
+
+  let typ = se.readObjectType(objectId = objectRef.objectId, selectFirst = false)
+  if not typ.ok:
+    printSe050Error("ReadType failed", typ.error)
+    return 1
+
+  if not typ.value.objectType.isReadableEcPublicObjectType():
+    stderr.writeLine &"attest-verify refused: {objectIdHex(objectRef.objectId)} is {typeText(typ.value.objectType)}, not an EC key pair/public key"
+    return 2
+
+  let certificate = se.readAttestationCertificate(selectFirst = false)
+  if not certificate.ok:
+    printSe050Error("Read attestation certificate failed", certificate.error)
+    return 1
+
+  let certificatePublicKey = extractCertificateEcPublicKey(certificate.value)
+  if not certificatePublicKey.ok:
+    printSe050Error("Attestation certificate public-key extraction failed", certificatePublicKey.error)
+    return 1
+
+  let provisionedPublicKey = se.readPublicKey(
+    objectId = Se050AttestationKeyObjectId,
+    selectFirst = false
+  )
+  if not provisionedPublicKey.ok:
+    printSe050Error("Read attestation key public part failed", provisionedPublicKey.error)
+    return 1
+
+  if certificatePublicKey.value != provisionedPublicKey.value:
+    stderr.writeLine(
+      "attest-verify failed: certificate public key does not match " &
+      objectIdHex(Se050AttestationKeyObjectId)
+    )
+    return 1
+
+  let attested = se.readObjectWithAttestation(
+    objectId = objectRef.objectId,
+    freshness = freshness,
+    selectFirst = false
+  )
+  if not attested.ok:
+    printSe050Error("ReadObject with Attestation failed", attested.error)
+    return 1
+
+  let verified = verifyAttestationSignature(attested.value, certificate.value)
+  if not verified.ok:
+    printSe050Error("Attestation signature verification failed", verified.error)
+    return 1
+
+  echo &"id: {objectIdHex(objectRef.objectId)}"
+  printResolvedObjectRef(objectRef)
+  echo &"type: {typeText(typ.value.objectType)}"
+  echo &"freshness: {bytesToHex(freshness)}"
+  echo &"chip uid: {bytesToHex(attested.value.response.chipId)}"
+  echo &"certificate sha256: {bytesToHex(verified.value.certificateSha256)}"
+  echo &"certificate key matches {objectIdHex(Se050AttestationKeyObjectId)}: yes"
+  echo "attestation signature: valid"
+  echo "certificate trust chain: not verified"
+
+  result = 0
+
 proc runDerive(
     busText: string,
     addressText: string,
@@ -1148,6 +1240,28 @@ proc main(): int =
           opts.name,
           opts.freshness,
           opts.out_prefix
+        ))
+
+    command("attest-verify"):
+      help("Verify a live SE050 attestation signature using the provisioned device certificate.")
+      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
+      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("--id", default = some(""), help = "Secure Object ID in hex, e.g. 0x30000100")
+      option("--area", default = some(""), help = "Object area: dev, customer, vendor, nxp, internal")
+      option("--index", default = some(""), help = "Area-relative object index, decimal or 0x-prefixed hex")
+      option("--name", default = some(""), help = "Known object name. Must refer to an EC key object")
+      option("--freshness", required = true, help = "16-byte freshness as hexadecimal text")
+      flag("-d", "--debug", help = "Print T=1 over I2C frames")
+      run:
+        quit(runAttestVerify(
+          opts.bus,
+          opts.address,
+          opts.debug,
+          opts.id,
+          opts.area,
+          opts.index,
+          opts.name,
+          opts.freshness
         ))
 
     command("derive"):

@@ -10,6 +10,8 @@ import se050_nim/[
   management,
   kitting_profile,
   attestation_cert,
-  attestation
+  attestation,
+  crypto_verify,
+  attestation_verify
 ]
-export errors, transport, apdu, tlv, uid, random, objects, keys, management, kitting_profile, attestation_cert, attestation
+export errors, transport, apdu, tlv, uid, random, objects, keys, management, kitting_profile, attestation_cert, attestation, crypto_verify, attestation_verify
