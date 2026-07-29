@@ -3,6 +3,9 @@
 # =============================================================================
 #
 # Small BER-TLV style helpers used by SE050 APDU response parsers.
+#
+# Attestation verification needs the exact Tag + Length + Value byte sequence,
+# not only the decoded value. RawTlv therefore preserves both representations.
 
 import ./errors
 
@@ -12,6 +15,12 @@ import ./errors
 
 type
   TlvLength* = tuple[length: int, nextIndex: int]
+
+  RawTlv* = object
+    ## One BER-TLV value preserving its original byte representation.
+    tag*: uint8
+    encoded*: seq[uint8]
+    value*: seq[uint8]
 
 # =============================================================================
 # API
@@ -24,7 +33,7 @@ proc readTlvLength*(data: openArray[uint8], index: int): SE[TlvLength] =
   ##   12          -> length 0x12
   ##   81 80       -> length 0x80
   ##   82 00 12    -> length 0x12
-  if index >= data.len:
+  if index < 0 or index >= data.len:
     return fail[TlvLength](
       seInvalidResponse,
       "TLV length is missing"
@@ -53,3 +62,56 @@ proc readTlvLength*(data: openArray[uint8], index: int): SE[TlvLength] =
     value = (value shl 8) or int(data[index + 1 + i])
 
   result = ok((value, index + 1 + lenBytes))
+
+proc readRawTlv*(
+    data: openArray[uint8],
+    index: int
+): SE[tuple[tlv: RawTlv, nextIndex: int]] =
+  ## Reads one TLV and preserves the original encoded bytes.
+  if index < 0 or index >= data.len:
+    return fail[tuple[tlv: RawTlv, nextIndex: int]](
+      seInvalidResponse,
+      "TLV tag is missing"
+    )
+
+  let length = readTlvLength(data, index + 1)
+  if not length.ok:
+    return fail[tuple[tlv: RawTlv, nextIndex: int]](
+      length.error.kind,
+      length.error.message,
+      length.error.sw
+    )
+
+  let valueStart = length.value.nextIndex
+  let valueEnd = valueStart + length.value.length
+  if valueEnd > data.len:
+    return fail[tuple[tlv: RawTlv, nextIndex: int]](
+      seInvalidResponse,
+      "TLV value is truncated"
+    )
+
+  var tlv = RawTlv(tag: data[index])
+  tlv.encoded = @data[index ..< valueEnd]
+  if valueStart < valueEnd:
+    tlv.value = @data[valueStart ..< valueEnd]
+  else:
+    tlv.value = @[]
+
+  result = ok((tlv, valueEnd))
+
+proc parseRawTlvs*(data: openArray[uint8]): SE[seq[RawTlv]] =
+  ## Parses a byte sequence containing only complete, consecutive TLVs.
+  var index = 0
+  while index < data.len:
+    let parsed = readRawTlv(data, index)
+    if not parsed.ok:
+      return fail[seq[RawTlv]](
+        parsed.error.kind,
+        parsed.error.message,
+        parsed.error.sw
+      )
+
+    result.value.add(parsed.value.tlv)
+    index = parsed.value.nextIndex
+
+  result.ok = true

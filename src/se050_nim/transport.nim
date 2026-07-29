@@ -34,6 +34,8 @@ type
     ifsc*: int
     maxReadLen*: int
     maxRetries*: int
+    maxReadPolls*: int
+    maxReadBackoffMs*: int
 
   T1FrameKind = enum
     fkIBlock,
@@ -72,6 +74,13 @@ const
 
   HeaderLen = 3
   CrcLen = 2
+
+  # A cryptographic command such as ReadObject-with-Attestation may keep the
+  # SE050 busy longer than ordinary management/read commands. During that
+  # period the device NACKs I2C reads. Poll with an increasing delay, following
+  # the behaviour of NXP's T=1-over-I2C PAL.
+  DefaultMaxReadPolls* = 100
+  DefaultMaxReadBackoffMs* = 20
 
 # =============================================================================
 # Byte helpers
@@ -174,7 +183,13 @@ proc writeRaw(self: Se050Transport, frame: openArray[uint8]): SE[void] =
   result = ok()
 
 proc readRaw(self: Se050Transport, readLen: int): SE[seq[uint8]] =
-  for attempt in 0 ..< self.maxRetries:
+  ## Polls until the SE050 has a T=1 frame ready.
+  ##
+  ## SE050 signals a busy state by NACKing I2C reads. Commands involving
+  ## internal asymmetric cryptography can remain busy long enough that the
+  ## previous fixed 8 x 5 ms window expired before the first WTX/I-block was
+  ## available. Use a bounded incremental backoff instead.
+  for attempt in 0 ..< self.maxReadPolls:
     let rxChars = self.i2c.read(readLen)
     if rxChars.len > 0:
       let rx = toBytes(rxChars)
@@ -182,9 +197,16 @@ proc readRaw(self: Se050Transport, readLen: int): SE[seq[uint8]] =
         echo "T1 RX: ", hexDump(rx)
       return ok(rx)
 
-    sleep(5)
+    if attempt + 1 < self.maxReadPolls:
+      let delayMs = min(attempt + 1, self.maxReadBackoffMs)
+      if self.debug:
+        echo &"T1 RX busy: poll {attempt + 1}/{self.maxReadPolls}, retry in {delayMs} ms"
+      sleep(delayMs)
 
-  result = fail[seq[uint8]](seI2cReadFailed, "I2C read returned no data")
+  result = fail[seq[uint8]](
+    seI2cReadFailed,
+    &"I2C read returned no data after {self.maxReadPolls} polls"
+  )
 
 proc readRaw(self: Se050Transport): SE[seq[uint8]] =
   result = self.readRaw(self.maxReadLen)
@@ -268,6 +290,8 @@ proc newSe050Transport*(i2c: I2cdev, debug: bool = false): Se050Transport =
   result.ifsc = 254
   result.maxReadLen = 260
   result.maxRetries = 8
+  result.maxReadPolls = DefaultMaxReadPolls
+  result.maxReadBackoffMs = DefaultMaxReadBackoffMs
 
 # --------------------------------------------------------------------------------
 # API:
