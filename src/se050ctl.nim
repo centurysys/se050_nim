@@ -720,6 +720,30 @@ proc runPubkey(
 
   result = 0
 
+proc runAttestationCert(
+    busText: string,
+    addressText: string,
+    debug: bool,
+    outputPath: string
+): int =
+  let se = openAndRequestAtr(busText, addressText, debug)
+
+  let certificate = se.readAttestationCertificate(selectFirst = true)
+  if not certificate.ok:
+    printSe050Error("Read attestation certificate failed", certificate.error)
+    return 1
+
+  try:
+    writeFile(outputPath, bytesToRawString(certificate.value))
+  except CatchableError as e:
+    stderr.writeLine &"attestation-cert failed: cannot write {outputPath}: {e.msg}"
+    return 1
+
+  echo &"{objectIdHex(Se050AttestationCertificateObjectId)}: attestation certificate written to {outputPath}"
+  echo &"length: {certificate.value.len}"
+  result = 0
+
+
 proc runDerive(
     busText: string,
     addressText: string,
@@ -957,6 +981,20 @@ proc main(): int =
           opts.name,
           opts.out,
           separator
+        ))
+
+    command("attestation-cert"):
+      help("Read the NXP-provisioned SE050 device attestation certificate.")
+      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
+      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-o", "--out", required = true, help = "Write the DER certificate to this file")
+      flag("-d", "--debug", help = "Print T=1 over I2C frames")
+      run:
+        quit(runAttestationCert(
+          opts.bus,
+          opts.address,
+          opts.debug,
+          opts.out
         ))
 
     command("derive"):

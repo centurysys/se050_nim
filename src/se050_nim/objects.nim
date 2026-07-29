@@ -35,6 +35,7 @@ const
   MorePresent = 0x02'u8
 
   SecureObjectTypeAll* = 0xFF'u8
+  Se050TypeBinaryFile* = 0x0B'u8
 
   # SE05x CheckObjectExists APDU.
   #
@@ -111,6 +112,24 @@ const
   ReadSizeIns = 0x02'u8
   ReadSizeP1 = 0x00'u8
   ReadSizeP2 = 0x07'u8
+
+  # SE05x ReadObject APDU.
+  #
+  # NXP AN12413 describes ReadObject as:
+  #   CLA = 0x80
+  #   INS = INS_READ   = 0x02
+  #   P1  = P1_DEFAULT = 0x00
+  #   P2  = P2_DEFAULT = 0x00
+  #
+  # Command data:
+  #   TAG_1: 4-byte Secure Object identifier
+  #
+  # Response data:
+  #   TAG_1: Data read from the Secure Object
+  ReadObjectCla = 0x80'u8
+  ReadObjectIns = 0x02'u8
+  ReadObjectP1 = 0x00'u8
+  ReadObjectP2 = 0x00'u8
 
   # SE05x DeleteSecureObject APDU.
   #
@@ -260,6 +279,15 @@ proc buildReadSizeApdu(objectId: uint32): seq[uint8] =
     objectId = objectId
   )
 
+proc buildReadObjectApdu(objectId: uint32): seq[uint8] =
+  result = buildReadObjectPropertyApdu(
+    cla = ReadObjectCla,
+    ins = ReadObjectIns,
+    p1 = ReadObjectP1,
+    p2 = ReadObjectP2,
+    objectId = objectId
+  )
+
 proc buildDeleteObjectApdu(objectId: uint32): seq[uint8] =
   result = @[
     DeleteObjectCla,
@@ -275,6 +303,57 @@ proc buildDeleteObjectApdu(objectId: uint32): seq[uint8] =
   result.appendU32Be(objectId)
 
   # DeleteSecureObject has no Le field.
+
+proc parseReadSecureObjectResponse*(
+    response: openArray[uint8]
+): SE[seq[uint8]] =
+  ## Parses a ReadObject response and returns the TAG_1 value.
+  ##
+  ## This pure helper is exported so higher-level parsers and unit tests can
+  ## validate captured APDU responses without requiring a live SE050 transport.
+  let st = checkStatus(response, "ReadObject")
+  if not st.ok:
+    return fail[seq[uint8]](st.error.kind, st.error.message, st.error.sw)
+
+  let data = dataWithoutStatus(response)
+  if not data.ok:
+    return fail[seq[uint8]](data.error.kind, data.error.message, data.error.sw)
+
+  if data.value.len < 2:
+    return fail[seq[uint8]](
+      seInvalidResponse,
+      "ReadObject response does not contain TAG/LEN/VALUE"
+    )
+
+  if data.value[0] != Tag1:
+    return fail[seq[uint8]](
+      seInvalidResponse,
+      "ReadObject response does not start with TAG_1"
+    )
+
+  let tlvLen = readTlvLength(data.value, 1)
+  if not tlvLen.ok:
+    return fail[seq[uint8]](
+      tlvLen.error.kind,
+      tlvLen.error.message,
+      tlvLen.error.sw
+    )
+
+  let valueStart = tlvLen.value.nextIndex
+  let valueEnd = valueStart + tlvLen.value.length
+  if valueEnd > data.value.len:
+    return fail[seq[uint8]](
+      seInvalidResponse,
+      "ReadObject response value is shorter than expected"
+    )
+
+  if valueEnd != data.value.len:
+    return fail[seq[uint8]](
+      seInvalidResponse,
+      "ReadObject response contains trailing data after TAG_1"
+    )
+
+  result = ok(data.value[valueStart ..< valueEnd])
 
 proc parseExistsResponse(response: openArray[uint8]): SE[bool] =
   let st = checkStatus(response, "CheckObjectExists")
@@ -682,6 +761,35 @@ proc readObjectSize*(
     )
 
   result = parseReadSizeResponse(response.value)
+
+proc readSecureObject*(
+    se: Se050Transport,
+    objectId: uint32,
+    selectFirst: bool = true
+): SE[seq[uint8]] =
+  ## Reads the raw value of a readable SE050 Secure Object.
+  ##
+  ## For EC key-pair and EC-public-key objects, the returned value is the public
+  ## key. For a BINARY_FILE object, the returned value is the stored byte array.
+  ## Object-type and policy checks remain the caller's responsibility.
+  if selectFirst:
+    let selected = se.selectApplet()
+    if not selected.ok:
+      return fail[seq[uint8]](
+        selected.error.kind,
+        selected.error.message,
+        selected.error.sw
+      )
+
+  let response = se.transceiveApdu(buildReadObjectApdu(objectId))
+  if not response.ok:
+    return fail[seq[uint8]](
+      response.error.kind,
+      response.error.message,
+      response.error.sw
+    )
+
+  result = parseReadSecureObjectResponse(response.value)
 
 proc deleteSecureObject*(
     se: Se050Transport,
