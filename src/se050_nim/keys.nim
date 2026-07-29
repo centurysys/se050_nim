@@ -237,6 +237,21 @@ proc deviceEcKeyPolicy*(): EcKeyPolicy =
       PolicyObjAllowRead
   )
 
+proc testDeviceKeyPolicy*(): EcKeyPolicy =
+  ## Returns a production-like EC key policy for disposable test objects.
+  ##
+  ## The key has the same key-agreement and public-key read permissions as a
+  ## production device key. DELETE is additionally allowed so development tests
+  ## can remove the object and repeat the complete provisioning flow. WRITE and
+  ## GEN stay disabled, preventing an existing test key from being overwritten
+  ## or regenerated in place.
+  result = EcKeyPolicy(
+    header:
+      PolicyObjAllowKa or
+      PolicyObjAllowRead or
+      PolicyObjAllowDelete
+  )
+
 proc oneTimeDeviceKeyPolicy*(): EcKeyPolicy =
   ## Returns a one-time-write style production EC key policy.
   ##

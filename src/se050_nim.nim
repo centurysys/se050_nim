@@ -7,6 +7,7 @@ import se050_nim/[
   random,
   objects,
   keys,
-  management
+  management,
+  kitting_profile
 ]
-export errors, transport, apdu, tlv, uid, random, objects, keys, management
+export errors, transport, apdu, tlv, uid, random, objects, keys, management, kitting_profile
