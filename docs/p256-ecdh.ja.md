@@ -30,7 +30,7 @@ board serial
   -> per-device envelope
 ```
 
-CSVが保持する公開鍵、Object ID、SE050 UID、Policy、基板serialはAttestation検証で結び付けられます。現在のproduction鍵生成とEnvelope生成コードは未実装です。
+CSVが保持する公開鍵、Object ID、SE050 UID、Policy、基板serialはAttestation検証で結び付けられます。Production鍵生成CLIは実装済みですが、不可逆実機試験は未完了です。Envelope生成コードはまだ未実装です。
 
 ## 公開鍵形式
 
@@ -133,4 +133,4 @@ raw、curve-prefix、nested TLVのpeer encodingを試してもderiveできなか
 
 ## Production note
 
-現在実機確認済みなのは、削除可能なtest kitting鍵`0x30000100`までです。Production鍵`0x20000100`はProfileとPolicy APIを定義していますが、不可逆生成CLIと実機試験は未実装です。
+現在実機確認済みなのは、削除可能なtest kitting鍵`0x30000100`までです。Production鍵`0x20000100`の不可逆生成CLIは実装済みですが、出荷しない評価個体での実機試験は未完了です。

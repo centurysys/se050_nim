@@ -22,6 +22,8 @@ NXP Plug & Trust Middlewareには依存せず、組み込みLinux製品から必
 - CSVのオフライン暗号学的検証
 - CSVとローカル基板serial、SE050 UID、公開鍵の実機照合
 
+Production用`0x20000100`の生成経路も実装済みですが、不可逆な実機試験はまだ完了していません。
+
 Firmware envelope用の鍵共有本線は以下です。
 
 ```text
@@ -42,9 +44,9 @@ bin/se050-kitting-export
 - `se050ctl`: 開発・診断、およびCSVと実機の照合
 - `se050-kitting-export`: 工場・開発環境でAttestation付きCSVを生成
 
-現在のExporterが実装するのは、削除可能な`test`プロファイルだけです。Production用`0x20000100`のone-time/no-delete鍵生成は未実装です。
+Exporterは、削除可能な`test`プロファイルと、削除・上書きできない`production`プロファイルを実装します。Production経路は不可逆なため、出荷しない評価個体での実機確認が完了するまではexperimentalとして扱います。
 
-## Testキッティング
+## キッティング
 
 Exporterは`/proc/device-tree/board/serialno`から基板serialを取得し、SE050内のtest鍵を作成または再利用して、Attestation付きCSV recordを追加します。
 
@@ -53,6 +55,16 @@ se050-kitting-export test \
   -b 0 \
   --append /tmp/se050-kitting.csv
 ```
+
+Production鍵を作成する場合は、固定Object ID `0x20000100`へPolicy `0x04200000`で不可逆生成します。
+
+```sh
+se050-kitting-export production \
+  -b 0 \
+  --append /tmp/se050-kitting.csv
+```
+
+`production`は既存Objectを削除・上書きしません。異なるtypeやPolicyのObjectが存在する場合は停止します。
 
 同じ基板・同じ鍵で再実行すると、CSV行を重複追加せず次の状態になります。
 
@@ -130,7 +142,7 @@ P-256公開鍵は65 bytesの非圧縮point、ECDH shared secretは32 bytesです
 |---|---:|---:|---|
 | 汎用development鍵 | dev range | `0x043C0000` | `se050ctl keygen`で作成可能 |
 | test firmware KEX | `0x30000100` | `0x04240000` | Exporterで実装・実機確認済み |
-| production firmware KEX | `0x20000100` | `0x04200000` | Profile/API定義のみ。生成CLI未実装 |
+| production firmware KEX | `0x20000100` | `0x04200000` | Exporter実装済み。不可逆実機試験待ち |
 | NXP Attestation key | `0xF0000012` | NXP provisioned | 読出し・検証で使用 |
 | NXP device certificate | `0xF0000013` | NXP provisioned | 読出し・検証で使用 |
 

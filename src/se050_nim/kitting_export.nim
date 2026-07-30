@@ -7,8 +7,10 @@
 # the dedicated exporter executable.
 
 import std/strformat
+import std/strutils
 
 import ./errors
+import ./kitting_profile
 import ./kitting_record
 
 # =============================================================================
@@ -43,6 +45,27 @@ proc sameKittingDeviceKey*(a, b: KittingRecord): bool =
     a.se050Uid == b.se050Uid and
     a.keyObjectId == b.keyObjectId and
     a.publicKey == b.publicKey
+
+
+proc validateKittingObjectPresenceForExport*(
+    existingRecordPresent: bool,
+    objectExists: bool,
+    serialNumber: string,
+    profile: KittingProfile
+): SE[void] =
+  ## Prevents replacement-key creation when a trusted CSV record already exists.
+  ##
+  ## If the record exists but the corresponding Secure Object is absent, the
+  ## exporter must stop rather than create a different key under the same
+  ## serial/profile logical slot. This is especially important for production
+  ## kitting because a replacement key would itself become non-deletable.
+  if existingRecordPresent and not objectExists:
+    return fail[void](
+      seKittingValidationFailed,
+      &"CSV already contains a {profile.name} record for serial {serialNumber}, but object 0x{profile.keyObjectId.toHex(8)} is absent; refusing to create a replacement key"
+    )
+
+  result = ok()
 
 proc mergeKittingRecord*(
     existing: openArray[KittingRecord],

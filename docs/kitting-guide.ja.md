@@ -9,13 +9,13 @@
 - Applet 7.2.xのReadObject-with-Attestation
 - NXP個体証明書とAttestation署名の検証
 - test firmware KEX鍵`0x30000100`の作成・再利用
+- production firmware KEX鍵`0x20000100`の固定Policy生成経路
 - 複数機器CSVへの安全な追加と冪等な再実行
 - CSV recordのオフライン暗号学的検証
 - CSVとローカル実機の照合
 
 未実装:
 
-- production firmware KEX鍵`0x20000100`の不可逆生成CLI
 - production鍵の削除不能・上書き不能実機試験
 - SE050を必要としないPC専用CSV検証CLI
 - firmware envelope生成、HKDF、AES-GCM、復号
@@ -45,7 +45,7 @@ src/se050_nim/certs/nxp-attestation-ecc-intermediate.der
 | Profile | Object ID | Curve/type | Policy | Lifecycle | CLI |
 |---|---:|---|---:|---|---|
 | `test` | `0x30000100` | P-256 / `0x29` | `0x04240000` | KA/READ/DELETE、上書き不可 | 実装済み |
-| `production` | `0x20000100` | P-256 / `0x29` | `0x04200000` | KA/READ、削除・上書き不可 | 未実装 |
+| `production` | `0x20000100` | P-256 / `0x29` | `0x04200000` | KA/READ、削除・上書き不可 | CLI実装済み、実機試験待ち |
 
 `test`はproduction相当のKA/READ権限にDELETEだけを追加しています。既存鍵を同じObject IDへ上書き・再生成する権限はありません。
 
@@ -110,6 +110,30 @@ CSV record: already valid
 CSV path: /tmp/se050-kitting.csv
 ```
 
+## Production CSVの生成
+
+`production`は固定Object ID `0x20000100`へ、KA/READだけを許可するPolicy `0x04200000`でP-256鍵を内部生成します。DELETE、WRITE、GEN権限は付与しません。
+
+```sh
+se050-kitting-export production \
+  -b 0 \
+  --append /tmp/se050-kitting.csv
+```
+
+この操作は不可逆です。最初の実機試験は出荷しない評価個体で実施してください。
+
+Exporterは、鍵生成前に次の可逆な確認を完了します。
+
+1. board serialとApplet version
+2. NXP個体証明書の読取りと組み込みTrust Storeでのchain検証
+3. SE050 UIDの読取り
+4. 既存CSV全recordのオフライン検証
+5. 同じserial/profileのCSV recordがある場合、対象Objectも存在すること
+
+対象Objectが存在しない場合だけproduction鍵を生成します。既存Objectがある場合は削除・上書きせず再利用し、Attestationでtype、origin、Policy、公開鍵を検証します。一致しない場合は停止します。
+
+鍵生成後にCSV書込みなどで失敗しても、次回実行では既存鍵を再利用してAttestationとCSV生成をやり直せます。
+
 ## 旧development鍵が残っている場合
 
 汎用`se050ctl keygen`のPolicyは`0x043C0000`です。これで`0x30000100`を作った場合、Exporterは次のように拒否します。
@@ -139,7 +163,7 @@ serialno,format_version,profile,created_at,key_role,se050_uid,key_object_id,nonc
 |---|---|
 | `serialno` | Device Treeの基板serial |
 | `format_version` | 現在は`1` |
-| `profile` | `test`または将来の`production` |
+| `profile` | `test`または`production` |
 | `created_at` | UTC `YYYY-MM-DDTHH:MM:SSZ` |
 | `key_role` | 現在は`firmware-kex` |
 | `se050_uid` | SE050 UID |
@@ -184,7 +208,7 @@ se050ctl kitting-verify \
 - persistent indicator
 - 公開鍵
 
-`--profile`のCLI defaultは`production`です。現在のExporterで作ったCSVを確認するときは、必ず`--profile test`を指定してください。
+`--profile`のCLI defaultは`production`です。Test CSVを確認するときは`--profile test`を指定し、production CSVはdefaultまたは`--profile production`で選択します。
 
 ## NXP個体証明書のBinaryFile差異
 
@@ -196,11 +220,10 @@ se050ctl kitting-verify \
 
 現状は同一directory内の一時ファイルへ全CSVを書き、renameで置換します。途中の部分書込みをreaderに見せないための対策です。
 
-Production exporterのhardeningとして、次は未実装です。
+CSV writerの追加hardeningとして、次は未実装です。
 
 - 複数process/端末の同時追記を防ぐfile lock
 - temporary fileとdirectoryへの明示的`fsync()`
-- production profileの不可逆作成
 
 ## 次の開発段階
 

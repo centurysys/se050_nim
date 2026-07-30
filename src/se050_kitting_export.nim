@@ -3,9 +3,10 @@
 # =============================================================================
 #
 # Factory/development exporter for an Attestation-backed, multi-device CSV.
-# The first implementation supports only the disposable test profile. A later
-# step adds the one-time production profile while deployment packaging decides
-# whether this executable is included in a target image.
+# The test profile creates a disposable key in the development range. The
+# production profile creates or reuses the fixed one-time/no-delete key in the
+# customer range. Deployment packaging decides whether this executable is
+# included in a target image.
 
 import std/options
 import std/os
@@ -56,8 +57,8 @@ proc writeCsvAtomic(path: string, content: string): SE[void] =
   ## Replaces the CSV through a temporary file in the same directory.
   ##
   ## Same-directory rename prevents readers from observing a partially written
-  ## CSV. File locking and explicit fsync durability are added in the production
-  ## exporter hardening step.
+  ## CSV. The current exporter assumes one writer; file locking and explicit
+  ## fsync durability are not implemented.
   let directory = parentDir(path)
   if directory.len > 0 and not dirExists(directory):
     return fail[void](
@@ -112,19 +113,25 @@ proc openAndRequestAtr(
   result = ok(se)
 
 # =============================================================================
-# Live test-profile export
+# Live kitting export
 # =============================================================================
 
-proc ensureTestKey(
+proc ensureKittingKey(
     se: Se050Transport,
-    profile: KittingProfile
+    profile: KittingProfile,
+    objectAlreadyExists: bool
 ): SE[bool] =
   ## Returns true when this invocation created the key.
-  let exists = se.objectExists(profile.keyObjectId, selectFirst = false)
-  if not exists.ok:
-    return fail[bool](exists.error.kind, exists.error.message, exists.error.sw)
+  ##
+  ## Existing objects are never overwritten or deleted. The full signed policy,
+  ## origin, and object semantics are verified later through Attestation.
+  if not profile.isValid():
+    return fail[bool](
+      seInvalidArgument,
+      "kitting profile is invalid"
+    )
 
-  if not exists.value:
+  if not objectAlreadyExists:
     let generated = se.generateEcKeyPair(
       objectId = profile.keyObjectId,
       curve = profile.curve,
@@ -150,14 +157,14 @@ proc ensureTestKey(
   if objectType.value.objectType != profile.expectedKeyType():
     return fail[bool](
       seKittingValidationFailed,
-      &"test object 0x{profile.keyObjectId.toHex(8)} has type 0x{objectType.value.objectType.toHex(2)}; expected 0x{profile.expectedKeyType().toHex(2)}"
+      &"{profile.name} object 0x{profile.keyObjectId.toHex(8)} has type 0x{objectType.value.objectType.toHex(2)}; expected 0x{profile.expectedKeyType().toHex(2)}"
     )
 
   if objectType.value.transientIndicator.isNone or
       objectType.value.transientIndicator.get() != 0x01'u8:
     return fail[bool](
       seKittingValidationFailed,
-      &"test object 0x{profile.keyObjectId.toHex(8)} is not persistent"
+      &"{profile.name} object 0x{profile.keyObjectId.toHex(8)} is not persistent"
     )
 
   result.ok = true
@@ -190,13 +197,17 @@ proc findExistingVerifiedRecord(
       return some(verified)
   result = none(VerifiedKittingRecord)
 
-proc runTestExport(
+proc runKittingExport(
+    profile: KittingProfile,
     busText: string,
     addressText: string,
     csvPath: string,
     debug: bool
 ): int =
-  let profile = testKittingProfile()
+  if not profile.isValid():
+    stderr.writeLine "invalid kitting profile"
+    return 2
+
   let trustAnchors = nxpAttestationTrustAnchors()
   let intermediates = nxpAttestationIntermediates()
 
@@ -220,31 +231,27 @@ proc runTestExport(
     stderr.writeLine &"unsupported SE050 applet version {version.value.major}.{version.value.minor}.{version.value.patch}; expected {KittingAppletMajor}.{KittingAppletMinor}.x"
     return 1
 
-  let keyCreated = ensureTestKey(se, profile)
-  if not keyCreated.ok:
-    printError("Prepare test kitting key failed", keyCreated.error)
-    return 1
-
+  # Complete all reversible trust/input checks before an absent production key
+  # is created with a no-delete/no-overwrite policy.
   let certificate = se.readAttestationCertificate(selectFirst = false)
   if not certificate.ok:
     printError("Read attestation certificate failed", certificate.error)
     return 6
+
+  let certificateChain = verifyCertificateChain(
+    leafCertificateDer = certificate.value,
+    trustAnchorsDer = trustAnchors,
+    intermediatesDer = intermediates
+  )
+  if not certificateChain.ok:
+    printError("Verify attestation certificate failed", certificateChain.error)
+    return 1
 
   let liveUidArray = se.readUidRaw(selectFirst = false)
   if not liveUidArray.ok:
     printError("Read live SE050 UID failed", liveUidArray.error)
     return 6
   let liveUid = @(liveUidArray.value)
-
-  let liveType = se.readObjectType(profile.keyObjectId, selectFirst = false)
-  if not liveType.ok:
-    printError("Read live key type failed", liveType.error)
-    return 6
-
-  let livePublicKey = se.readPublicKey(profile.keyObjectId, selectFirst = false)
-  if not livePublicKey.ok:
-    printError("Read live public key failed", livePublicKey.error)
-    return 6
 
   let existingText = readOptionalCsv(csvPath)
   if not existingText.ok:
@@ -275,6 +282,37 @@ proc runTestExport(
     serial.value,
     profile
   )
+
+  let objectExists = se.objectExists(profile.keyObjectId, selectFirst = false)
+  if not objectExists.ok:
+    printError("Check kitting key failed", objectExists.error)
+    return 6
+
+  let presence = validateKittingObjectPresenceForExport(
+    existingRecordPresent = alreadyRegistered.isSome,
+    objectExists = objectExists.value,
+    serialNumber = serial.value,
+    profile = profile
+  )
+  if not presence.ok:
+    printError("Existing CSV record does not match this device", presence.error)
+    return 5
+
+  let keyCreated = ensureKittingKey(se, profile, objectExists.value)
+  if not keyCreated.ok:
+    printError(&"Prepare {profile.name} kitting key failed", keyCreated.error)
+    return 1
+
+  let liveType = se.readObjectType(profile.keyObjectId, selectFirst = false)
+  if not liveType.ok:
+    printError("Read live key type failed", liveType.error)
+    return 6
+
+  let livePublicKey = se.readPublicKey(profile.keyObjectId, selectFirst = false)
+  if not livePublicKey.ok:
+    printError("Read live public key failed", livePublicKey.error)
+    return 6
+
   if alreadyRegistered.isSome:
     let local = verifyLocalKittingIdentity(
       verified = alreadyRegistered.get(),
@@ -291,8 +329,8 @@ proc runTestExport(
     echo &"serialno: {serial.value}"
     echo &"profile: {profile.name}"
     echo &"key object id: 0x{profile.keyObjectId.toHex(8)}"
-    echo &"key created: no"
-    echo &"CSV record: already valid"
+    echo "key created: no"
+    echo "CSV record: already valid"
     echo &"CSV path: {csvPath}"
     return 0
 
@@ -404,7 +442,7 @@ proc runTestExport(
   echo &"key created: {keyCreatedText}"
   echo &"SE050 UID: {uidToHex(liveUid)}"
   echo &"CSV record count: {merged.value.recordCount}"
-  echo &"CSV record: added"
+  echo "CSV record: added"
   echo &"CSV path: {csvPath}"
   echo "self-verification: valid"
   result = 0
@@ -424,7 +462,23 @@ proc main(): int =
       option("--append", required = true, help = "Multi-device kitting CSV path")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
-        quit(runTestExport(
+        quit(runKittingExport(
+          testKittingProfile(),
+          opts.bus,
+          opts.address,
+          opts.append,
+          opts.debug
+        ))
+
+    command("production"):
+      help("Irreversibly create or reuse the fixed production key and append its record.")
+      option("-b", "--bus", required = true, help = "I2C bus number")
+      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address")
+      option("--append", required = true, help = "Multi-device kitting CSV path")
+      flag("-d", "--debug", help = "Print T=1 over I2C frames")
+      run:
+        quit(runKittingExport(
+          productionKittingProfile(),
           opts.bus,
           opts.address,
           opts.append,

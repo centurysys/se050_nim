@@ -22,7 +22,7 @@
 | NXP Attestation key | `0xF0000012` | P-256 key pair / NXP | 事前搭載、署名検証に使用 |
 | NXP device certificate | `0xF0000013` | BinaryFile / NXP | 事前搭載、X.509検証に使用 |
 | test firmware KEX | `0x30000100` | P-256 key pair / dev | Exporter実装・実機確認済み |
-| production firmware KEX | `0x20000100` | P-256 key pair / customer | Profile/API・汎用変更ガード実装済み、生成CLI未実装 |
+| production firmware KEX | `0x20000100` | P-256 key pair / customer | 生成CLI・汎用変更ガード実装済み、不可逆実機試験待ち |
 
 Testとproductionで下位16-bitのindexを`0x0100`に揃え、上位byteでprofileを見分けます。
 
@@ -86,7 +86,13 @@ Curve: P-256
 Policy: 0x04200000
 ```
 
-ただし、現在の`se050-kitting-export`は`test`サブコマンドだけを実装しています。Production生成を追加する前に、出荷しない評価個体を使って次を確認する必要があります。
+```sh
+se050-kitting-export production \
+  -b 0 \
+  --append /tmp/se050-kitting.csv
+```
+
+`se050-kitting-export production`はこの固定ID・固定Policyだけを使用し、既存Objectを削除・上書きしません。不可逆な初回実機試験では、出荷しない評価個体を使って次を確認します。
 
 - 初回生成が成功する
 - AttestationのPolicy/Origin/typeが一致する

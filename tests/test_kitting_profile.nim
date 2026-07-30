@@ -34,6 +34,8 @@ suite "SE050 kitting profiles":
     let testHeader = policyHeader(testKittingProfile().keyPolicy())
     let productionHeader = policyHeader(productionKittingProfile().keyPolicy())
 
+    check testHeader == 0x04240000'u32
+    check productionHeader == 0x04200000'u32
     check testHeader != productionHeader
     check (testHeader xor productionHeader) == 0x00040000'u32
     check productionHeader == policyHeader(oneTimeDeviceKeyPolicy())

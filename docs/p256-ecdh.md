@@ -30,7 +30,7 @@ board serial
   -> per-device envelope
 ```
 
-Attestation binds the public key, Object ID, SE050 UID, policy, and board-serial-derived freshness. Production key creation and envelope generation are not implemented yet.
+Attestation binds the public key, Object ID, SE050 UID, policy, and board-serial-derived freshness. The production key creation CLI is implemented, but its irreversible hardware test is still pending. Envelope generation is not implemented yet.
 
 ## Public-key format
 
@@ -133,4 +133,4 @@ Raw, curve-prefixed, and nested-TLV peer encodings did not work, so X25519 remai
 
 ## Production note
 
-Only the deletable test kitting key `0x30000100` has been exercised on hardware. The production profile and policy API for `0x20000100` exist, but irreversible creation and hardware testing are not implemented yet.
+Only the deletable test kitting key `0x30000100` has been exercised on hardware. The irreversible production creation CLI for `0x20000100` is implemented, but it has not yet been tested on a non-shipping evaluation device.

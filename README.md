@@ -22,6 +22,8 @@ The main paths verified with SE050 Applet 7.2.x devices include:
 - offline cryptographic verification of CSV records
 - live comparison with the board serial, SE050 UID, object type, persistence, and public key
 
+The production creation path for `0x20000100` is implemented, but its irreversible hardware test is still pending.
+
 The main firmware-envelope key-agreement path is:
 
 ```text
@@ -42,9 +44,9 @@ bin/se050-kitting-export
 - `se050ctl`: development, diagnostics, and local CSV/device verification
 - `se050-kitting-export`: factory/development generation of attested CSV records
 
-The exporter currently implements only the deletable `test` profile. Creation of the one-time/no-delete production object `0x20000100` is not implemented yet.
+The exporter implements both the deletable `test` profile and the no-delete/no-overwrite `production` profile. Because production creation is irreversible, treat that path as experimental until it has been exercised on a non-shipping evaluation device.
 
-## Test kitting
+## Kitting
 
 The exporter reads the board serial from `/proc/device-tree/board/serialno`, creates or reuses the test key, and appends an Attestation-backed record.
 
@@ -53,6 +55,16 @@ se050-kitting-export test \
   -b 0 \
   --append /tmp/se050-kitting.csv
 ```
+
+The production command irreversibly creates the fixed object `0x20000100` with policy `0x04200000`.
+
+```sh
+se050-kitting-export production \
+  -b 0 \
+  --append /tmp/se050-kitting.csv
+```
+
+The production path never deletes or overwrites an existing object. It stops if the existing type or signed policy is different.
 
 A second run with the same board and key does not duplicate the row:
 
@@ -130,7 +142,7 @@ P-256 public keys are 65-byte uncompressed points, and ECDH shared secrets are 3
 |---|---:|---:|---|
 | Generic development key | development range | `0x043C0000` | Created by `se050ctl keygen` |
 | Test firmware KEX | `0x30000100` | `0x04240000` | Implemented and tested |
-| Production firmware KEX | `0x20000100` | `0x04200000` | Profile/API only; exporter not implemented |
+| Production firmware KEX | `0x20000100` | `0x04200000` | Exporter implemented; irreversible device test pending |
 | NXP attestation key | `0xF0000012` | NXP provisioned | Used for verification |
 | NXP device certificate | `0xF0000013` | NXP provisioned | Used for verification |
 

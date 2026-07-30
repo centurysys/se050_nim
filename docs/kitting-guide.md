@@ -9,13 +9,13 @@ Implemented:
 - Applet 7.2.x ReadObject-with-Attestation
 - NXP device certificate and attestation signature verification
 - creation and reuse of test firmware KEX object `0x30000100`
+- fixed-policy production firmware KEX creation path at `0x20000100`
 - safe append and idempotent reuse of a multi-device CSV
 - offline cryptographic verification of records
 - local comparison with the current board and SE050
 
 Not implemented:
 
-- irreversible creation CLI for production object `0x20000100`
 - real-device no-delete/no-overwrite production tests
 - a PC-only CSV verification executable
 - firmware envelope generation, HKDF, AES-GCM, and decryption
@@ -45,7 +45,7 @@ They are embedded with `staticRead()`. Kitting verification does not accept call
 | Profile | Object ID | Curve/type | Policy | Lifecycle | CLI |
 |---|---:|---|---:|---|---|
 | `test` | `0x30000100` | P-256 / `0x29` | `0x04240000` | KA/READ/DELETE, no overwrite | implemented |
-| `production` | `0x20000100` | P-256 / `0x29` | `0x04200000` | KA/READ, no delete or overwrite | not implemented |
+| `production` | `0x20000100` | P-256 / `0x29` | `0x04200000` | KA/READ, no delete or overwrite | CLI implemented; device test pending |
 
 The test policy matches production KA/READ permissions and adds DELETE only. It does not allow overwriting or regenerating an existing key in place.
 
@@ -98,6 +98,30 @@ A repeated run includes:
 CSV record: already valid
 ```
 
+## Production CSV generation
+
+The `production` command internally generates a P-256 key at fixed Object ID `0x20000100` with policy `0x04200000`, which allows KA/READ only. DELETE, WRITE, and GEN are not granted.
+
+```sh
+se050-kitting-export production \
+  -b 0 \
+  --append /tmp/se050-kitting.csv
+```
+
+This operation is irreversible. Perform the first device test on a non-shipping evaluation unit.
+
+Before creating an absent production key, the exporter completes these reversible checks:
+
+1. board serial and Applet version;
+2. device certificate read and chain validation against the embedded trust store;
+3. SE050 UID read;
+4. offline verification of every existing CSV record;
+5. when a CSV record already exists for the same serial/profile, confirmation that the target object also exists.
+
+The key is created only when the target object is absent. Existing objects are never deleted or overwritten; they are reused only after Attestation verifies type, origin, policy, and public key. Any mismatch stops the operation.
+
+If CSV writing fails after key creation, a later run reuses the existing key and can regenerate the Attestation-backed record.
+
 ## Existing generic development key
 
 Generic `se050ctl keygen` uses policy `0x043C0000`. A key created that way at `0x30000100` is rejected because kitting requires `0x04240000`.
@@ -120,7 +144,7 @@ serialno,format_version,profile,created_at,key_role,se050_uid,key_object_id,nonc
 |---|---|
 | `serialno` | board serial from Device Tree |
 | `format_version` | currently `1` |
-| `profile` | `test`, or future `production` |
+| `profile` | `test` or `production` |
 | `created_at` | UTC `YYYY-MM-DDTHH:MM:SSZ` |
 | `key_role` | currently `firmware-kex` |
 | `se050_uid` | SE050 UID |
@@ -165,7 +189,7 @@ In addition to offline checks, this compares:
 - persistent indicator;
 - live public key.
 
-The CLI default profile is `production`, so CSV files created by the current exporter require explicit `--profile test`.
+The CLI default profile is `production`. Use `--profile test` for test CSV records and either the default or `--profile production` for production records.
 
 ## Padded device certificate BinaryFiles
 
@@ -177,11 +201,10 @@ The implementation reads the complete size reported by ReadSize, extracts the le
 
 The current exporter writes the complete CSV to a temporary file in the same directory and then renames it over the destination. This prevents readers from seeing a partial CSV.
 
-Production hardening still needs:
+Additional CSV-writer hardening still needs:
 
 - locking against concurrent writers;
 - explicit `fsync()` of the temporary file and directory;
-- irreversible production-profile creation.
 
 ## Next layer
 
