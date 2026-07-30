@@ -154,6 +154,36 @@ proc parseHexByte(s: string): uint8 =
 
   result = uint8(v)
 
+proc parseHexBytes(s: string): seq[uint8] =
+  ## Parses compact or separator-delimited hexadecimal bytes.
+  var source = s.strip()
+  if source.startsWith("0x") or source.startsWith("0X"):
+    source = source[2 .. ^1]
+
+  var compact = ""
+  for ch in source:
+    if ch in {' ', ':', '-', '_'}:
+      continue
+
+    let isHex =
+      (ch >= '0' and ch <= '9') or
+      (ch >= 'a' and ch <= 'f') or
+      (ch >= 'A' and ch <= 'F')
+    if not isHex:
+      raise newException(ValueError, &"invalid hexadecimal character: {ch}")
+
+    compact.add(ch)
+
+  if compact.len == 0:
+    raise newException(ValueError, "hex byte string is empty")
+
+  if (compact.len mod 2) != 0:
+    raise newException(ValueError, "hex byte string must contain an even number of digits")
+
+  result = newSeq[uint8](compact.len div 2)
+  for i in 0 ..< result.len:
+    result[i] = uint8(parseHexInt(compact[i * 2 .. i * 2 + 1]))
+
 proc printSe050Error(prefix: string, e: Se050Error) =
   stderr.writeLine &"{prefix}: {e.kind}: {e.message}"
   if e.sw != 0:
@@ -404,6 +434,38 @@ proc rawStringToBytes(data: string): seq[uint8] =
   result = newSeq[uint8](data.len)
   for i, ch in data:
     result[i] = uint8(ord(ch))
+
+proc writeRawBytes(path: string, data: openArray[uint8], context: string): bool =
+  try:
+    writeFile(path, bytesToRawString(data))
+    result = true
+  except CatchableError as e:
+    stderr.writeLine &"{context}: cannot write {path}: {e.msg}"
+    result = false
+
+proc readDerCertificateBundleFile(
+    path: string,
+    label: string
+): SE[seq[seq[uint8]]] =
+  ## Reads one or more concatenated DER X.509 certificates from a file.
+  var raw: seq[uint8]
+  try:
+    raw = rawStringToBytes(readFile(path))
+  except CatchableError as e:
+    return fail[seq[seq[uint8]]](
+      seInvalidArgument,
+      &"cannot read {label} file {path}: {e.msg}"
+    )
+
+  let parsed = parseDerCertificateBundle(raw)
+  if not parsed.ok:
+    return fail[seq[seq[uint8]]](
+      parsed.error.kind,
+      &"invalid {label} file {path}: {parsed.error.message}",
+      parsed.error.sw
+    )
+
+  result = parsed
 
 proc typeText(objectType: uint8): string =
   result = &"0x{objectType.toHex(2)} ({objectTypeName(objectType)})"
@@ -720,6 +782,373 @@ proc runPubkey(
 
   result = 0
 
+proc runAttestationCert(
+    busText: string,
+    addressText: string,
+    debug: bool,
+    outputPath: string
+): int =
+  let se = openAndRequestAtr(busText, addressText, debug)
+
+  let certificate = se.readAttestationCertificate(selectFirst = true)
+  if not certificate.ok:
+    printSe050Error("Read attestation certificate failed", certificate.error)
+    return 1
+
+  try:
+    writeFile(outputPath, bytesToRawString(certificate.value))
+  except CatchableError as e:
+    stderr.writeLine &"attestation-cert failed: cannot write {outputPath}: {e.msg}"
+    return 1
+
+  echo &"{objectIdHex(Se050AttestationCertificateObjectId)}: attestation certificate written to {outputPath}"
+  echo &"length: {certificate.value.len}"
+  result = 0
+
+
+proc runAttestRead(
+    busText: string,
+    addressText: string,
+    debug: bool,
+    idText: string,
+    areaText: string,
+    indexText: string,
+    nameText: string,
+    freshnessText: string,
+    outputPrefix: string
+): int =
+  let objectRef = resolveObjectRef(idText, areaText, indexText, nameText)
+  let freshness = parseHexBytes(freshnessText)
+  if freshness.len != KittingFreshnessLength:
+    stderr.writeLine &"attest-read requires exactly {KittingFreshnessLength} freshness bytes; got {freshness.len}"
+    return 2
+
+  let prefix = outputPrefix.strip()
+  if prefix.len == 0:
+    stderr.writeLine "attest-read requires a non-empty output prefix"
+    return 2
+
+  let se = openAndRequestAtr(busText, addressText, debug)
+
+  let exists = se.objectExists(objectId = objectRef.objectId, selectFirst = true)
+  if not exists.ok:
+    printSe050Error("CheckObjectExists failed", exists.error)
+    return 1
+
+  if not exists.value:
+    stderr.writeLine &"attest-read failed: {objectIdHex(objectRef.objectId)} does not exist"
+    return 1
+
+  let typ = se.readObjectType(objectId = objectRef.objectId, selectFirst = false)
+  if not typ.ok:
+    printSe050Error("ReadType failed", typ.error)
+    return 1
+
+  if not typ.value.objectType.isReadableEcPublicObjectType():
+    stderr.writeLine &"attest-read refused: {objectIdHex(objectRef.objectId)} is {typeText(typ.value.objectType)}, not an EC key pair/public key"
+    return 2
+
+  let attested = se.readObjectWithAttestation(
+    objectId = objectRef.objectId,
+    freshness = freshness,
+    selectFirst = false
+  )
+  if not attested.ok:
+    printSe050Error("ReadObject with Attestation failed", attested.error)
+    return 1
+
+  let commandPath = &"{prefix}.command.bin"
+  let transmitPath = &"{prefix}.transmit-apdu.bin"
+  let responsePath = &"{prefix}.response.bin"
+  let signaturePath = &"{prefix}.signature.bin"
+  let objectPath = &"{prefix}.object.bin"
+
+  if not writeRawBytes(commandPath, attested.value.request.signedCommandApdu, "attest-read failed"):
+    return 1
+  if not writeRawBytes(transmitPath, attested.value.request.transmitApdu, "attest-read failed"):
+    return 1
+  if not writeRawBytes(responsePath, attested.value.response.rawResponseData, "attest-read failed"):
+    return 1
+  if not writeRawBytes(signaturePath, attested.value.response.signature, "attest-read failed"):
+    return 1
+
+  if attested.value.response.objectDataPresent:
+    if not writeRawBytes(objectPath, attested.value.response.objectData, "attest-read failed"):
+      return 1
+
+  echo &"id: {objectIdHex(objectRef.objectId)}"
+  printResolvedObjectRef(objectRef)
+  echo &"type: {typeText(typ.value.objectType)}"
+  echo &"freshness: {bytesToHex(freshness)}"
+  echo &"chip uid: {bytesToHex(attested.value.response.chipId)}"
+  echo &"object data present: {attested.value.response.objectDataPresent}"
+  echo &"object data length: {attested.value.response.objectData.len}"
+  echo &"attributes length: {attested.value.response.attributes.len}"
+  echo &"object info: {bytesToHex(attested.value.response.objectInfo)}"
+  echo &"timestamp: {bytesToHex(attested.value.response.timestamp)}"
+  echo &"signature length: {attested.value.response.signature.len}"
+  echo &"signed command: {commandPath}"
+  echo &"transmitted APDU: {transmitPath}"
+  echo &"raw response data: {responsePath}"
+  echo &"signature: {signaturePath}"
+  if attested.value.response.objectDataPresent:
+    echo &"object data: {objectPath}"
+  echo "verification: not performed by this diagnostic command"
+
+  result = 0
+
+proc runAttestVerify(
+    busText: string,
+    addressText: string,
+    debug: bool,
+    idText: string,
+    areaText: string,
+    indexText: string,
+    nameText: string,
+    freshnessText: string,
+    trustAnchorsPath: string,
+    intermediatesPath: string
+): int =
+  ## Verifies the live ReadObject-with-Attestation signature, validates the
+  ## provisioned device certificate to explicit trust anchors, and confirms
+  ## that the certificate public key matches the attestation key object.
+  let objectRef = resolveObjectRef(idText, areaText, indexText, nameText)
+  let profileMatch = kittingProfileForObjectId(objectRef.objectId)
+  if profileMatch.isNone:
+    stderr.writeLine &"attest-verify refused: {objectIdHex(objectRef.objectId)} is not a configured kitting key object"
+    return 2
+  let profile = profileMatch.get()
+
+  let freshness = parseHexBytes(freshnessText)
+  if freshness.len != KittingFreshnessLength:
+    stderr.writeLine &"attest-verify requires exactly {KittingFreshnessLength} freshness bytes; got {freshness.len}"
+    return 2
+
+  let trustAnchors = readDerCertificateBundleFile(
+    trustAnchorsPath,
+    "trust-anchor bundle"
+  )
+  if not trustAnchors.ok:
+    printSe050Error("Load trust anchors failed", trustAnchors.error)
+    return 2
+
+  var intermediates: seq[seq[uint8]] = @[]
+  if intermediatesPath.strip().len > 0:
+    let loadedIntermediates = readDerCertificateBundleFile(
+      intermediatesPath,
+      "intermediate-certificate bundle"
+    )
+    if not loadedIntermediates.ok:
+      printSe050Error("Load intermediate certificates failed", loadedIntermediates.error)
+      return 2
+    intermediates = loadedIntermediates.value
+
+  let se = openAndRequestAtr(busText, addressText, debug)
+
+  let exists = se.objectExists(objectId = objectRef.objectId, selectFirst = true)
+  if not exists.ok:
+    printSe050Error("CheckObjectExists failed", exists.error)
+    return 1
+
+  if not exists.value:
+    stderr.writeLine &"attest-verify failed: {objectIdHex(objectRef.objectId)} does not exist"
+    return 1
+
+  let typ = se.readObjectType(objectId = objectRef.objectId, selectFirst = false)
+  if not typ.ok:
+    printSe050Error("ReadType failed", typ.error)
+    return 1
+
+  if not typ.value.objectType.isReadableEcPublicObjectType():
+    stderr.writeLine &"attest-verify refused: {objectIdHex(objectRef.objectId)} is {typeText(typ.value.objectType)}, not an EC key pair/public key"
+    return 2
+
+  let certificate = se.readAttestationCertificate(selectFirst = false)
+  if not certificate.ok:
+    printSe050Error("Read attestation certificate failed", certificate.error)
+    return 1
+
+  let chain = verifyCertificateChain(
+    certificate.value,
+    trustAnchors.value,
+    intermediates
+  )
+  if not chain.ok:
+    printSe050Error("Attestation certificate chain verification failed", chain.error)
+    return 1
+
+  let certificatePublicKey = extractCertificateEcPublicKey(certificate.value)
+  if not certificatePublicKey.ok:
+    printSe050Error("Attestation certificate public-key extraction failed", certificatePublicKey.error)
+    return 1
+
+  let provisionedPublicKey = se.readPublicKey(
+    objectId = Se050AttestationKeyObjectId,
+    selectFirst = false
+  )
+  if not provisionedPublicKey.ok:
+    printSe050Error("Read attestation key public part failed", provisionedPublicKey.error)
+    return 1
+
+  if certificatePublicKey.value != provisionedPublicKey.value:
+    stderr.writeLine(
+      "attest-verify failed: certificate public key does not match " &
+      objectIdHex(Se050AttestationKeyObjectId)
+    )
+    return 1
+
+  let attested = se.readObjectWithAttestation(
+    objectId = objectRef.objectId,
+    freshness = freshness,
+    selectFirst = false
+  )
+  if not attested.ok:
+    printSe050Error("ReadObject with Attestation failed", attested.error)
+    return 1
+
+  let verified = verifyAttestationSignature(attested.value, certificate.value)
+  if not verified.ok:
+    printSe050Error("Attestation signature verification failed", verified.error)
+    return 1
+
+  let semantics = verifyKittingAttestationSemantics(attested.value, profile)
+  if not semantics.ok:
+    printSe050Error("Kitting attestation semantic validation failed", semantics.error)
+    return 1
+
+  let signedPolicy = semantics.value.attributes.policies[0]
+
+  echo &"id: {objectIdHex(objectRef.objectId)}"
+  printResolvedObjectRef(objectRef)
+  echo &"type: {typeText(typ.value.objectType)}"
+  echo &"freshness: {bytesToHex(freshness)}"
+  echo &"chip uid: {bytesToHex(attested.value.response.chipId)}"
+  echo &"certificate sha256: {bytesToHex(verified.value.certificateSha256)}"
+  echo &"certificate key matches {objectIdHex(Se050AttestationKeyObjectId)}: yes"
+  echo &"certificate trust anchors: {chain.value.trustAnchorCount}"
+  echo &"certificate intermediates: {chain.value.intermediateCount}"
+  echo "certificate trust chain: valid"
+  echo "attestation signature: valid"
+  echo &"kitting profile: {semantics.value.profile.name}"
+  echo &"attribute object id: {objectIdHex(semantics.value.attributes.objectId)}"
+  echo &"attribute object type: 0x{semantics.value.attributes.objectType.toHex(2)}"
+  echo &"attribute auth: {objectAuthenticationIndicatorName(semantics.value.attributes.authAttribute)}"
+  echo &"attribute owner auth object: {objectIdHex(semantics.value.attributes.ownerAuthObjectId)}"
+  echo &"attribute origin: {objectOriginName(semantics.value.attributes.origin)}"
+  echo &"attribute version: 0x{semantics.value.attributes.objectVersion.toHex(8)}"
+  echo &"policy count: {semantics.value.attributes.policies.len}"
+  echo &"policy auth object: {objectIdHex(signedPolicy.authObjectId)}"
+  echo &"policy header: 0x{signedPolicy.header.toHex(8)}"
+  echo &"object size: {semantics.value.objectSize}"
+  echo "kitting semantics: valid"
+
+  result = 0
+
+proc runKittingVerify(
+    busText: string,
+    addressText: string,
+    debug: bool,
+    inputPath: string,
+    profileText: string
+): int =
+  ## Selects this board's CSV row, performs every offline trust check, and then
+  ## confirms that the live SE050 UID, object type, persistence, and public key
+  ## still match the attested record.
+  let profileMatch = kittingProfileForName(profileText.strip().toLowerAscii())
+  if profileMatch.isNone:
+    stderr.writeLine &"kitting-verify refused: unknown profile {profileText}"
+    return 2
+  let profile = profileMatch.get()
+
+  let boardSerial = readBoardSerialNumber()
+  if not boardSerial.ok:
+    printSe050Error("Read board serial number failed", boardSerial.error)
+    return 2
+
+  var csvText: string
+  try:
+    csvText = readFile(inputPath)
+  except CatchableError as e:
+    stderr.writeLine &"kitting-verify failed: cannot read CSV file {inputPath}: {e.msg}"
+    return 2
+
+  let trustAnchors = nxpAttestationTrustAnchors()
+  let intermediates = nxpAttestationIntermediates()
+
+  let verified = verifyKittingCsvRecord(
+    csvText = csvText,
+    serialNumber = boardSerial.value,
+    profileKind = profile.kind,
+    trustAnchorsDer = trustAnchors,
+    intermediatesDer = intermediates
+  )
+  if not verified.ok:
+    printSe050Error("Kitting CSV verification failed", verified.error)
+    return 1
+
+  let se = openAndRequestAtr(busText, addressText, debug)
+
+  let liveUidRaw = se.readUidRaw(selectFirst = true)
+  if not liveUidRaw.ok:
+    printSe050Error("Read live SE050 UID failed", liveUidRaw.error)
+    return 6
+
+  var liveUid = newSeq[uint8](Se050UidLength)
+  for index, value in liveUidRaw.value:
+    liveUid[index] = value
+
+  let objectType = se.readObjectType(
+    objectId = verified.value.record.keyObjectId,
+    selectFirst = false
+  )
+  if not objectType.ok:
+    printSe050Error("Read live kitting key type failed", objectType.error)
+    return 6
+
+  let publicKey = se.readPublicKey(
+    objectId = verified.value.record.keyObjectId,
+    selectFirst = false
+  )
+  if not publicKey.ok:
+    printSe050Error("Read live kitting public key failed", publicKey.error)
+    return 6
+
+  let local = verifyLocalKittingIdentity(
+    verified = verified.value,
+    boardSerialNumber = boardSerial.value,
+    liveSe050Uid = liveUid,
+    liveObjectType = objectType.value.objectType,
+    liveTransientIndicator = objectType.value.transientIndicator,
+    livePublicKey = publicKey.value
+  )
+  if not local.ok:
+    printSe050Error("Local kitting identity verification failed", local.error)
+    return 5
+
+  let signedPolicy = local.value.verified.semantics.attributes.policies[0]
+
+  echo &"serialno: {local.value.boardSerialNumber}"
+  echo &"profile: {profile.name}"
+  echo &"created at: {local.value.verified.record.createdAt}"
+  echo &"key role: {local.value.verified.record.keyRole}"
+  echo &"key object id: {objectIdHex(local.value.verified.record.keyObjectId)}"
+  echo &"SE050 UID: {bytesToHex(local.value.liveSe050Uid)}"
+  echo &"certificate sha256: {bytesToHex(local.value.verified.signature.certificateSha256)}"
+  echo &"certificate trust anchors: {local.value.verified.certificateChain.trustAnchorCount}"
+  echo &"certificate intermediates: {local.value.verified.certificateChain.intermediateCount}"
+  echo "certificate trust chain: valid"
+  echo "attestation signature: valid"
+  echo &"attribute origin: {objectOriginName(local.value.verified.semantics.attributes.origin)}"
+  echo &"policy header: 0x{signedPolicy.header.toHex(8)}"
+  echo &"live object type: {typeText(local.value.liveObjectType)}"
+  echo "live object persistence: persistent"
+  echo "local board serial: match"
+  echo "local SE050 UID: match"
+  echo "local public key: match"
+  echo "kitting record: valid"
+
+  result = 0
+
 proc runDerive(
     busText: string,
     addressText: string,
@@ -957,6 +1386,86 @@ proc main(): int =
           opts.name,
           opts.out,
           separator
+        ))
+
+    command("attestation-cert"):
+      help("Read the NXP-provisioned SE050 device attestation certificate.")
+      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
+      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-o", "--out", required = true, help = "Write the DER certificate to this file")
+      flag("-d", "--debug", help = "Print T=1 over I2C frames")
+      run:
+        quit(runAttestationCert(
+          opts.bus,
+          opts.address,
+          opts.debug,
+          opts.out
+        ))
+
+    command("attest-read"):
+      help("Read an SE050 EC public key with NXP attestation and capture raw verification inputs.")
+      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
+      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("--id", default = some(""), help = "Secure Object ID in hex, e.g. 0x30000100")
+      option("--area", default = some(""), help = "Object area: dev, customer, vendor, nxp, internal")
+      option("--index", default = some(""), help = "Area-relative object index, decimal or 0x-prefixed hex")
+      option("--name", default = some(""), help = "Known object name. Must refer to an EC key object")
+      option("--freshness", required = true, help = "16-byte freshness as hexadecimal text")
+      option("-o", "--out-prefix", required = true, help = "Output path prefix for captured binary data")
+      flag("-d", "--debug", help = "Print T=1 over I2C frames")
+      run:
+        quit(runAttestRead(
+          opts.bus,
+          opts.address,
+          opts.debug,
+          opts.id,
+          opts.area,
+          opts.index,
+          opts.name,
+          opts.freshness,
+          opts.out_prefix
+        ))
+
+    command("attest-verify"):
+      help("Verify a configured kitting key, its NXP certificate chain, attestation signature, and signed object attributes.")
+      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
+      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("--id", default = some(""), help = "Secure Object ID in hex, e.g. 0x30000100")
+      option("--area", default = some(""), help = "Object area: dev, customer, vendor, nxp, internal")
+      option("--index", default = some(""), help = "Area-relative object index, decimal or 0x-prefixed hex")
+      option("--name", default = some(""), help = "Known object name. Must refer to an EC key object")
+      option("--freshness", required = true, help = "16-byte freshness as hexadecimal text")
+      option("--trust-anchors", required = true, help = "DER file containing one or more trusted CA certificates")
+      option("--intermediates", default = some(""), help = "Optional DER file containing concatenated intermediate certificates")
+      flag("-d", "--debug", help = "Print T=1 over I2C frames")
+      run:
+        quit(runAttestVerify(
+          opts.bus,
+          opts.address,
+          opts.debug,
+          opts.id,
+          opts.area,
+          opts.index,
+          opts.name,
+          opts.freshness,
+          opts.trust_anchors,
+          opts.intermediates
+        ))
+
+    command("kitting-verify"):
+      help("Verify this unit against an attested multi-device kitting CSV.")
+      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
+      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("--input", required = true, help = "Multi-device kitting CSV file")
+      option("--profile", default = some("production"), help = "Kitting profile: production or test, default: production")
+      flag("-d", "--debug", help = "Print T=1 over I2C frames")
+      run:
+        quit(runKittingVerify(
+          opts.bus,
+          opts.address,
+          opts.debug,
+          opts.input,
+          opts.profile
         ))
 
     command("derive"):

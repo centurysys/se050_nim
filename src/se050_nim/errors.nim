@@ -27,7 +27,13 @@ type
     seApduTooLarge,
     seApduStatusError,
     seInvalidResponse,
-    seUidNotFound
+    seUidNotFound,
+
+    # Host cryptographic verification errors
+    seCryptoError,
+    seSignatureInvalid,
+    seCertificateUntrusted,
+    seKittingValidationFailed
 
   Se050Error* = object
     kind*: Se050ErrorKind

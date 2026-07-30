@@ -6,8 +6,9 @@ description   = "Minimal Nim library and CLI for NXP SE050 using T=1 over I2C (n
 license       = "MIT"
 srcDir        = "src"
 binDir        = "bin"
-bin           = @["se050ctl"]
-installExt    = @["nim"]
+bin           = @["se050ctl", "se050_kitting_export"]
+namedBin["se050_kitting_export"] = "se050-kitting-export"
+installExt    = @["nim", "der"]
 
 
 # Dependencies
@@ -15,3 +16,5 @@ installExt    = @["nim"]
 requires "nim >= 2.2.10"
 requires "results >= 0.5.1"
 requires "argparse >= 4.0.2"
+
+

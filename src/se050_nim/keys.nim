@@ -12,6 +12,7 @@ import ./errors
 import ./transport
 import ./apdu
 import ./tlv
+import ./objects
 
 # =============================================================================
 # Constants
@@ -78,26 +79,6 @@ const
   # This is later wrapped as TLV[TAG_POLICY].
   ObjectPolicyEntryLen = 0x08'u8
   DefaultAuthObjectId = 0x00000000'u32
-
-  # SE05x ReadObject APDU.
-  #
-  # NXP AN12413 describes ReadObject as:
-  #   CLA = 0x80
-  #   INS = INS_READ   = 0x02
-  #   P1  = P1_DEFAULT = 0x00
-  #   P2  = P2_DEFAULT = 0x00
-  #
-  # Command data:
-  #   TAG_1: 4-byte Secure Object identifier
-  #
-  # Response data:
-  #   TAG_1: Data read from the Secure Object
-  #
-  # For an EC key pair or EC public key, ReadObject returns the public key.
-  ReadObjectCla = 0x80'u8
-  ReadObjectIns = 0x02'u8
-  ReadObjectP1 = 0x00'u8
-  ReadObjectP2 = 0x00'u8
 
   # SE05x ECDHGenerateSharedSecret APDU.
   #
@@ -237,6 +218,21 @@ proc deviceEcKeyPolicy*(): EcKeyPolicy =
       PolicyObjAllowRead
   )
 
+proc testDeviceKeyPolicy*(): EcKeyPolicy =
+  ## Returns a production-like EC key policy for disposable test objects.
+  ##
+  ## The key has the same key-agreement and public-key read permissions as a
+  ## production device key. DELETE is additionally allowed so development tests
+  ## can remove the object and repeat the complete provisioning flow. WRITE and
+  ## GEN stay disabled, preventing an existing test key from being overwritten
+  ## or regenerated in place.
+  result = EcKeyPolicy(
+    header:
+      PolicyObjAllowKa or
+      PolicyObjAllowRead or
+      PolicyObjAllowDelete
+  )
+
 proc oneTimeDeviceKeyPolicy*(): EcKeyPolicy =
   ## Returns a one-time-write style production EC key policy.
   ##
@@ -274,23 +270,6 @@ proc buildDevelopmentEcKeyPolicy(): seq[uint8] =
   ## Builds the current default development policy entry for existing callers.
   result = encodeEcKeyPolicy(developmentEcKeyPolicy())
 
-proc buildReadObjectApdu(objectId: uint32): seq[uint8] =
-  result = @[
-    ReadObjectCla,
-    ReadObjectIns,
-    ReadObjectP1,
-    ReadObjectP2,
-    0x06'u8,
-
-    # TAG_1: 4-byte Secure Object identifier
-    Tag1,
-    0x04'u8
-  ]
-  result.appendU32Be(objectId)
-
-  # Le
-  result.add(0x00'u8)
-
 proc parseTag1Value(response: openArray[uint8], commandName: string): SE[seq[uint8]] =
   let st = checkStatus(response, commandName)
   if not st.ok:
@@ -326,9 +305,6 @@ proc parseTag1Value(response: openArray[uint8], commandName: string): SE[seq[uin
 
   let value = data.value[valueStart ..< valueEnd]
   result = ok(value)
-
-proc parseReadObjectValue(response: openArray[uint8]): SE[seq[uint8]] =
-  result = parseTag1Value(response, "ReadObject")
 
 proc buildGenerateEcKeyPairApdu(
     objectId: uint32,
@@ -524,29 +500,14 @@ proc readPublicKey*(
 ): SE[seq[uint8]] =
   ## Reads the public key material from an SE050 EC key pair or EC public key.
   ##
-  ## This is a raw ReadObject helper. The SE050 returns the public key for EC
-  ## key-pair and EC-public-key objects. The caller is responsible for checking
-  ## the Secure Object type before calling this helper if it needs stricter
-  ## semantics.
-  if selectFirst:
-    let selected = se.selectApplet()
-    if not selected.ok:
-      return fail[seq[uint8]](
-        selected.error.kind,
-        selected.error.message,
-        selected.error.sw
-      )
-
-  let response = se.transceiveApdu(buildReadObjectApdu(objectId))
-  if not response.ok:
-    return fail[seq[uint8]](
-      response.error.kind,
-      response.error.message,
-      response.error.sw
-    )
-
-  result = parseReadObjectValue(response.value)
-
+  ## This compatibility helper delegates to readSecureObject(). The SE050
+  ## returns the public key for EC key-pair and EC-public-key objects. The caller
+  ## remains responsible for checking the Secure Object type when stricter
+  ## semantics are required.
+  result = se.readSecureObject(
+    objectId = objectId,
+    selectFirst = selectFirst
+  )
 
 proc deriveSharedSecret*(
     se: Se050Transport,

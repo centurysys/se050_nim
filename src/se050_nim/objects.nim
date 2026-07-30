@@ -22,6 +22,7 @@ import ./tlv
 const
   Tag1 = 0x41'u8
   Tag2 = 0x42'u8
+  Tag3 = 0x43'u8
 
   ResultSuccess = 0x01'u8
   ResultFailure = 0x02'u8
@@ -35,6 +36,7 @@ const
   MorePresent = 0x02'u8
 
   SecureObjectTypeAll* = 0xFF'u8
+  Se050TypeBinaryFile* = 0x0B'u8
 
   # SE05x CheckObjectExists APDU.
   #
@@ -111,6 +113,29 @@ const
   ReadSizeIns = 0x02'u8
   ReadSizeP1 = 0x00'u8
   ReadSizeP2 = 0x07'u8
+
+  # SE05x ReadObject APDU.
+  #
+  # NXP AN12413 describes ReadObject as:
+  #   CLA = 0x80
+  #   INS = INS_READ   = 0x02
+  #   P1  = P1_DEFAULT = 0x00
+  #   P2  = P2_DEFAULT = 0x00
+  #
+  # Command data:
+  #   TAG_1: 4-byte Secure Object identifier
+  #
+  # Response data:
+  #   TAG_1: Data read from the Secure Object
+  ReadObjectCla = 0x80'u8
+  ReadObjectIns = 0x02'u8
+  ReadObjectP1 = 0x00'u8
+  ReadObjectP2 = 0x00'u8
+
+  # Keep BinaryFile reads within one ordinary T=1 response I-block. The SE050
+  # supports larger objects, but requesting a whole provisioned certificate can
+  # exceed the applet's single ReadObject response conditions.
+  DefaultBinaryReadChunkSize* = 224
 
   # SE05x DeleteSecureObject APDU.
   #
@@ -260,6 +285,49 @@ proc buildReadSizeApdu(objectId: uint32): seq[uint8] =
     objectId = objectId
   )
 
+proc buildReadObjectApdu(objectId: uint32): seq[uint8] =
+  result = buildReadObjectPropertyApdu(
+    cla = ReadObjectCla,
+    ins = ReadObjectIns,
+    p1 = ReadObjectP1,
+    p2 = ReadObjectP2,
+    objectId = objectId
+  )
+
+proc buildReadObjectRangeApdu*(
+    objectId: uint32,
+    offset: uint16,
+    length: uint16
+): seq[uint8] =
+  ## Builds a BinaryFile ReadObject command with explicit offset and length.
+  ##
+  ## NXP requires TAG_2 and TAG_3 to be either both present or both absent.
+  result = @[
+    ReadObjectCla,
+    ReadObjectIns,
+    ReadObjectP1,
+    ReadObjectP2,
+    0x0E'u8,
+
+    # TAG_1: 4-byte Secure Object identifier
+    Tag1,
+    0x04'u8
+  ]
+  result.appendU32Be(objectId)
+
+  # TAG_2: 2-byte BinaryFile offset
+  result.add(Tag2)
+  result.add(0x02'u8)
+  result.appendU16Be(offset)
+
+  # TAG_3: 2-byte length to read
+  result.add(Tag3)
+  result.add(0x02'u8)
+  result.appendU16Be(length)
+
+  # Le
+  result.add(0x00'u8)
+
 proc buildDeleteObjectApdu(objectId: uint32): seq[uint8] =
   result = @[
     DeleteObjectCla,
@@ -275,6 +343,57 @@ proc buildDeleteObjectApdu(objectId: uint32): seq[uint8] =
   result.appendU32Be(objectId)
 
   # DeleteSecureObject has no Le field.
+
+proc parseReadSecureObjectResponse*(
+    response: openArray[uint8]
+): SE[seq[uint8]] =
+  ## Parses a ReadObject response and returns the TAG_1 value.
+  ##
+  ## This pure helper is exported so higher-level parsers and unit tests can
+  ## validate captured APDU responses without requiring a live SE050 transport.
+  let st = checkStatus(response, "ReadObject")
+  if not st.ok:
+    return fail[seq[uint8]](st.error.kind, st.error.message, st.error.sw)
+
+  let data = dataWithoutStatus(response)
+  if not data.ok:
+    return fail[seq[uint8]](data.error.kind, data.error.message, data.error.sw)
+
+  if data.value.len < 2:
+    return fail[seq[uint8]](
+      seInvalidResponse,
+      "ReadObject response does not contain TAG/LEN/VALUE"
+    )
+
+  if data.value[0] != Tag1:
+    return fail[seq[uint8]](
+      seInvalidResponse,
+      "ReadObject response does not start with TAG_1"
+    )
+
+  let tlvLen = readTlvLength(data.value, 1)
+  if not tlvLen.ok:
+    return fail[seq[uint8]](
+      tlvLen.error.kind,
+      tlvLen.error.message,
+      tlvLen.error.sw
+    )
+
+  let valueStart = tlvLen.value.nextIndex
+  let valueEnd = valueStart + tlvLen.value.length
+  if valueEnd > data.value.len:
+    return fail[seq[uint8]](
+      seInvalidResponse,
+      "ReadObject response value is shorter than expected"
+    )
+
+  if valueEnd != data.value.len:
+    return fail[seq[uint8]](
+      seInvalidResponse,
+      "ReadObject response contains trailing data after TAG_1"
+    )
+
+  result = ok(data.value[valueStart ..< valueEnd])
 
 proc parseExistsResponse(response: openArray[uint8]): SE[bool] =
   let st = checkStatus(response, "CheckObjectExists")
@@ -682,6 +801,142 @@ proc readObjectSize*(
     )
 
   result = parseReadSizeResponse(response.value)
+
+proc readSecureObject*(
+    se: Se050Transport,
+    objectId: uint32,
+    selectFirst: bool = true
+): SE[seq[uint8]] =
+  ## Reads the complete raw value of a small readable SE050 Secure Object.
+  ##
+  ## For EC key-pair and EC-public-key objects, the returned value is the public
+  ## key. BinaryFile callers that know the object size should prefer
+  ## readBinaryObject(), which uses explicit offset/length chunks.
+  if selectFirst:
+    let selected = se.selectApplet()
+    if not selected.ok:
+      return fail[seq[uint8]](
+        selected.error.kind,
+        selected.error.message,
+        selected.error.sw
+      )
+
+  let response = se.transceiveApdu(buildReadObjectApdu(objectId))
+  if not response.ok:
+    return fail[seq[uint8]](
+      response.error.kind,
+      response.error.message,
+      response.error.sw
+    )
+
+  result = parseReadSecureObjectResponse(response.value)
+
+proc readSecureObjectRange*(
+    se: Se050Transport,
+    objectId: uint32,
+    offset: uint16,
+    length: uint16,
+    selectFirst: bool = true
+): SE[seq[uint8]] =
+  ## Reads one explicit byte range from a BinaryFile Secure Object.
+  if length == 0'u16:
+    return fail[seq[uint8]](
+      seInvalidArgument,
+      "BinaryFile ReadObject length must be greater than zero"
+    )
+
+  if selectFirst:
+    let selected = se.selectApplet()
+    if not selected.ok:
+      return fail[seq[uint8]](
+        selected.error.kind,
+        selected.error.message,
+        selected.error.sw
+      )
+
+  let response = se.transceiveApdu(
+    buildReadObjectRangeApdu(objectId, offset, length)
+  )
+  if not response.ok:
+    return fail[seq[uint8]](
+      response.error.kind,
+      response.error.message,
+      response.error.sw
+    )
+
+  let parsed = parseReadSecureObjectResponse(response.value)
+  if not parsed.ok:
+    return fail[seq[uint8]](
+      parsed.error.kind,
+      parsed.error.message,
+      parsed.error.sw
+    )
+
+  if parsed.value.len != int(length):
+    return fail[seq[uint8]](
+      seInvalidResponse,
+      "BinaryFile ReadObject returned an unexpected chunk length"
+    )
+
+  result = parsed
+
+proc readBinaryObject*(
+    se: Se050Transport,
+    objectId: uint32,
+    objectSize: uint32,
+    chunkSize: int = DefaultBinaryReadChunkSize,
+    selectFirst: bool = true
+): SE[seq[uint8]] =
+  ## Reads a BinaryFile object in bounded offset/length chunks.
+  ##
+  ## BinaryFile offsets and lengths are 16-bit values in the SE050 APDU.
+  if objectSize > uint32(uint16.high):
+    return fail[seq[uint8]](
+      seInvalidArgument,
+      "BinaryFile size exceeds the ReadObject 16-bit offset range"
+    )
+
+  if chunkSize <= 0 or chunkSize > int(uint16.high):
+    return fail[seq[uint8]](
+      seInvalidArgument,
+      "BinaryFile chunk size is outside the uint16 range"
+    )
+
+  if selectFirst:
+    let selected = se.selectApplet()
+    if not selected.ok:
+      return fail[seq[uint8]](
+        selected.error.kind,
+        selected.error.message,
+        selected.error.sw
+      )
+
+  if objectSize == 0'u32:
+    return ok(newSeq[uint8]())
+
+  let totalSize = int(objectSize)
+  var data = newSeqOfCap[uint8](totalSize)
+  var offset = 0
+
+  while offset < totalSize:
+    let requested = min(chunkSize, totalSize - offset)
+    let chunk = se.readSecureObjectRange(
+      objectId = objectId,
+      offset = uint16(offset),
+      length = uint16(requested),
+      selectFirst = false
+    )
+    if not chunk.ok:
+      return fail[seq[uint8]](
+        chunk.error.kind,
+        chunk.error.message,
+        chunk.error.sw
+      )
+
+    data.add(chunk.value)
+    offset += requested
+
+  result = ok(data)
 
 proc deleteSecureObject*(
     se: Se050Transport,
