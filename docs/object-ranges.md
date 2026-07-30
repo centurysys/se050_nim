@@ -22,9 +22,26 @@ This document defines the Object IDs, access policies, and responsibility bounda
 | NXP attestation key | `0xF0000012` | P-256 key pair / NXP | pre-provisioned, used for signatures |
 | NXP device certificate | `0xF0000013` | BinaryFile / NXP | pre-provisioned, used for X.509 validation |
 | test firmware KEX | `0x30000100` | P-256 key pair / dev | exporter implemented and tested |
-| production firmware KEX | `0x20000100` | P-256 key pair / customer | profile/API defined; creation CLI not implemented |
+| production firmware KEX | `0x20000100` | P-256 key pair / customer | profile/API and generic mutation guard implemented; creation CLI not implemented |
 
 Test and production use the same lower index `0x0100`, while the high byte makes the profile visible.
+
+## Production firmware KEX ID reservation guard
+
+`0x20000100` is explicitly reserved at the application layer for the production firmware KEX key.
+
+Before its general range checks, `se050ctl` calls a shared guard that rejects generic mutation operations against this ID:
+
+- create;
+- key generation;
+- write / overwrite;
+- delete.
+
+The currently implemented mutating `se050ctl` commands, `keygen` and `delete`, use this guard. Future write/import commands must use the same guard.
+
+Read and verification operations such as `info`, `exists`, `pubkey`, and Attestation remain allowed. The production exporter will use a dedicated raw-library path only after fixing and validating the Object ID and policy.
+
+This guard prevents accidents; it is not the security boundary. It does not block custom APDUs or other middleware. The final delete and overwrite protection comes from the one-time policy stored with the Secure Object inside the SE050.
 
 ## Object references
 

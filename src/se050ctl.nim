@@ -353,6 +353,10 @@ proc deleteTargetError(objectId: uint32): Option[string] =
   if objectId == 0'u32:
     return some("object id 0x00000000 is not a valid delete target")
 
+  let productionGuard = productionKittingMutationError(objectId, komDelete)
+  if productionGuard.isSome:
+    return productionGuard
+
   if not objectId.isDevelopmentObjectId():
     return some(
       &"delete refused: {objectIdHex(objectId)} is outside the se050ctl development range " &
@@ -364,6 +368,10 @@ proc deleteTargetError(objectId: uint32): Option[string] =
 proc keygenTargetError(objectId: uint32): Option[string] =
   if objectId == 0'u32:
     return some("object id 0x00000000 is not a valid key generation target")
+
+  let productionGuard = productionKittingMutationError(objectId, komGenerate)
+  if productionGuard.isSome:
+    return productionGuard
 
   if objectId.isProtectedReservedObjectId():
     return some(

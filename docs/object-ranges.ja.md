@@ -22,9 +22,26 @@
 | NXP Attestation key | `0xF0000012` | P-256 key pair / NXP | 事前搭載、署名検証に使用 |
 | NXP device certificate | `0xF0000013` | BinaryFile / NXP | 事前搭載、X.509検証に使用 |
 | test firmware KEX | `0x30000100` | P-256 key pair / dev | Exporter実装・実機確認済み |
-| production firmware KEX | `0x20000100` | P-256 key pair / customer | Profile/API定義済み、生成CLI未実装 |
+| production firmware KEX | `0x20000100` | P-256 key pair / customer | Profile/API・汎用変更ガード実装済み、生成CLI未実装 |
 
 Testとproductionで下位16-bitのindexを`0x0100`に揃え、上位byteでprofileを見分けます。
+
+## Production firmware KEX IDの予約ガード
+
+`0x20000100`はproduction firmware KEX専用IDとして、アプリケーション側でも明示的に予約します。
+
+`se050ctl`は一般的なrange判定より先に共通ガードを呼び出し、次の汎用変更操作を拒否します。
+
+- create
+- key generation
+- write / overwrite
+- delete
+
+現在`se050ctl`に実装されている変更系コマンドでは、`keygen`と`delete`がこのガードを使用します。将来write/import系コマンドを追加する場合も同じガードを通します。
+
+`info`、`exists`、`pubkey`、Attestationなどの読取り・検証操作は許可します。production Exporterは固定Object ID・固定Policyを検証したうえで、ライブラリのraw primitiveから専用経路で生成します。
+
+このガードは誤操作防止であり、セキュリティ境界ではありません。独自APDUや別middlewareからの操作を防ぐものではなく、最終的な削除・上書き防止はSE050内に保存されるone-time Policyが担います。
 
 ## Object参照形式
 
