@@ -1,43 +1,32 @@
 # SE050 Object Ranges and Tool Policy
 
-This document records the object ID namespace policy used by `se050ctl` and the intended split between the diagnostic CLI and future production provisioning tools.
+This document defines the Object IDs, access policies, and responsibility boundaries used by `se050ctl` and the kitting exporter.
 
 ## Object ID ranges
 
-`se050ctl` classifies Secure Object IDs into the following ranges:
+| Area | Range | `se050ctl` create/delete | Intended use |
+|---|---|---:|---|
+| `vendor` | `0x10000000..0x10000FFF` | no | controlled vendor provisioning |
+| `customer` | `0x20000000..0x2000FFFF` | no | production product objects |
+| `dev` | `0x30000000..0x3000FFFF` | yes | development, diagnostics, deletable tests |
+| `nxp` | `0x7FFF0000..0x7FFFFFFF` | no | NXP/pre-provisioned objects |
+| `internal` | `0xF0000000..0xFFFFFFFF` | no | NXP internal/platform objects |
 
-| Area | Range | `se050ctl` creation | `se050ctl` deletion | Intended owner |
-| --- | --- | ---: | ---: | --- |
-| `vendor` | `0x10000000..0x10000FFF` | no | no | future vendor/provisioning tool |
-| `customer` | `0x20000000..0x2000FFFF` | no | no | future product provisioning tool |
-| `dev` | `0x30000000..0x3000FFFF` | yes | yes | development and diagnostics |
-| `nxp` | `0x7FFF0000..0x7FFFFFFF` | no | no | NXP/pre-provisioned objects |
-| `internal` | `0xF0000000..0xFFFFFFFF` | no | no | internal/platform objects |
+`se050ctl keygen` and `delete` are limited to the development range. Raw library APIs do not enforce that limit because higher-level provisioning tools must be able to address customer/vendor ranges intentionally.
 
-Known object:
+## Objects currently used
 
-| Name | Object ID | Notes |
-| --- | ---: | --- |
-| `uid` | `0x7FFF0206` | SE050 unique ID object |
+| Name / purpose | Object ID | Type/owner | Status |
+|---|---:|---|---|
+| `uid` | `0x7FFF0206` | NXP unique ID | read path verified |
+| NXP attestation key | `0xF0000012` | P-256 key pair / NXP | pre-provisioned, used for signatures |
+| NXP device certificate | `0xF0000013` | BinaryFile / NXP | pre-provisioned, used for X.509 validation |
+| test firmware KEX | `0x30000100` | P-256 key pair / dev | exporter implemented and tested |
+| production firmware KEX | `0x20000100` | P-256 key pair / customer | profile/API defined; creation CLI not implemented |
 
-## Why `se050ctl` only writes `dev`
+Test and production use the same lower index `0x0100`, while the high byte makes the profile visible.
 
-`se050ctl` is a development and diagnostic CLI. It is allowed to create and delete only development objects. This keeps experiments safe and prevents accidental destruction of production keys.
-
-Production provisioning needs different behavior:
-
-- write outside the development range
-- apply final production policy
-- allow one-time provisioning semantics
-- disallow deletion where appropriate
-- emit factory registration records
-- handle re-run and partial-failure recovery
-
-Those responsibilities belong in a separate tool such as `se050-provision` or `se050-kitting`.
-
-## Object reference syntax
-
-`se050ctl` accepts exactly one object reference form:
+## Object references
 
 ```sh
 --id 0x30000100
@@ -45,64 +34,60 @@ Those responsibilities belong in a separate tool such as `se050-provision` or `s
 --name uid
 ```
 
-`--area` and `--index` are resolved by adding the area base to the relative index.
-
-Examples:
-
 | Reference | Object ID |
-| --- | ---: |
+|---|---:|
 | `--area dev --index 0x100` | `0x30000100` |
 | `--area customer --index 0x100` | `0x20000100` |
 | `--name uid` | `0x7FFF0206` |
 
-## Development key policy
+## EC key policies
 
-Development EC key pairs created by `se050ctl keygen` use a deliberately permissive development policy.
+| API / purpose | Header | KA | READ | WRITE | GEN | DELETE |
+|---|---:|:---:|:---:|:---:|:---:|:---:|
+| `developmentEcKeyPolicy()` | `0x043C0000` | yes | yes | yes | yes | yes |
+| `testDeviceKeyPolicy()` | `0x04240000` | yes | yes | no | no | yes |
+| `deviceEcKeyPolicy()` | `0x04200000` | yes | yes | no | no | no |
+| `oneTimeDeviceKeyPolicy()` | `0x04200000` | yes | yes | no | no | no |
 
-The current policy allows:
+`oneTimeDeviceKeyPolicy()` currently has the same effective header as `deviceEcKeyPolicy()`. The distinct API name records irreversible provisioning intent and leaves room for future Applet-specific attributes.
 
-- key agreement
-- public key read
-- write/generate during development iteration
-- delete
+## Test kitting safety
 
-This policy is useful for diagnostics, but it is not a production policy.
+`se050-kitting-export test` targets only `0x30000100` and fixes the policy at `0x04240000`.
 
-## Library freedom and CLI safety
+An existing object is never overwritten. The exporter verifies its ID, type, origin, size, policy, and public key through Attestation. A correct test key is reused. A generic development-policy key (`0x043C0000`) is rejected and never deleted automatically.
 
-`se050_nim` is a library, not a safety wrapper for every product workflow. Its raw primitives accept caller-provided object IDs, including `customer` and `vendor` ranges, because higher-level kitting/provisioning tools must be able to write production objects intentionally.
+## Production kitting
 
-`se050ctl` is different. It is a diagnostic CLI that may be shipped with products, so its write/delete commands remain restricted to the development range. Do not add production policy shortcuts to `se050ctl` simply because the library can perform the raw operation.
+The production profile is defined as:
 
-## Production policy belongs in provisioning tools
+```text
+Object ID: 0x20000100
+Curve: P-256
+Policy: 0x04200000
+```
 
-A future provisioning tool should make production policy explicit and reviewable. Examples:
+The current exporter implements only the `test` subcommand. Before production creation is added, a non-shipping evaluation device should verify:
 
-- P-256 device key in `customer` area
-- allow key agreement
-- allow public-key export during provisioning if needed
-- disallow delete after provisioning
-- avoid write/overwrite after finalization
-- optionally use authenticated sessions or platform policy when available
+- successful first creation;
+- matching attested policy, origin, and type;
+- reuse after a power cycle;
+- rejection of overwrite, regenerate, and delete;
+- recovery by re-running after a CSV write failure.
 
-The library provides `EcKeyPolicy` builders for this purpose:
+No irreversible create/delete shortcut belongs in the diagnostic CLI.
 
-- `developmentEcKeyPolicy()` for scratch/dev keys
-- `deviceEcKeyPolicy()` for provisioned device keys
-- `oneTimeDeviceKeyPolicy()` to express final one-time device-key creation intent
-- `customEcKeyPolicy(header)` for advanced callers that need raw policy headers
+## NXP reserved object protection
 
-The provisioning tool, not `se050ctl`, should decide which object range and policy are valid for each production operation.
+NXP objects in `0x7FFF...` and `0xF000...` are outside `se050ctl` write/delete commands. Attestation key `0xF0000012` and certificate `0xF0000013` are read and verified only.
 
-## Suggested future production layout
+## Future layout
 
-One possible production layout:
+| Purpose | Area | Example Object ID |
+|---|---|---:|
+| production firmware KEX private key | `customer` | `0x20000100` |
+| product metadata/version | `customer` | `0x20000010` |
+| vendor-managed objects | `vendor` | `0x10000000..` |
+| disposable diagnostic objects | `dev` | `0x30000000..` |
 
-| Purpose | Area | Example ID | Notes |
-| --- | --- | ---: | --- |
-| device P-256 ECDH private key | `customer` | `0x20000100` | used to open firmware envelope keys |
-| device metadata/version object | `customer` | `0x20000010` | optional; only if needed by product flow |
-| factory/vendor reserved objects | `vendor` | `0x10000000..` | reserved for controlled provisioning |
-| diagnostic scratch objects | `dev` | `0x30000000..` | safe to delete/recreate |
-
-The exact production map should be fixed before kitting begins and versioned in the provisioning project.
+Freeze and version the production map before irreversible factory kitting begins.

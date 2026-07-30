@@ -6,9 +6,10 @@
 # verification path. Keeping these values in one module prevents the test and
 # production tools from silently drifting to different object IDs or policies.
 #
-# This module defines the firmware key-agreement profile only. Attestation APDU,
-# certificate parsing, CSV records, and envelope handling are implemented by
-# higher layers added in later development steps.
+# This module defines only the fixed firmware key-agreement profile values.
+# Attestation, certificate validation, kitting records, CSV handling, and local
+# verification are implemented by sibling modules. Firmware envelope handling
+# remains a higher-layer responsibility.
 
 import std/options
 

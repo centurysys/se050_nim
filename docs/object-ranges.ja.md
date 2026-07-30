@@ -1,43 +1,32 @@
-# SE050 Object Range とツール方針
+# SE050 Object Rangeとツール方針
 
-この文書は、`se050ctl` が使う object ID namespace 方針と、診断CLIとproduction provisioning toolの責務分担をまとめたものです。
+この文書は、`se050ctl`とキッティングExporterが使用するObject ID、Policy、責務境界をまとめます。
 
 ## Object ID range
 
-`se050ctl` は Secure Object ID を以下の範囲に分類します。
+| Area | Range | `se050ctl` create/delete | 想定用途 |
+|---|---|---:|---|
+| `vendor` | `0x10000000..0x10000FFF` | 不可 | 管理されたvendor provisioning |
+| `customer` | `0x20000000..0x2000FFFF` | 不可 | production製品object |
+| `dev` | `0x30000000..0x3000FFFF` | 可 | 開発・診断・削除可能test |
+| `nxp` | `0x7FFF0000..0x7FFFFFFF` | 不可 | NXP/pre-provisioned |
+| `internal` | `0xF0000000..0xFFFFFFFF` | 不可 | NXP internal/platform object |
 
-| Area | Range | `se050ctl` 作成 | `se050ctl` 削除 | 想定所有者 |
-| --- | --- | ---: | ---: | --- |
-| `vendor` | `0x10000000..0x10000FFF` | 不可 | 不可 | 将来のvendor/provisioning tool |
-| `customer` | `0x20000000..0x2000FFFF` | 不可 | 不可 | 将来の製品provisioning tool |
-| `dev` | `0x30000000..0x3000FFFF` | 可 | 可 | 開発・診断用 |
-| `nxp` | `0x7FFF0000..0x7FFFFFFF` | 不可 | 不可 | NXP/pre-provisioned object |
-| `internal` | `0xF0000000..0xFFFFFFFF` | 不可 | 不可 | internal/platform object |
+`se050ctl keygen`と`delete`はdev rangeだけを許可します。ライブラリのraw APIは上位provisioning toolからcustomer/vendor rangeを扱えるよう、同じ制限を内部では強制しません。
 
-既知object:
+## 現在使用するObject
 
-| Name | Object ID | 備考 |
-| --- | ---: | --- |
-| `uid` | `0x7FFF0206` | SE050 unique ID object |
+| Name / purpose | Object ID | Type/owner | 状態 |
+|---|---:|---|---|
+| `uid` | `0x7FFF0206` | NXP unique ID | 読出し確認済み |
+| NXP Attestation key | `0xF0000012` | P-256 key pair / NXP | 事前搭載、署名検証に使用 |
+| NXP device certificate | `0xF0000013` | BinaryFile / NXP | 事前搭載、X.509検証に使用 |
+| test firmware KEX | `0x30000100` | P-256 key pair / dev | Exporter実装・実機確認済み |
+| production firmware KEX | `0x20000100` | P-256 key pair / customer | Profile/API定義済み、生成CLI未実装 |
 
-## なぜ `se050ctl` は `dev` だけを書き込むのか
-
-`se050ctl` は開発・診断CLIです。そのため、作成・削除できるのは development object だけに制限します。これにより、実験中にproduction鍵を誤って破壊するリスクを減らします。
-
-Production provisioning では、まったく別の性質が必要です。
-
-- development range 以外への書き込み
-- 最終production policyの適用
-- one-time provisioning 的な扱い
-- 必要に応じた削除不可設定
-- 工場登録用recordの出力
-- 再実行や途中失敗からの復旧
-
-これらは、`se050-provision` や `se050-kitting` のような別ツールの責務です。
+Testとproductionで下位16-bitのindexを`0x0100`に揃え、上位byteでprofileを見分けます。
 
 ## Object参照形式
-
-`se050ctl` は以下のいずれか1つで object を参照します。
 
 ```sh
 --id 0x30000100
@@ -45,64 +34,62 @@ Production provisioning では、まったく別の性質が必要です。
 --name uid
 ```
 
-`--area` と `--index` は、area base に相対indexを足して解決します。
-
 例:
 
 | Reference | Object ID |
-| --- | ---: |
+|---|---:|
 | `--area dev --index 0x100` | `0x30000100` |
 | `--area customer --index 0x100` | `0x20000100` |
 | `--name uid` | `0x7FFF0206` |
 
-## 開発用key policy
+## EC key Policy
 
-`se050ctl keygen` で作る開発用EC key pair は、意図的に扱いやすい開発用policyを使います。
+| API /用途 | Header | KA | READ | WRITE | GEN | DELETE |
+|---|---:|:---:|:---:|:---:|:---:|:---:|
+| `developmentEcKeyPolicy()` | `0x043C0000` | yes | yes | yes | yes | yes |
+| `testDeviceKeyPolicy()` | `0x04240000` | yes | yes | no | no | yes |
+| `deviceEcKeyPolicy()` | `0x04200000` | yes | yes | no | no | no |
+| `oneTimeDeviceKeyPolicy()` | `0x04200000` | yes | yes | no | no | no |
 
-現在のpolicyで許可するもの:
+`oneTimeDeviceKeyPolicy()`は現在`deviceEcKeyPolicy()`と同じ実効headerです。API名を分けることで、provisioning codeが不可逆な意図を明示し、将来Applet固有の属性を追加できるようにしています。
 
-- key agreement
-- public key read
-- 開発中の write/generate
-- delete
+## Test kittingの安全性
 
-これは診断には便利ですが、production policyではありません。
+`se050-kitting-export test`は`0x30000100`だけを対象にし、Policyを`0x04240000`へ固定します。
 
-## ライブラリの自由度とCLIの安全性
+既存Objectがある場合は上書きしません。AttestationでObject ID、type、origin、size、Policy、公開鍵を検証し、正しいtest鍵なら再利用します。汎用development Policy `0x043C0000`の鍵が残っている場合は停止し、自動削除しません。
 
-`se050_nim` はライブラリであり、すべての製品フローを安全側に包むラッパーではありません。raw primitive は、呼び出し側が指定した object ID をそのまま受け取ります。`customer` / `vendor` range も扱える必要があります。上位の kitting/provisioning tool が、production object を意図的に書き込むためです。
+## Production kitting
 
-一方で `se050ctl` は別です。`se050ctl` は製品に同梱される可能性がある診断CLIなので、write/delete系コマンドは development range に制限したままにします。ライブラリがraw操作を実行できるからといって、`se050ctl` にproduction policy用の近道を追加しないほうが安全です。
+Production profileは次の値を定義済みです。
 
-## Production policy は provisioning tool で扱う
+```text
+Object ID: 0x20000100
+Curve: P-256
+Policy: 0x04200000
+```
 
-将来のprovisioning toolでは、production policyを明示的に設計・レビューできるようにします。例:
+ただし、現在の`se050-kitting-export`は`test`サブコマンドだけを実装しています。Production生成を追加する前に、出荷しない評価個体を使って次を確認する必要があります。
 
-- `customer` area に P-256 device key を作る
-- key agreementを許可する
-- provisioning中に必要であればpublic key exportを許可する
-- provisioning完了後はdelete不可にする
-- finalization後のwrite/overwriteを避ける
-- 必要であればauthenticated sessionやplatform policyを使う
+- 初回生成が成功する
+- AttestationのPolicy/Origin/typeが一致する
+- 電源再投入後も同じ鍵を再利用できる
+- overwrite/regenerate/deleteが拒否される
+- CSV生成失敗後でも既存鍵から再実行できる
 
-このため、ライブラリは `EcKeyPolicy` builder を提供します。
+不可逆Objectを診断CLIから作成・削除する経路は追加しません。
 
-- `developmentEcKeyPolicy()` は scratch/dev key 用
-- `deviceEcKeyPolicy()` は provision済みdevice key 用
-- `oneTimeDeviceKeyPolicy()` は final one-time device key作成の意図を表すため
-- `customEcKeyPolicy(header)` は raw policy header が必要なadvanced caller用
+## NXP reserved objectの保護
 
-production操作でどのobject rangeとpolicyを許可するかは、`se050ctl` ではなく provisioning tool 側で判断します。
+`0x7FFF...`および`0xF000...`のNXP objectは、`se050ctl`のwrite/delete対象外です。Attestation鍵`0xF0000012`と証明書`0xF0000013`は読出し・検証だけに使用します。
 
-## 将来のproduction配置案
+## 将来の配置
 
-production配置の一例です。
+| 用途 | Area | Object ID例 |
+|---|---|---:|
+| production firmware KEX private key | `customer` | `0x20000100` |
+| 製品metadata/version | `customer` | `0x20000010` |
+| vendor管理object | `vendor` | `0x10000000..` |
+| disposable diagnostic object | `dev` | `0x30000000..` |
 
-| 用途 | Area | 例 | 備考 |
-| --- | --- | ---: | --- |
-| device P-256 ECDH private key | `customer` | `0x20000100` | firmware envelope keyを開くために使う |
-| device metadata/version object | `customer` | `0x20000010` | 製品フローで必要なら使用 |
-| factory/vendor reserved objects | `vendor` | `0x10000000..` | 管理されたprovisioning用 |
-| diagnostic scratch objects | `dev` | `0x30000000..` | 削除・再作成してよい領域 |
-
-正確なproduction mapは、キッティング開始前に固定し、provisioning project側でversion管理します。
+Production mapは不可逆キッティング開始前に固定し、version管理します。

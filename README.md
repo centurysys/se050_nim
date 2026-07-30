@@ -1,87 +1,105 @@
 # se050_nim
 
-Lightweight Nim library and diagnostic CLI for accessing an NXP SE050 secure element over T=1 over I2C.
+A lightweight Nim library, diagnostic CLI, and Attestation-backed kitting CSV exporter for NXP SE050 secure elements over T=1 over I2C.
 
-The project intentionally avoids NXP Plug & Trust Middleware and exposes small SE050 primitives that are useful for embedded Linux products, firmware-envelope experiments, and production provisioning tools built on top of this library.
+The project avoids the NXP Plug & Trust Middleware and talks to the SE050 directly from embedded Linux. It now provides not only low-level primitives, but also NXP attestation certificate validation, kitting records and CSV handling, offline verification, and live-device matching. Firmware-envelope formats, HKDF/AES-GCM processing, and firmware update logic belong to higher-level projects.
 
 ## Current status
 
-Verified on the currently tested SE050 applet path:
+The main paths verified with SE050 Applet 7.2.x devices include:
 
 - UID read from object `0x7FFF0206`
-- SE050 applet version/config read
+- Applet version/config readout
 - random byte generation
-- Secure Object existence/type/size/list/delete helpers
-- development EC key generation
-- public-key readout from EC key objects
+- Secure Object exists/type/size/list/delete helpers
+- development EC key generation and public-key readout
 - P-256 ECDH shared-secret derivation
+- use of the NXP pre-provisioned attestation key and device certificate
+- ReadObject-with-Attestation capture and ECDSA verification
+- X.509 chain validation to the NXP Root and Intermediate CAs
+- creation and reuse of test firmware KEX object `0x30000100`
+- generation, append, and idempotent reuse of a multi-device attested CSV
+- offline cryptographic verification of CSV records
+- live comparison with the board serial, SE050 UID, object type, persistence, and public key
 
-The practical firmware-envelope key-agreement path is:
+The main firmware-envelope key-agreement path is:
 
 ```text
 P-256 ECDH + HKDF-SHA256 + AES-256-GCM
 ```
 
-X25519 key generation and public-key export may work on the tested SE050 applet 7.2.0 environment, but `ECDHGenerateSharedSecret` consistently returned `SW=0x6985` during the investigation. Because P-256 works through the same ECDH APDU family, the CLI treats X25519 derive as unsupported and keeps P-256 as the mainline path.
+X25519 key generation and public-key export worked on the tested Applet 7.2.0 path, but `ECDHGenerateSharedSecret` consistently returned `SW=0x6985`. P-256 therefore remains the supported product path.
 
-## CLI
+## Built commands
 
-The installed command is:
+`nimble build` produces two executables:
 
-```sh
-se050ctl
+```text
+bin/se050ctl
+bin/se050-kitting-export
 ```
 
-Common options:
+- `se050ctl`: development, diagnostics, and local CSV/device verification
+- `se050-kitting-export`: factory/development generation of attested CSV records
+
+The exporter currently implements only the deletable `test` profile. Creation of the one-time/no-delete production object `0x20000100` is not implemented yet.
+
+## Test kitting
+
+The exporter reads the board serial from `/proc/device-tree/board/serialno`, creates or reuses the test key, and appends an Attestation-backed record.
 
 ```sh
+se050-kitting-export test \
+  -b 0 \
+  --append /tmp/se050-kitting.csv
+```
+
+A second run with the same board and key does not duplicate the row:
+
+```text
+CSV record: already valid
+```
+
+Verify the CSV against the same unit:
+
+```sh
+se050ctl kitting-verify \
+  -b 0 \
+  --input /tmp/se050-kitting.csv \
+  --profile test
+```
+
+The NXP Attestation Root and Intermediate certificates are embedded with `staticRead()`, so kitting commands do not accept replacement CA files.
+
+See [`docs/kitting-guide.md`](docs/kitting-guide.md) for details.
+
+## Common `se050ctl` options
+
+```text
 -b, --bus <n>          I2C bus number, e.g. 0 for /dev/i2c-0
 -a, --address <hex>    SE050 I2C address, default: 0x48
 -d, --debug            Print T=1 over I2C frames
 ```
 
-### UID
+Main commands:
 
-```sh
-se050ctl uid -b 0
-se050ctl uid -b 0 --colon
+```text
+uid                 Read the UID
+random              Generate random bytes
+version             Inspect Applet version/config
+exists/info/list    Inspect Secure Objects
+keygen/pubkey       Create development EC keys and read public keys
+derive              Perform P-256 ECDH
+attestation-cert    Export the NXP device certificate as DER
+attest-read         Diagnostic ReadObject-with-Attestation capture
+attest-verify       Live attestation diagnostic with explicit CA files
+kitting-verify      Embedded-CA CSV and live-device verification
+delete              Delete development-range objects
 ```
 
-### Version and feature bitmap
+See [`docs/se050ctl-guide.md`](docs/se050ctl-guide.md).
 
-```sh
-se050ctl version -b 0
-```
-
-### Random
-
-```sh
-se050ctl random -b 0 --len 32
-se050ctl random -b 0 --len 32 --colon
-```
-
-### Secure Object inspection
-
-Object references can be specified in one of these forms:
-
-```sh
---id 0x30000100
---area dev --index 0x100
---name uid
-```
-
-Examples:
-
-```sh
-se050ctl exists -b 0 --name uid
-se050ctl info -b 0 --name uid
-se050ctl list -b 0 --annotate
-se050ctl list -b 0 --area dev --annotate
-```
-
-### Development P-256 key agreement
-
-`se050ctl keygen` defaults to P-256.
+## Development P-256 key agreement
 
 ```sh
 se050ctl delete -b 0 --area dev --index 0x110 || true
@@ -101,60 +119,48 @@ se050ctl derive -b 0 --area dev --index 0x111 \
   --peer-public p256_a.bin \
   --out p256_secret_ba.bin
 
-sha256sum p256_secret_ab.bin p256_secret_ba.bin
 cmp p256_secret_ab.bin p256_secret_ba.bin
 ```
 
-Expected shape:
+P-256 public keys are 65-byte uncompressed points, and ECDH shared secrets are 32 bytes.
 
-- P-256 public keys are 65-byte uncompressed points: `0x04 || X(32) || Y(32)`
-- ECDH shared secrets are 32 bytes
-- A→B and B→A shared secrets must match
+## Object IDs and policies
 
-## Object ID policy used by `se050ctl`
+| Purpose | Object ID | Policy header | Status |
+|---|---:|---:|---|
+| Generic development key | development range | `0x043C0000` | Created by `se050ctl keygen` |
+| Test firmware KEX | `0x30000100` | `0x04240000` | Implemented and tested |
+| Production firmware KEX | `0x20000100` | `0x04200000` | Profile/API only; exporter not implemented |
+| NXP attestation key | `0xF0000012` | NXP provisioned | Used for verification |
+| NXP device certificate | `0xF0000013` | NXP provisioned | Used for verification |
 
-`se050ctl` is a development and diagnostic tool, not a production provisioning tool. Creation and deletion are intentionally limited to the development range.
+A key created at `0x30000100` with generic `se050ctl keygen` has the wrong policy for kitting and is rejected. After confirming that it is a disposable test object, delete it explicitly and let the exporter recreate it.
 
-| Area | Range | `se050ctl` create/delete |
-|---|---:|---|
-| vendor | `0x10000000..0x10000FFF` | no |
-| customer | `0x20000000..0x2000FFFF` | no |
-| dev | `0x30000000..0x3000FFFF` | yes |
-| nxp | `0x7FFF0000..0x7FFFFFFF` | no |
-| internal | `0xF0000000..0xFFFFFFFF` | no |
+See [`docs/object-ranges.md`](docs/object-ranges.md).
 
-Future production tooling should be split from this CLI, for example:
+## Library responsibility
 
-- `se050-provision`: production object creation and no-delete policy management
-- `fwkeys` / `fw-envelope`: manifest/envelope processing
-- `fw-update`: A/B firmware update application
+`src/se050_nim.nim` re-exports these functional areas:
 
-## Library layout
+- transport/APDU/TLV, UID, random, Secure Object, and key management
+- attestation certificate readout and ReadObject-with-Attestation
+- OpenSSL 3 SHA-256, ECDSA, and X.509 verification
+- embedded NXP trust store
+- board identity, kitting profiles, records, and CSV handling
+- offline kitting verification
+- local-device identity verification
+- exporter CSV merge helpers
 
-```text
-src/se050_nim.nim
-src/se050_nim/apdu.nim
-src/se050_nim/errors.nim
-src/se050_nim/i2c.nim
-src/se050_nim/keys.nim
-src/se050_nim/management.nim
-src/se050_nim/objects.nim
-src/se050_nim/random.nim
-src/se050_nim/tlv.nim
-src/se050_nim/transport.nim
-src/se050_nim/uid.nim
-src/se050ctl.nim
-```
+Firmware-envelope formats, HKDF, AES-GCM, release CEK handling, firmware signatures, and A/B updates remain out of scope.
 
-The library layer provides low-level primitives. Product policy, firmware package parsing, envelope formats, signing policy, and A/B update logic should live above it.
-
-## Build
+## Build and runtime requirements
 
 ```sh
 nimble build
+nimble test
 ```
 
-Dependencies are intentionally small:
+Nim dependencies:
 
 ```nim
 requires "nim >= 2.2.10"
@@ -162,7 +168,24 @@ requires "results >= 0.5.1"
 requires "argparse >= 4.0.2"
 ```
 
-Keep the `results` dependency as `>= 0.5.1`; using `> 0.5.1` can prevent builds when `0.5.1` is the available version.
+Keep `results` as `>= 0.5.1`.
+
+The embedded trust store requires these DER files in the source tree:
+
+```text
+src/se050_nim/certs/nxp-attestation-ecc-root.der
+src/se050_nim/certs/nxp-attestation-ecc-intermediate.der
+```
+
+Targets that execute attestation verification must provide OpenSSL 3 `libcrypto.so.3`. OpenSSL headers and a development symlink are not required because the library is loaded dynamically at runtime.
+
+## Documentation
+
+- [`docs/se050ctl-guide.md`](docs/se050ctl-guide.md): CLI
+- [`docs/api-guide.md`](docs/api-guide.md): library API
+- [`docs/kitting-guide.md`](docs/kitting-guide.md): Attestation-backed kitting
+- [`docs/object-ranges.md`](docs/object-ranges.md): Object IDs and policies
+- [`docs/p256-ecdh.md`](docs/p256-ecdh.md): P-256 ECDH for envelopes
 
 ## License
 

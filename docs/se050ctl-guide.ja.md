@@ -1,50 +1,39 @@
-# se050ctl ガイド
+# se050ctlガイド
 
-`se050ctl` は、`se050_nim` の開発・診断用CLIです。
-
-このツールは SE050 の低レベル primitive 操作に閉じます。production provisioning、firmware envelope、firmware updater の処理は、`se050_nim` に依存する上位ツール側で実装します。
+`se050ctl`は`se050_nim`の開発・診断CLIです。SE050 primitive、Attestation診断、キッティングCSVとローカル実機の照合を提供します。Production鍵生成、firmware envelope、firmware updaterは扱いません。
 
 ## 対象範囲
 
-`se050ctl` が扱うもの:
+扱うもの:
 
-- SE050疎通確認
-- UID取得
-- 乱数生成
-- applet version / feature確認
-- Secure Object の list / info / exists
-- 開発用EC鍵ペア生成
-- 公開鍵export
-- 診断用P-256 shared secret derive
-- 開発用object削除
+- UID、乱数、Applet version/config
+- Secure Objectのexists/info/list
+- dev rangeのEC鍵生成と削除
+- 公開鍵export、P-256 ECDH derive
+- NXP個体証明書のDER export
+- ReadObject-with-Attestationのraw capture
+- 外部CA指定によるライブAttestation診断
+- 組み込みNXP CAによるキッティングCSV＋実機照合
 
-`se050ctl` が扱わないもの:
+扱わないもの:
 
-- production用 one-time/no-delete provisioning
-- customer/vendor object policy管理
-- firmware envelope parse
-- firmware復号・適用処理
-- updater の A/B切替
+- production one-time/no-delete鍵生成
+- customer/vendor objectの一般write/delete
+- PC専用CSV検証CLI
+- HKDF/AES-GCM envelope処理
+- firmware復号・A/B更新
 
 ## 共通オプション
 
-多くのコマンドは以下を受け付けます。
-
 ```text
--b, --bus       I2C bus番号。例: 0 は /dev/i2c-0
--a, --address   SE050 I2Cアドレス。デフォルト 0x48
--d, --debug     T=1 over I2C フレームを表示
+-b, --bus       I2C bus番号。例: 0は/dev/i2c-0
+-a, --address   SE050 I2C address。default: 0x48
+-d, --debug     T=1 over I2C frameを表示
 ```
 
-例:
+## Object参照
 
-```sh
-./se050ctl uid -b 0
-```
-
-## Object参照形式
-
-SE050 Secure Object を対象にするコマンドでは、以下のいずれか1つで object を指定します。
+Objectを対象とするコマンドでは、次のいずれか1つを使用します。
 
 ```sh
 --id 0x30000100
@@ -52,261 +41,193 @@ SE050 Secure Object を対象にするコマンドでは、以下のいずれか
 --name uid
 ```
 
-これらは同時指定できません。
+Areaは`vendor`、`customer`、`dev`、`nxp`、`internal`です。
 
-`--area` 名:
+## 基本コマンド
 
-- `vendor`
-- `customer`
-- `dev`
-- `nxp`
-- `internal`
-
-`--index` は area の先頭からの相対indexです。通常は10進数、`0x` prefix付きなら16進数として扱います。
-
-例:
+### UID
 
 ```sh
-./se050ctl info -b 0 --area dev --index 0x100
+se050ctl uid -b 0
+se050ctl uid -b 0 --colon
 ```
 
-これは object ID `0x30000100` として解決されます。
-
-## UID
-
-Unique ID object を読みます。
+### Random
 
 ```sh
-./se050ctl uid -b 0
+se050ctl random -b 0 --len 32
+se050ctl random -b 0 --len 32 --colon
 ```
 
-コロン区切り表示:
+長さは1..255 bytesです。
+
+### Version
 
 ```sh
-./se050ctl uid -b 0 --colon
+se050ctl version -b 0
 ```
 
-既知object名 `uid` は、object系コマンドでも使えます。
+Applet version/config、secure box version、feature bitmapを表示します。
+
+### Exists / Info / List
 
 ```sh
-./se050ctl info -b 0 --name uid
+se050ctl exists -b 0 --area dev --index 0x100
+se050ctl exists -b 0 --area dev --index 0x100 --quiet
+se050ctl info -b 0 --area dev --index 0x100
+se050ctl list -b 0 --area dev --annotate
+se050ctl list -b 0 --filter 0x29
 ```
 
-## 乱数
-
-乱数を生成します。
-
-```sh
-./se050ctl random -b 0 --len 32
-```
-
-コロン区切り表示:
-
-```sh
-./se050ctl random -b 0 --len 32 --colon
-```
-
-対応長は 1..255 bytes です。
-
-## Version
-
-Applet version と feature bitmap を読みます。
-
-```sh
-./se050ctl version -b 0
-```
-
-出力には applet version、applet config、secure box version、`ECDSA_ECDH_ECDHE`、`DH_MONT`、`AES`、`FIPS_MODE_DISABLED` などの feature が含まれます。
-
-## Exists
-
-Object が存在するか確認します。
-
-```sh
-./se050ctl exists -b 0 --area dev --index 0x100
-```
-
-表示せず exit code だけを使う場合:
-
-```sh
-./se050ctl exists -b 0 --area dev --index 0x100 --quiet
-```
-
-## Info
-
-Object type、persistent/transient、size を確認します。
-
-```sh
-./se050ctl info -b 0 --area dev --index 0x100
-```
-
-P-256 key pair の出力例:
+P-256 key pairの`info`例:
 
 ```text
 id: 0x30000100
-ref: area:dev[0x00000100]
-area: dev
-exists: yes
 type: 0x29 (EC_KEY_PAIR_NIST_P256)
 transient: 0x01 (persistent)
 size: 32
 ```
 
-## List
+## 開発用EC鍵
 
-見えている object ID を列挙します。
-
-```sh
-./se050ctl list -b 0
-```
-
-開発用objectだけ表示:
+### Keygen
 
 ```sh
-./se050ctl list -b 0 --area dev
+se050ctl keygen -b 0 --area dev --index 0x120 --curve p256
+se050ctl keygen -b 0 --area dev --index 0x121 --curve x25519
 ```
 
-area/name 注釈付き:
+Default curveはP-256です。`se050ctl keygen`はdev rangeだけを許可し、汎用development Policy `0x043C0000`を使用します。このPolicyで作った`0x30000100`はキッティングtest Policyと異なるため、Exporterに拒否されます。
+
+### Public key
 
 ```sh
-./se050ctl list -b 0 --annotate
+se050ctl pubkey -b 0 --area dev --index 0x120 --out p256_pub.bin
+se050ctl pubkey -b 0 --area dev --index 0x120 --colon
 ```
 
-SecureObjectType byte でfilter:
+P-256は65-byte `0x04 || X || Y`、X25519は32 bytesです。
+
+### P-256 derive
 
 ```sh
-./se050ctl list -b 0 --filter 0x29
+se050ctl derive -b 0 --area dev --index 0x120 \
+  --peer-public peer_p256.bin \
+  --out shared_secret.bin
 ```
 
-`0xFF` は全object typeを意味します。
+Peer P-256公開鍵は65 bytes、shared secretは32 bytesです。X25519 deriveは確認したApplet 7.2.0経路で`SW=0x6985`となるため拒否します。
 
-## 鍵生成
-
-開発用P-256 key pair を作ります。
+### Delete
 
 ```sh
-./se050ctl keygen -b 0 --area dev --index 0x100
+se050ctl delete -b 0 --area dev --index 0x120
 ```
 
-デフォルトcurveは P-256 です。
+Dev range以外は拒否します。
 
-明示的にP-256を指定:
+## Attestationコマンド
+
+### `attestation-cert`
+
+NXP事前搭載の個体証明書`0xF0000013`をDERで保存します。
 
 ```sh
-./se050ctl keygen -b 0 --area dev --index 0x100 --curve p256
+se050ctl attestation-cert \
+  -b 0 \
+  --out se050-attestation-cert.der
 ```
 
-診断用にX25519鍵生成も可能です。
+個体によってBinaryFileの末尾がゼロ埋めされる場合があります。コマンドはDER SEQUENCE本体だけを出力し、非ゼロの余剰データは拒否します。
+
+### `attest-read`
+
+ReadObject-with-Attestationのrawデータを診断用に保存します。署名検証は行いません。
 
 ```sh
-./se050ctl keygen -b 0 --area dev --index 0x120 --curve x25519
+se050ctl attest-read \
+  -b 0 \
+  --id 0x30000100 \
+  --freshness 000102030405060708090A0B0C0D0E0F \
+  --out-prefix /tmp/attest
 ```
 
-ただし、テストした applet 経路では X25519 derive は `ECDHGenerateSharedSecret` が各種encodingで `SW=0x6985` を返したため、製品本線にはしません。
-
-`se050ctl keygen` は `dev` range のみ許可します。vendor/customer range の production鍵は、専用provisioning toolで作成します。
-
-## 公開鍵export
-
-公開鍵のraw bytesをファイルへ書き出します。
-
-```sh
-./se050ctl pubkey -b 0 --area dev --index 0x100 --out p256_pub.bin
-```
-
-hexとして表示:
-
-```sh
-./se050ctl pubkey -b 0 --area dev --index 0x100
-```
-
-P-256 public key は 65-byte の非圧縮pointです。
+生成物:
 
 ```text
-0x04 || X(32) || Y(32)
+/tmp/attest.command.bin
+/tmp/attest.transmit-apdu.bin
+/tmp/attest.response.bin
+/tmp/attest.signature.bin
+/tmp/attest.object.bin
 ```
 
-X25519 public key は 32 bytes です。
+### `attest-verify`
 
-## P-256 derive
-
-P-256 key pair を2つ作ります。
+ライブAttestationを外部CAファイルで診断検証します。対象は設定済みキッティングObject IDだけです。
 
 ```sh
-./se050ctl keygen -b 0 --area dev --index 0x110 --curve p256
-./se050ctl keygen -b 0 --area dev --index 0x111 --curve p256
-
-./se050ctl pubkey -b 0 --area dev --index 0x110 --out p256_a_pub.bin
-./se050ctl pubkey -b 0 --area dev --index 0x111 --out p256_b_pub.bin
+se050ctl attest-verify \
+  -b 0 \
+  --id 0x30000100 \
+  --freshness 000102030405060708090A0B0C0D0E0F \
+  --trust-anchors nxp-attestation-ecc-root.der \
+  --intermediates nxp-attestation-ecc-intermediate.der
 ```
 
-A秘密鍵 × B公開鍵:
+確認するもの:
+
+- 個体証明書chain
+- 証明書公開鍵と`0xF0000012`公開鍵の一致
+- Attestation ECDSA署名
+- Object ID/type/origin/size/Policy
+
+外部CA指定を残しているのは診断・CA更新調査のためです。通常のキッティング検証では組み込みTrust Storeを使用します。
+
+## `kitting-verify`
+
+Multi-device CSVからこの基板のrecordを選び、オフライン検証後に実機と照合します。
 
 ```sh
-./se050ctl derive -b 0 --area dev --index 0x110 \
-  --peer-public p256_b_pub.bin \
-  --out p256_secret_ab.bin
+se050ctl kitting-verify \
+  -b 0 \
+  --input /tmp/se050-kitting.csv \
+  --profile test
 ```
 
-B秘密鍵 × A公開鍵:
+検証内容:
+
+- CSV構造とmetadata-bound freshness
+- 組み込みNXP Root/Intermediateまでの証明書chain
+- Attestation署名とsigned object semantics
+- `/proc/device-tree/board/serialno`
+- live SE050 UID
+- live Object type/persistence
+- live public key
+
+`--profile`のdefaultは`production`です。現在の`se050-kitting-export test`で作ったCSVには`--profile test`を明示してください。
+
+成功時の最後は次のようになります。
+
+```text
+certificate trust chain: valid
+attestation signature: valid
+local board serial: match
+local SE050 UID: match
+local public key: match
+kitting record: valid
+```
+
+## 推奨test kitting smoke test
 
 ```sh
-./se050ctl derive -b 0 --area dev --index 0x111 \
-  --peer-public p256_a_pub.bin \
-  --out p256_secret_ba.bin
+se050-kitting-export test -b 0 --append /tmp/se050-kitting.csv
+se050-kitting-export test -b 0 --append /tmp/se050-kitting.csv
+se050ctl kitting-verify -b 0 \
+  --input /tmp/se050-kitting.csv \
+  --profile test
 ```
 
-一致確認:
+1回目は`CSV record: added`、2回目は`CSV record: already valid`を期待します。
 
-```sh
-sha256sum p256_secret_ab.bin p256_secret_ba.bin
-cmp p256_secret_ab.bin p256_secret_ba.bin
-```
-
-shared secret は 32 bytes です。上位の firmware envelope 側では、この値をそのまま AES key にせず、HKDF に渡します。
-
-## Delete
-
-開発用objectを削除します。
-
-```sh
-./se050ctl delete -b 0 --area dev --index 0x100
-```
-
-dev range 以外の削除は拒否します。このガードは意図的なものです。production object削除やproduction policy管理は、診断CLIに入れません。
-
-## 推奨 smoke test
-
-```sh
-./se050ctl version -b 0
-./se050ctl random -b 0 --len 32
-./se050ctl list -b 0 --area dev --annotate
-
-./se050ctl delete -b 0 --area dev --index 0x110 || true
-./se050ctl delete -b 0 --area dev --index 0x111 || true
-
-./se050ctl keygen -b 0 --area dev --index 0x110 --curve p256
-./se050ctl keygen -b 0 --area dev --index 0x111 --curve p256
-
-./se050ctl pubkey -b 0 --area dev --index 0x110 --out p256_a_pub.bin
-./se050ctl pubkey -b 0 --area dev --index 0x111 --out p256_b_pub.bin
-
-./se050ctl derive -b 0 --area dev --index 0x110 \
-  --peer-public p256_b_pub.bin \
-  --out p256_secret_ab.bin
-
-./se050ctl derive -b 0 --area dev --index 0x111 \
-  --peer-public p256_a_pub.bin \
-  --out p256_secret_ba.bin
-
-ls -l p256_a_pub.bin p256_b_pub.bin p256_secret_ab.bin p256_secret_ba.bin
-sha256sum p256_secret_ab.bin p256_secret_ba.bin
-cmp p256_secret_ab.bin p256_secret_ba.bin
-```
-
-期待サイズ:
-
-- `p256_a_pub.bin`: 65 bytes
-- `p256_b_pub.bin`: 65 bytes
-- `p256_secret_ab.bin`: 32 bytes
-- `p256_secret_ba.bin`: 32 bytes
+詳細は[`kitting-guide.ja.md`](kitting-guide.ja.md)を参照してください。

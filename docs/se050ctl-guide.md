@@ -1,50 +1,39 @@
 # se050ctl Guide
 
-`se050ctl` is the development and diagnostic CLI for `se050_nim`.
-
-It intentionally stays in the low-level SE050 primitive layer. Production provisioning, firmware envelopes, and firmware updater behavior should be implemented by higher-level tools that depend on `se050_nim`.
+`se050ctl` is the development and diagnostic CLI for `se050_nim`. It provides SE050 primitives, attestation diagnostics, and local comparison of a kitting CSV with the current unit. It does not create production keys or process firmware envelopes.
 
 ## Scope
 
-`se050ctl` is intended for:
+Included:
 
-- checking SE050 connectivity
-- reading UID
-- generating random bytes
-- reading applet version/features
-- listing and inspecting Secure Objects
-- creating development EC key pairs
-- exporting public keys
-- deriving P-256 shared secrets for diagnostics
-- deleting development objects
+- UID, random, and Applet version/config
+- Secure Object exists/info/list
+- development-range EC key creation and deletion
+- public-key export and P-256 ECDH derive
+- NXP device certificate DER export
+- raw ReadObject-with-Attestation capture
+- live attestation diagnostics with explicit CA files
+- kitting CSV and live-device verification with embedded NXP CAs
 
-It is not intended for:
+Excluded:
 
-- production one-time/no-delete provisioning
-- customer/vendor object policy management
-- firmware envelope parsing
-- firmware decryption/apply logic
-- updater A/B switching
+- production one-time/no-delete key creation
+- general customer/vendor object writes and deletion
+- a PC-only CSV verification executable
+- HKDF/AES-GCM envelope processing
+- firmware decryption and A/B updates
 
 ## Common options
 
-Most commands accept:
-
 ```text
--b, --bus       I2C bus number, for example 0 for /dev/i2c-0
--a, --address   SE050 I2C address, default 0x48
--d, --debug     print T=1 over I2C frames
-```
-
-Example:
-
-```sh
-./se050ctl uid -b 0
+-b, --bus       I2C bus number, e.g. 0 for /dev/i2c-0
+-a, --address   SE050 I2C address, default: 0x48
+-d, --debug     Print T=1 over I2C frames
 ```
 
 ## Object references
 
-Commands that target an SE050 Secure Object accept exactly one of these forms:
+Use exactly one form:
 
 ```sh
 --id 0x30000100
@@ -52,261 +41,102 @@ Commands that target an SE050 Secure Object accept exactly one of these forms:
 --name uid
 ```
 
-These forms are mutually exclusive.
+Areas are `vendor`, `customer`, `dev`, `nxp`, and `internal`.
 
-`--area` names are:
-
-- `vendor`
-- `customer`
-- `dev`
-- `nxp`
-- `internal`
-
-`--index` is relative to the area base. Decimal values are accepted by default, and `0x`-prefixed values are accepted as hexadecimal.
-
-Example:
+## Basic commands
 
 ```sh
-./se050ctl info -b 0 --area dev --index 0x100
+se050ctl uid -b 0
+se050ctl random -b 0 --len 32
+se050ctl version -b 0
+se050ctl exists -b 0 --area dev --index 0x100
+se050ctl info -b 0 --area dev --index 0x100
+se050ctl list -b 0 --area dev --annotate
 ```
 
-This resolves to object ID `0x30000100`.
+Random length is 1..255 bytes. `exists --quiet` uses the exit status without printing.
 
-## UID
-
-Read the unique ID object:
+## Development EC keys
 
 ```sh
-./se050ctl uid -b 0
+se050ctl keygen -b 0 --area dev --index 0x120 --curve p256
+se050ctl pubkey -b 0 --area dev --index 0x120 --out p256_pub.bin
+se050ctl derive -b 0 --area dev --index 0x120 \
+  --peer-public peer_p256.bin \
+  --out shared_secret.bin
+se050ctl delete -b 0 --area dev --index 0x120
 ```
 
-Colon-separated output:
+`keygen` is limited to the development range and uses generic development policy `0x043C0000`. A key created that way at `0x30000100` is not a valid kitting test key and is rejected by the exporter.
+
+P-256 public keys are 65-byte uncompressed points, and shared secrets are 32 bytes. X25519 derive is refused because the tested Applet 7.2.0 path returned `SW=0x6985`.
+
+## Attestation commands
+
+### `attestation-cert`
+
+Export the pre-provisioned device certificate from `0xF0000013`:
 
 ```sh
-./se050ctl uid -b 0 --colon
+se050ctl attestation-cert -b 0 --out se050-attestation-cert.der
 ```
 
-The known UID object name can also be used with object commands:
+A zero-padded BinaryFile tail is removed; non-zero trailing bytes are rejected.
+
+### `attest-read`
+
+Capture raw ReadObject-with-Attestation data without verifying it:
 
 ```sh
-./se050ctl info -b 0 --name uid
+se050ctl attest-read \
+  -b 0 \
+  --id 0x30000100 \
+  --freshness 000102030405060708090A0B0C0D0E0F \
+  --out-prefix /tmp/attest
 ```
 
-## Random
+It writes `.command.bin`, `.transmit-apdu.bin`, `.response.bin`, `.signature.bin`, and, when present, `.object.bin` files.
 
-Generate random bytes:
+### `attest-verify`
+
+Verify a live attestation using explicit external CA files:
 
 ```sh
-./se050ctl random -b 0 --len 32
+se050ctl attest-verify \
+  -b 0 \
+  --id 0x30000100 \
+  --freshness 000102030405060708090A0B0C0D0E0F \
+  --trust-anchors nxp-attestation-ecc-root.der \
+  --intermediates nxp-attestation-ecc-intermediate.der
 ```
 
-Colon-separated output:
+This verifies the device certificate chain, the match between the certificate public key and `0xF0000012`, the ECDSA attestation signature, and the signed object semantics. External CA selection remains only for diagnostics and CA update investigations.
+
+## `kitting-verify`
+
+Select this board's row from a multi-device CSV, perform offline verification, and compare it with the live unit:
 
 ```sh
-./se050ctl random -b 0 --len 32 --colon
+se050ctl kitting-verify \
+  -b 0 \
+  --input /tmp/se050-kitting.csv \
+  --profile test
 ```
 
-The supported length range is 1..255 bytes.
+It validates the CSV and freshness, the embedded NXP certificate chain, the attestation signature and semantics, the Device Tree serial, live SE050 UID, object type/persistence, and public key.
 
-## Version
+The default profile is `production`; explicitly use `--profile test` for CSV files generated by the current exporter.
 
-Read applet version and feature bitmap:
+## Recommended test-kitting smoke test
 
 ```sh
-./se050ctl version -b 0
+se050-kitting-export test -b 0 --append /tmp/se050-kitting.csv
+se050-kitting-export test -b 0 --append /tmp/se050-kitting.csv
+se050ctl kitting-verify -b 0 \
+  --input /tmp/se050-kitting.csv \
+  --profile test
 ```
 
-The output includes applet version, applet config, secure box version, and feature flags such as `ECDSA_ECDH_ECDHE`, `DH_MONT`, `AES`, and `FIPS_MODE_DISABLED`.
+Expect `CSV record: added` on the first run and `CSV record: already valid` on the second.
 
-## Exists
-
-Check whether an object exists:
-
-```sh
-./se050ctl exists -b 0 --area dev --index 0x100
-```
-
-Quiet mode returns only the exit code:
-
-```sh
-./se050ctl exists -b 0 --area dev --index 0x100 --quiet
-```
-
-## Info
-
-Inspect object type, persistence, and size:
-
-```sh
-./se050ctl info -b 0 --area dev --index 0x100
-```
-
-Example output for a P-256 key pair:
-
-```text
-id: 0x30000100
-ref: area:dev[0x00000100]
-area: dev
-exists: yes
-type: 0x29 (EC_KEY_PAIR_NIST_P256)
-transient: 0x01 (persistent)
-size: 32
-```
-
-## List
-
-List visible object IDs:
-
-```sh
-./se050ctl list -b 0
-```
-
-List only development objects:
-
-```sh
-./se050ctl list -b 0 --area dev
-```
-
-Add area/name annotations:
-
-```sh
-./se050ctl list -b 0 --annotate
-```
-
-Filter by raw SecureObjectType byte:
-
-```sh
-./se050ctl list -b 0 --filter 0x29
-```
-
-`0xFF` means all object types.
-
-## Key generation
-
-Create a development P-256 key pair:
-
-```sh
-./se050ctl keygen -b 0 --area dev --index 0x100
-```
-
-The default curve is P-256.
-
-Explicit P-256:
-
-```sh
-./se050ctl keygen -b 0 --area dev --index 0x100 --curve p256
-```
-
-X25519 key generation is supported for diagnostics:
-
-```sh
-./se050ctl keygen -b 0 --area dev --index 0x120 --curve x25519
-```
-
-However, X25519 derive is not the product path on the tested applet because `ECDHGenerateSharedSecret` returned `SW=0x6985` across the tested encodings.
-
-`se050ctl keygen` intentionally allows only the `dev` range. Production keys in vendor/customer ranges should be created by a dedicated provisioning tool.
-
-## Public key export
-
-Write the raw public key to a file:
-
-```sh
-./se050ctl pubkey -b 0 --area dev --index 0x100 --out p256_pub.bin
-```
-
-Print as hex:
-
-```sh
-./se050ctl pubkey -b 0 --area dev --index 0x100
-```
-
-P-256 public keys are 65-byte uncompressed points:
-
-```text
-0x04 || X(32) || Y(32)
-```
-
-X25519 public keys are 32 bytes.
-
-## P-256 derive
-
-Given two P-256 key pairs:
-
-```sh
-./se050ctl keygen -b 0 --area dev --index 0x110 --curve p256
-./se050ctl keygen -b 0 --area dev --index 0x111 --curve p256
-
-./se050ctl pubkey -b 0 --area dev --index 0x110 --out p256_a_pub.bin
-./se050ctl pubkey -b 0 --area dev --index 0x111 --out p256_b_pub.bin
-```
-
-Derive A private × B public:
-
-```sh
-./se050ctl derive -b 0 --area dev --index 0x110 \
-  --peer-public p256_b_pub.bin \
-  --out p256_secret_ab.bin
-```
-
-Derive B private × A public:
-
-```sh
-./se050ctl derive -b 0 --area dev --index 0x111 \
-  --peer-public p256_a_pub.bin \
-  --out p256_secret_ba.bin
-```
-
-Verify both sides match:
-
-```sh
-sha256sum p256_secret_ab.bin p256_secret_ba.bin
-cmp p256_secret_ab.bin p256_secret_ba.bin
-```
-
-The shared secret should be 32 bytes. Higher-level firmware envelope code should feed it into HKDF instead of using it directly as an AES key.
-
-## Delete
-
-Delete a development object:
-
-```sh
-./se050ctl delete -b 0 --area dev --index 0x100
-```
-
-Deletion is refused outside the development range. This guard is intentional. Production object deletion and production policy management should not be part of the diagnostic CLI.
-
-## Recommended smoke test
-
-```sh
-./se050ctl version -b 0
-./se050ctl random -b 0 --len 32
-./se050ctl list -b 0 --area dev --annotate
-
-./se050ctl delete -b 0 --area dev --index 0x110 || true
-./se050ctl delete -b 0 --area dev --index 0x111 || true
-
-./se050ctl keygen -b 0 --area dev --index 0x110 --curve p256
-./se050ctl keygen -b 0 --area dev --index 0x111 --curve p256
-
-./se050ctl pubkey -b 0 --area dev --index 0x110 --out p256_a_pub.bin
-./se050ctl pubkey -b 0 --area dev --index 0x111 --out p256_b_pub.bin
-
-./se050ctl derive -b 0 --area dev --index 0x110 \
-  --peer-public p256_b_pub.bin \
-  --out p256_secret_ab.bin
-
-./se050ctl derive -b 0 --area dev --index 0x111 \
-  --peer-public p256_a_pub.bin \
-  --out p256_secret_ba.bin
-
-ls -l p256_a_pub.bin p256_b_pub.bin p256_secret_ab.bin p256_secret_ba.bin
-sha256sum p256_secret_ab.bin p256_secret_ba.bin
-cmp p256_secret_ab.bin p256_secret_ba.bin
-```
-
-Expected sizes:
-
-- `p256_a_pub.bin`: 65 bytes
-- `p256_b_pub.bin`: 65 bytes
-- `p256_secret_ab.bin`: 32 bytes
-- `p256_secret_ba.bin`: 32 bytes
+See [`kitting-guide.md`](kitting-guide.md).

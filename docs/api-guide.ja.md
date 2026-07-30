@@ -1,43 +1,27 @@
 # se050_nim APIガイド
 
-この文書は、`se050_nim` のライブラリAPIを使う側向けのガイドです。
+`se050_nim`は、SE050 primitive、Attestation検証、キッティングrecord/CSV検証を提供します。Firmware envelope format、HKDF/AES-GCM、firmware updaterは上位projectへ分離します。
 
-`se050_nim` は、SE050の低レベル primitive を扱うためのライブラリです。transport、APDU/TLV、UID、乱数、Secure Object、鍵生成、公開鍵読み出し、P-256 ECDH までを担当します。ファームウェア envelope、production provisioning policy、updater の処理は、このライブラリを `requires` / `import` する上位プロジェクト側に分離します。
-
-## エントリポイント
-
-通常はトップレベルモジュールだけを import します。
+## Entry point
 
 ```nim
 import se050_nim
 ```
 
-トップレベルモジュールは、以下のサブモジュールを re-export します。
+トップレベルは次の機能群をre-exportします。
 
-- `errors`
-- `transport`
-- `apdu`
-- `tlv`
-- `uid`
-- `random`
-- `objects`
-- `keys`
-- `management`
-
-特定の機能だけを明示的に使いたい場合だけ、サブモジュールを直接 import します。
+- `errors`, `transport`, `apdu`, `tlv`
+- `uid`, `random`, `objects`, `keys`, `management`
+- `attestation_cert`, `attestation`
+- `crypto_verify`, `x509_verify`, `trust_store`
+- `attestation_verify`, `attestation_attributes`, `kitting_attestation_verify`
+- `binary_encoding`, `board_identity`
+- `kitting_profile`, `kitting_record`, `kitting_csv`
+- `kitting_verify`, `kitting_local_verify`, `kitting_export`
 
 ## Result形式
 
-通常の SE050/APDU エラーでは例外を投げず、`SE[T]` を返します。
-
-```nim
-type SE[T] = object
-  ok*: bool
-  value*: T        # T が void でない場合
-  error*: Se050Error
-```
-
-典型的な使い方は次の形です。
+通常のエラーは例外ではなく`SE[T]`で返します。
 
 ```nim
 let r = se.readUidHex()
@@ -48,247 +32,263 @@ if not r.ok:
 echo r.value
 ```
 
-`Se050Error.sw` が 0 以外の場合は、`0x6985` のような APDU status word 由来のエラーです。
+`Se050Error.sw`が0以外ならAPDU status word由来です。
 
-## デバイスを開く
-
-```nim
-let se = openSe050(bus = 0)
-```
-
-I2Cアドレスのデフォルトは `0x48` です。
+## Device / primitive
 
 ```nim
-let se = openSe050(bus = 0, address = 0x48'u8)
+let se = openSe050(bus = 0, address = 0x48'u8, debug = false)
+let atr = se.requestAtr()
+let uid = se.readUidRaw()
+let random = se.getRandomBytes(32)
 ```
 
-APDU/T=1 over I2C フレームを表示したい場合は `debug = true` を指定します。
+主なAPI:
+
+- `selectApplet()` / `requestAtr()`
+- `readUidRaw()` / `readUidHex()`
+- `getRandomBytes()` / `getRandomHex()`
+- `getVersionInfo()`
+- `objectExists()` / `readObjectType()` / `readObjectSize()` / `listObjectIds()`
+- `deleteSecureObject()`
+
+Raw APIには`se050ctl`のdev-range safety guardはありません。上位toolがObject ID policyを強制してください。
+
+## EC key API
 
 ```nim
-let se = openSe050(bus = 0, debug = true)
+let created = se.generateP256KeyPair(
+  0x30000120'u32,
+  developmentEcKeyPolicy()
+)
+let publicKey = se.readPublicKey(0x30000120'u32)
+let secret = se.deriveSharedSecret(0x30000120'u32, peerPublicKey)
 ```
 
-多くの high-level helper は、デフォルトで `selectFirst = true` として SE050 applet を選択します。複数コマンドを連続実行する場合は、最初に `selectApplet()` して、以後は `selectFirst = false` にしても構いません。
-
-```nim
-let selected = se.selectApplet()
-if not selected.ok:
-  echo selected.error.errorMessage()
-  quit 1
-
-let uid = se.readUidHex(selectFirst = false)
-```
-
-## UID
-
-```nim
-let uid = se.readUidHex()
-```
-
-関連API:
-
-- `readUidRaw(se, selectFirst = true): SE[array[Se050UidLength, uint8]]`
-- `readUidHex(se, separator = "", selectFirst = true): SE[string]`
-- `uidToHex(uid, separator = ""): string`
-
-既知の UID Secure Object ID は以下です。
-
-```nim
-Se050UniqueIdObjectId = 0x7FFF0206'u32
-```
-
-## 乱数
-
-```nim
-let rnd = se.getRandomBytes(length = 32)
-```
-
-関連API:
-
-- `getRandomBytes(se, length, selectFirst = true): SE[seq[uint8]]`
-- `getRandomHex(se, length, separator = "", selectFirst = true): SE[string]`
-- `Se050MaxRandomLength = 255`
-- `bytesToHex(data, separator = ""): string`
-
-現在の実装は1回のAPDUで乱数を取得するため、長さは 1..255 bytes です。
-
-## version / applet feature
-
-```nim
-let info = se.getVersionInfo()
-if info.ok:
-  echo info.value.major, ".", info.value.minor, ".", info.value.patch
-```
-
-関連API:
-
-- `getVersionInfo(se, selectFirst = true): SE[Se050VersionInfo]`
-- `hasFeature(info, bit): bool`
-- `featureName(bit): string`
-- `knownFeatureBits(): seq[uint16]`
-
-主な feature 定数:
-
-- `ConfigEcdsaEcdhEcdhe`
-- `ConfigEddsa`
-- `ConfigDhMont`
-- `ConfigAes`
-- `ConfigFipsModeDisabled`
-
-## Secure Object の確認
-
-```nim
-let exists = se.objectExists(0x30000100'u32)
-```
-
-関連API:
-
-- `objectExists(se, objectId, selectFirst = true): SE[bool]`
-- `readObjectType(se, objectId, selectFirst = true): SE[ObjectTypeInfo]`
-- `readObjectSize(se, objectId, selectFirst = true): SE[uint32]`
-- `readObjectIdListChunk(se, offset = 0, filter = SecureObjectTypeAll, selectFirst = true): SE[ObjectIdListChunk]`
-- `listObjectIds(se, filter = SecureObjectTypeAll, selectFirst = true): SE[seq[uint32]]`
-- `objectTypeName(objectType): string`
-- `transientIndicatorName(value): string`
-
-`deleteSecureObject` も export されていますが、これは生の primitive です。dev以外を消さない、といった安全ポリシーは CLI や provisioning tool 側で強制します。
-
-## 鍵生成
-
-```nim
-let created = se.generateP256KeyPair(0x30000100'u32)
-```
-
-関連API:
-
-- `generateEcKeyPair(se, objectId, curve, selectFirst = true): SE[void]`
-- `generateEcKeyPair(se, objectId, curve, policy, selectFirst = true): SE[void]`
-- `generateP256KeyPair(se, objectId, selectFirst = true): SE[void]`
-- `generateP256KeyPair(se, objectId, policy, selectFirst = true): SE[void]`
-- `generateX25519KeyPair(se, objectId, selectFirst = true): SE[void]`
-- `generateX25519KeyPair(se, objectId, policy, selectFirst = true): SE[void]`
-- `curveId(curve): uint8`
-- `curveName(curve): string`
-- `expectedKeyPairType(curve): uint8`
-
-対応している curve enum:
+Curve:
 
 - `ecCurveP256`
 - `ecCurveX25519`
 
-policyを指定しない鍵生成helperは、従来通り開発用EC key policyを使います。このpolicyでは、key agreement、公開鍵読み出し、開発中のwrite/generate、deleteを許可します。
+Policy helper:
 
-上位のprovisioning / kitting toolは、明示的に `EcKeyPolicy` を渡すことでproduction向けの権限で鍵を作成できます。`se050ctl` には、このproduction policy操作を意図的に公開しません。
+| API | Header | 用途 |
+|---|---:|---|
+| `developmentEcKeyPolicy()` | `0x043C0000` | 汎用development |
+| `testDeviceKeyPolicy()` | `0x04240000` | 削除可能なproduction相当test |
+| `deviceEcKeyPolicy()` | `0x04200000` | provision済みdevice key |
+| `oneTimeDeviceKeyPolicy()` | `0x04200000` | one-time作成意図 |
+| `customEcKeyPolicy()` | caller-defined | advanced use |
 
-## EC key policy API
+P-256公開鍵は65 bytes、shared secretは32 bytesです。
 
-`EcKeyPolicy` は、EC key object作成時にSE050へ渡すEC key policy headerを表します。
+## Attestation certificate
 
 ```nim
-type
-  EcKeyPolicy* = object
-    header*: uint32
+let cert = se.readAttestationCertificate()
 ```
 
-policy builder API:
+主なAPI:
 
-- `developmentEcKeyPolicy(): EcKeyPolicy`
-- `deviceEcKeyPolicy(): EcKeyPolicy`
-- `oneTimeDeviceKeyPolicy(): EcKeyPolicy`
-- `customEcKeyPolicy(header): EcKeyPolicy`
-- `policyHeader(policy): uint32`
+- `readAttestationCertificate()`
+- `extractAttestationCertificateDer()`
+- `validateAttestationCertificateDer()`
 
-開発用の典型例:
+`0xF0000013`のBinaryFile全体を読み、先頭DER SEQUENCEを返します。末尾のゼロ埋めは許可し、非ゼロtailは拒否します。
 
-```nim
-let policy = developmentEcKeyPolicy()
-let r = se.generateP256KeyPair(0x30000120'u32, policy)
-```
-
-provisioning tool側の典型例:
+## ReadObject-with-Attestation
 
 ```nim
-let policy = oneTimeDeviceKeyPolicy()
-let r = se.generateP256KeyPair(0x20000100'u32, policy)
-```
-
-ライブラリは、呼び出し側が指定したobject IDをそのまま扱います。rawな鍵生成primitiveでは `dev` range 制限を強制しません。production kitting toolが `customer` / `vendor` rangeへ意図的に書き込める必要があるためです。ユーザー向けツール側で、それぞれの安全ポリシーを強制してください。
-
-現在の定義済みpolicy:
-
-| Policy | 用途 | 許可するもの | 意図的に避けるもの |
-| --- | --- | --- | --- |
-| `developmentEcKeyPolicy()` | 開発・診断 | key agreement、公開鍵read、write/generate、delete | production finalization |
-| `deviceEcKeyPolicy()` | provision済みdevice key | key agreement、公開鍵read | write/generate/delete |
-| `oneTimeDeviceKeyPolicy()` | 最終device key作成 | 現時点では `deviceEcKeyPolicy()` と同じ実効権限 | write/generate/delete |
-| `customEcKeyPolicy(header)` | advanced caller | 呼び出し側定義 | raw header以上の検証はしない |
-
-`oneTimeDeviceKeyPolicy()` は、現時点では `deviceEcKeyPolicy()` と同じ実効権限ですが、kitting code側で「one-timeとして作る」という意図を明確にするために別APIにしています。将来、Applet固有のone-time表現が必要になっても、呼び出し側コードを変えずに拡張できます。
-
-sticky policyのテストには注意してください。deleteやoverwriteを許可しないpolicyで作ったobjectは、別の認可済み経路で消せない限りSE050上に残る可能性があります。production相当policyは、まず予約済みのdevelopment object IDで確認してください。
-
-## 公開鍵読み出し
-
-```nim
-let pub = se.readPublicKey(0x30000100'u32)
-```
-
-関連API:
-
-- `readPublicKey(se, objectId, selectFirst = true): SE[seq[uint8]]`
-
-実機で確認した公開鍵サイズ:
-
-- P-256: 65 bytes、非圧縮形式 `0x04 || X(32) || Y(32)`
-- X25519: 32 bytes
-
-## P-256 ECDH derive
-
-```nim
-let secret = se.deriveSharedSecret(
+let attested = se.readObjectWithAttestation(
   objectId = 0x30000100'u32,
-  peerPublicKey = peerPublicKeyBytes
+  freshness = freshness
 )
 ```
 
-関連API:
+主なAPI:
 
-- `deriveSharedSecret(se, objectId, peerPublicKey, selectFirst = true): SE[seq[uint8]]`
+- `buildReadObjectWithAttestationRequest()`
+- `parseReadObjectWithAttestationResponse()`
+- `readObjectWithAttestation()`
 
-ファームウェア envelope 用途では、SE050側の実用的な鍵共有方式として P-256 ECDH を使います。返ってくる 32-byte shared secret は、そのまま AES key にせず、上位の envelope ライブラリ側で HKDF に渡します。
+`AttestedObjectRead`は署名対象command、送信APDU、raw response、object data、attributes、chip UID、timestamp、signatureを保持します。
 
-X25519 は、鍵生成と公開鍵読み出しは動作確認できていますが、テストした applet 経路では derive が peer public key 形式を変えても `SW=0x6985` で失敗しました。別の applet/middleware 経路で成功が確認できるまでは、現在の製品経路では X25519 derive を非対応扱いにします。
+## OpenSSL host verification
 
-## エラー表示
+実行時にOpenSSL 3 `libcrypto.so.3`を動的loadします。
+
+主なAPI:
+
+- `sha256()`
+- `certificateSha256()`
+- `extractCertificateEcPublicKey()`
+- `verifyEcdsaSha256WithCertificate()`
+- `verifyCertificateChain()`
+- `splitDerCertificateBundle()`
+- `readDerCertificateBundleFile()`
+
+C headerやOpenSSL development symlinkは不要です。
+
+## Embedded NXP Trust Store
 
 ```nim
-if r.isErr:
-  echo r.error.errorMessage()
+let roots = nxpAttestationTrustAnchors()
+let intermediates = nxpAttestationIntermediates()
 ```
 
 関連API:
 
-- `isOk(r)`
-- `isErr(r)`
-- `errorMessage(e)`
+- `nxpAttestationRootDer()`
+- `nxpAttestationIntermediateDer()`
+- `nxpAttestationTrustAnchors()`
+- `nxpAttestationIntermediates()`
 
-## 推奨レイヤ構成
+DERは`src/se050_nim/certs/`から`staticRead()`で組み込みます。
 
-責務境界は次のように分けます。
+## Attestation signature / semantics
+
+```nim
+let signature = verifyAttestationSignature(attested, cert)
+let semantics = verifyKittingAttestationSemantics(
+  attested,
+  testKittingProfile()
+)
+```
+
+`verifyKittingAttestationSemantics()`はsigned fieldについて次を確認します。
+
+- configured Object ID
+- Attestation key ID `0xF0000012`
+- ECDSA/SHA-256 algorithm
+- 完全な65-byte P-256公開鍵
+- SE050 UID、timestamp、private key size
+- P-256 key-pair type
+- internal origin
+- owner/auth object
+- exactly one Policyとexpected header
+
+証明書chainと署名検証を先に成功させてからsemanticsを信頼してください。
+
+## Board identity / Profile
+
+```nim
+let serial = readBoardSerialNumber()
+let testProfile = testKittingProfile()
+let productionProfile = productionKittingProfile()
+```
+
+主なAPI:
+
+- `parseBoardSerialNumber()`
+- `readBoardSerialNumber()`
+- `kittingProfile()` / `kittingProfileForName()` / `kittingProfileForObjectId()`
+- `keyPolicy()` / `expectedKeyType()` / `isDeletable()`
+
+Board serial default pathは`/proc/device-tree/board/serialno`です。
+
+## Kitting record / freshness
+
+```nim
+let freshness = deriveKittingFreshness(
+  serialNumber,
+  createdAt,
+  testProfile,
+  nonce
+)
+```
+
+主なAPI:
+
+- `validateKittingTimestamp()`
+- `deriveKittingFreshness()`
+- `createKittingRecord()`
+- `encodeAttestationContainer()` / `decodeAttestationContainer()`
+- `restoreKittingAttestation()`
+
+`KittingRecord`はserial、format version、profile、UTC時刻、key role、SE050 UID、Object ID、nonce、公開鍵、個体証明書、Attestation containerを保持します。
+
+## CSV
+
+```nim
+let text = encodeKittingCsv(records)
+let records = decodeKittingCsv(text)
+let one = findKittingRecord(
+  records.value,
+  serialNumber,
+  kpTest
+)
+```
+
+API:
+
+- `encodeKittingCsv()`
+- `decodeKittingCsv()`
+- `findKittingRecord()`
+- `KittingCsvHeader`
+
+Binary fieldはstrict Base64です。Record selectionはserial/profile/key roleでexactly oneを要求します。
+
+## Offline verification
+
+```nim
+let verified = verifyKittingCsvRecord(
+  csvText = csvText,
+  serialNumber = "11900000015",
+  profileKind = kpTest,
+  trustAnchorsDer = nxpAttestationTrustAnchors(),
+  intermediatesDer = nxpAttestationIntermediates()
+)
+```
+
+API:
+
+- `verifyKittingRecord()`
+- `verifyKittingCsvRecord()`
+- `VerifiedKittingRecord`
+
+これはI2Cへアクセスせず、record復元、freshness、証明書chain、Attestation署名、signed semanticsを検証します。将来のPC importer/DB登録処理から再利用できます。
+
+## Local-device verification
+
+```nim
+let local = verifyLocalKittingIdentity(
+  verified = verified.value,
+  boardSerialNumber = serial,
+  liveSe050Uid = uid,
+  liveObjectType = objectType,
+  liveTransientIndicator = persistence,
+  livePublicKey = publicKey
+)
+```
+
+オフライン検証済みrecordを、現在の基板serial、SE050 UID、P-256 object type、persistent属性、公開鍵と比較します。I2C read自体はCLI/呼び出し側で行い、このAPIはpure comparisonとしてunit test可能です。
+
+## Exporter merge helper
+
+- `sameKittingRecordKey()`
+- `sameKittingDeviceKey()`
+- `mergeKittingRecord()`
+
+論理キー`serial + profile + role`が同じでUID/Object ID/public keyが異なるrecordは競合として拒否します。
+
+## 推奨layering
 
 ```text
 se050_nim:
-  SE050 primitive 操作
+  SE050 primitive + Attestation + reusable kitting verification
 
 se050ctl:
-  開発・診断CLI
+  development/diagnostic CLI + local kitting verification
 
-se050-provision / se050-kitting:
-  production object作成とpolicy設定
+se050-kitting-export:
+  current test factory exporter
+
+future production kitting:
+  irreversible customer-range key creation
 
 fwkeys / fw-envelope:
-  P-256 ECDH + HKDF + AES-GCM envelope処理
+  P-256 ECDH + HKDF + AES-GCM envelope
 
 fw-update:
-  ファームウェア検証、復号、適用、A/B切替
+  firmware verification, decryption, A/B update
 ```
