@@ -22,6 +22,7 @@ const
   TagPolicy = 0x11'u8
   Tag1 = 0x41'u8
   Tag2 = 0x42'u8
+  Tag3 = 0x43'u8
   Tag7 = 0x47'u8
 
   # SE05x WriteECKey APDU for generating an EC key pair inside SE050.
@@ -65,6 +66,7 @@ const
   # access-rule bits directly. Explicitly adding ALLOW_KA is required for
   # ECDHGenerateSharedSecret; otherwise the applet may return SW=0x6985
   # (conditions not satisfied) for derive operations.
+  PolicyObjAllowSign = 0x10000000'u32
   PolicyObjAllowKa = 0x04000000'u32
   PolicyObjAllowRead = 0x00200000'u32
   PolicyObjAllowWrite = 0x00100000'u32
@@ -102,6 +104,28 @@ const
   EcdhInsCrypto = 0x03'u8
   EcdhP1Ec = 0x01'u8
   EcdhP2Dh = 0x0F'u8
+
+  # SE05x ECDSASign APDU for a host-computed SHA-256 digest.
+  #
+  # NXP Plug & Trust names this command:
+  #   CLA = 0x80
+  #   INS = INS_CRYPTO   = 0x03
+  #   P1  = P1_SIGNATURE = 0x0C
+  #   P2  = P2_SIGN      = 0x09
+  #
+  # Command data:
+  #   TAG_1: 4-byte identifier of the EC key pair or private key
+  #   TAG_2: SIG_ECDSA_SHA_256 = 0x21
+  #   TAG_3: 32-byte SHA-256 digest computed by the host
+  #
+  # Response data:
+  #   TAG_1: ECDSA signature encoded as ASN.1 DER
+  EcdsaSignCla = 0x80'u8
+  EcdsaSignInsCrypto = 0x03'u8
+  EcdsaSignP1Signature = 0x0C'u8
+  EcdsaSignP2Sign = 0x09'u8
+  Se050EcSignatureSha256* = 0x21'u8
+  EcdsaSha256DigestLength* = 32
 
   # On-chip asymmetric key generation can take longer than normal object
   # inspection/random commands. During that time the T=1 over I2C layer may see
@@ -197,6 +221,25 @@ proc developmentEcKeyPolicy*(): EcKeyPolicy =
   result = EcKeyPolicy(
     header:
       PolicyObjAllowKa or
+      PolicyObjAllowRead or
+      PolicyObjAllowWrite or
+      PolicyObjAllowGen or
+      PolicyObjAllowDelete
+  )
+
+proc developmentSigningEcKeyPolicy*(): EcKeyPolicy =
+  ## Returns a disposable development policy for EC signing-key experiments.
+  ##
+  ## This policy deliberately stays separate from developmentEcKeyPolicy() so
+  ## existing ECDH development keys do not gain signing permission implicitly.
+  ## It allows ECDSA signing, public-key read, overwrite/regeneration, and
+  ## deletion. Key agreement is intentionally not enabled.
+  ##
+  ## Product TLS identity policies are defined by a higher layer and should use
+  ## the minimum permissions required for their lifecycle.
+  result = EcKeyPolicy(
+    header:
+      PolicyObjAllowSign or
       PolicyObjAllowRead or
       PolicyObjAllowWrite or
       PolicyObjAllowGen or
@@ -335,6 +378,46 @@ proc buildGenerateEcKeyPairApdu(
   ]
   for b in payload:
     result.value.add(b)
+  result.ok = true
+
+proc buildEcdsaSignApdu*(
+    objectId: uint32,
+    digest: openArray[uint8]
+): SE[seq[uint8]] =
+  ## Builds an SE05x ECDSASign APDU for a host-computed SHA-256 digest.
+  ##
+  ## AN12413 requires TLV[TAG_3] to contain the digest rather than the original
+  ## message and requires the input length to match the selected signature
+  ## algorithm. The response is requested as ASN.1 DER in TLV[TAG_1].
+  if digest.len != EcdsaSha256DigestLength:
+    return fail[seq[uint8]](
+      seInvalidArgument,
+      "ECDSA/SHA-256 digest must be exactly 32 bytes"
+    )
+
+  var payload: seq[uint8] = @[]
+  payload.appendTlvU32(Tag1, objectId)
+  payload.appendTlvU8(Tag2, Se050EcSignatureSha256)
+  payload.appendTlvBytes(Tag3, digest)
+
+  if payload.len > 255:
+    return fail[seq[uint8]](
+      seApduTooLarge,
+      "ECDSASign payload is too large for a short APDU"
+    )
+
+  result.value = @[
+    EcdsaSignCla,
+    EcdsaSignInsCrypto,
+    EcdsaSignP1Signature,
+    EcdsaSignP2Sign,
+    uint8(payload.len)
+  ]
+  for b in payload:
+    result.value.add(b)
+
+  # Le: request the ASN.1 DER ECDSA signature in TLV[TAG_1].
+  result.value.add(0x00'u8)
   result.ok = true
 
 proc buildEcdhSharedSecretApdu(
@@ -508,6 +591,46 @@ proc readPublicKey*(
     objectId = objectId,
     selectFirst = selectFirst
   )
+
+proc signDigest*(
+    se: Se050Transport,
+    objectId: uint32,
+    digest: openArray[uint8],
+    selectFirst: bool = true
+): SE[seq[uint8]] =
+  ## Signs a host-computed SHA-256 digest with an SE050 EC key pair/private key.
+  ##
+  ## The digest must be exactly 32 bytes. The key object must allow
+  ## POLICY_OBJ_ALLOW_SIGN. The returned signature is the ASN.1 DER ECDSA
+  ## signature supplied by the SE050 in TLV[TAG_1].
+  if selectFirst:
+    let selected = se.selectApplet()
+    if not selected.ok:
+      return fail[seq[uint8]](
+        selected.error.kind,
+        selected.error.message,
+        selected.error.sw
+      )
+
+  let apdu = buildEcdsaSignApdu(objectId, digest)
+  if not apdu.ok:
+    return fail[seq[uint8]](apdu.error.kind, apdu.error.message, apdu.error.sw)
+
+  let oldMaxRetries = se.maxRetries
+  if se.maxRetries < CryptoOperationMaxReadRetries:
+    se.maxRetries = CryptoOperationMaxReadRetries
+
+  let response = se.transceiveApdu(apdu.value)
+  se.maxRetries = oldMaxRetries
+
+  if not response.ok:
+    return fail[seq[uint8]](
+      response.error.kind,
+      response.error.message,
+      response.error.sw
+    )
+
+  result = parseTag1Value(response.value, "ECDSASign")
 
 proc deriveSharedSecret*(
     se: Se050Transport,
