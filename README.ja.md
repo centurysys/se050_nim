@@ -2,7 +2,7 @@
 
 NXP SE050 セキュアエレメントを T=1 over I2C で扱うための軽量な Nim ライブラリ、診断用CLI、およびAttestation付きキッティングCSV生成ツールです。
 
-NXP Plug & Trust Middlewareには依存せず、組み込みLinux製品から必要なSE050操作を直接実行します。現在は、低レベルprimitiveに加えて、NXP Attestation証明書の検証、キッティングrecord/CSV、オフライン検証、実機照合までを提供します。Firmware envelopeの形式、HKDF/AES-GCM処理、ファームウェア更新処理は上位プロジェクトの責務です。
+NXP Plug & Trust Middlewareには依存せず、組み込みLinux製品から必要なSE050操作を直接実行します。現在は、低レベルprimitiveに加えて、NXP Attestation証明書の検証、キッティングrecord/CSV、オフライン検証、実機照合、およびX.509/mTLS向けTLS client identity管理までを提供します。実際のOpenSSL/TLS連携にはNXP公式`se05x-openssl-provider`を使用します。Firmware envelopeの形式、HKDF/AES-GCM処理、ファームウェア更新処理は上位プロジェクトの責務です。
 
 ## 現在の状態
 
@@ -21,6 +21,13 @@ NXP Plug & Trust Middlewareには依存せず、組み込みLinux製品から必
 - Attestation付き複数機器CSVの生成、追記、再実行
 - CSVのオフライン暗号学的検証
 - CSVとローカル基板serial、SE050 UID、公開鍵の実機照合
+- P-256 ECDSA/SHA-256署名
+- TLS client identityの`identity N + A/B slot`管理
+- TLS identity鍵の`origin = internal`、Policy、公開鍵のAttestation検証
+- NXP OpenSSL Provider 1.1.5から`nxp:0x...`で既存SE050鍵を直接参照
+- SE050鍵によるPKCS#10 CSR生成とCSR自己署名検証
+- CSR内公開鍵とSE050公開鍵のbyte-for-byte一致確認
+- OpenSSL 3.5.6 + NXP Provider 1.1.5でTLS 1.2 / TLS 1.3 mTLS client authentication
 
 Production用`0x20000100`の生成経路も実装済みですが、不可逆な実機試験はまだ完了していません。
 
@@ -31,6 +38,63 @@ P-256 ECDH + HKDF-SHA256 + AES-256-GCM
 ```
 
 X25519は、確認したApplet 7.2.0経路では鍵生成と公開鍵exportは成功しましたが、`ECDHGenerateSharedSecret`が一貫して`SW=0x6985`で失敗しました。そのため、現在の製品経路ではP-256を使用します。
+
+## TLS client identity
+
+TLS client identityはCloud固有名を持たず、汎用のP-256 client signing keyとして管理します。各identityはA/Bの2 slotを持ち、証明書・鍵rotationに使用できます。
+
+```text
+identity 0: slot A / slot B
+identity 1: slot A / slot B
+identity 2: slot A / slot B
+...
+```
+
+Object IDは次の規則で固定します。
+
+```text
+test:       0x30000200 + identity * 2 + slotOffset
+production: 0x20000200 + identity * 2 + slotOffset
+slotOffset: A=0, B=1
+```
+
+TLS鍵Policyは`SIGN + READ + DELETE` (`0x10240000`)です。秘密鍵はSE050内部で生成し、filesystemやCloudへexportしません。既存Objectのtype、origin、Policy、公開鍵はNXP Attestationで検証し、不整合時に自動削除・再生成は行いません。
+
+主なCLI例:
+
+```sh
+se050ctl tls-keygen \
+  -b 0 \
+  --profile test \
+  --identity 0 \
+  --slot A
+
+se050ctl tls-key-info \
+  -b 0 \
+  --profile test \
+  --identity 0 \
+  --slot A
+
+se050ctl tls-key-ref \
+  --profile test \
+  --identity 0 \
+  --slot A
+```
+
+`tls-key-ref`はNXP OpenSSL Providerから直接参照できる`nxp:0x30000200`形式のURIを返します。
+
+実機では、SE050内部鍵をNXP OpenSSL Provider経由でOpenSSL 3から使用し、ECDSA署名、PKCS#10 CSR生成、CSR検証、TLS 1.2 / TLS 1.3の相互TLS client authenticationまで確認済みです。ローカルmTLS試験ではclient certificateなしの接続が拒否されることも確認しています。
+
+AWS IoT Core / Azure IoT Hubについては、現行の公式X.509/mTLS仕様と今回のSE050構成を照合し、接続・provisioning手順を文書化済みです。実AWS/Azureアカウントを使用したCloud接続試験はこのrepositoryでは未実施です。
+
+Host OSはtrusted environmentとして扱い、SE050とのdirect I2C通信にはPlain sessionを使用します。主目的はTLS private keyのnon-exportabilityであり、Host OS侵害後のSE050不正利用防止はこの設計のsecurity boundaryには含めません。
+
+詳細:
+
+- [`docs/openssl-provider.ja.md`](docs/openssl-provider.ja.md): NXP OpenSSL Provider連携
+- [`docs/local-mtls-test.ja.md`](docs/local-mtls-test.ja.md): ローカルmTLS統合試験
+- [`docs/aws-iot.ja.md`](docs/aws-iot.ja.md): AWS IoT Core接続手順
+- [`docs/azure-iot.ja.md`](docs/azure-iot.ja.md): Azure IoT Hub接続手順
 
 ## 生成されるコマンド
 
@@ -101,6 +165,10 @@ random              乱数生成
 version             Applet version/config確認
 exists/info/list    Secure Object確認
 keygen/pubkey       開発用EC鍵生成・公開鍵読出し
+tls-keygen           TLS client identity鍵生成・既存鍵検証
+tls-key-info          TLS client identity鍵のAttestation付き情報表示
+tls-key-ref           NXP OpenSSL Provider用`nxp:0x...` URI生成
+tls-key-pubkey        TLS identity公開鍵のraw/SPKI DER出力
 derive              P-256 ECDH
 attestation-cert    NXP個体証明書のDER出力
 attest-read         ReadObject-with-Attestationの診断取得
@@ -141,6 +209,8 @@ P-256公開鍵は65 bytesの非圧縮point、ECDH shared secretは32 bytesです
 | 用途 | Object ID | Policy header | 状態 |
 |---|---:|---:|---|
 | 汎用development鍵 | dev range | `0x043C0000` | `se050ctl keygen`で作成可能 |
+| TLS identity test | `0x30000200 + identity * 2 + slotOffset` | `0x10240000` | identity 0/1で実機確認済み |
+| TLS identity production | `0x20000200 + identity * 2 + slotOffset` | `0x10240000` | CLI/Policy実装済み。実Cloud接続未実施 |
 | test firmware KEX | `0x30000100` | `0x04240000` | Exporterで実装・実機確認済み |
 | production firmware KEX | `0x20000100` | `0x04200000` | Exporter実装済み。不可逆実機試験待ち |
 | NXP Attestation key | `0xF0000012` | NXP provisioned | 読出し・検証で使用 |
@@ -161,6 +231,9 @@ P-256公開鍵は65 bytesの非圧縮point、ECDH shared secretは32 bytesです
 - 基板serial、キッティングprofile/record/CSV
 - オフラインキッティング検証
 - ローカル実機照合
+- TLS identity profile / A/B slot / identity番号管理
+- TLS identity Attestation semantic検証
+- NXP OpenSSL Provider用Object URIとP-256 SPKI DER変換
 - Exporter用CSV merge helper
 
 Firmware envelope format、HKDF、AES-GCM、release CEK、ファームウェア署名検証、A/B更新はこのライブラリの範囲外です。
@@ -191,6 +264,8 @@ src/se050_nim/certs/nxp-attestation-ecc-intermediate.der
 
 Attestation検証を実行するtargetにはOpenSSL 3の`libcrypto.so.3`が必要です。C headerやdevelopment symlinkは不要で、実行時に動的loadします。
 
+TLS client identityをOpenSSL/TLSから利用する場合は、別途NXP公式`se05x-openssl-provider`の`libsssProvider.so`が必要です。`se050_nim`自体はNXP Plug & Trust Middlewareへ依存せず、ProviderはTLS runtime連携の境界としてのみ使用します。
+
 ## Documentation
 
 - [`docs/se050ctl-guide.ja.md`](docs/se050ctl-guide.ja.md): CLI
@@ -198,6 +273,10 @@ Attestation検証を実行するtargetにはOpenSSL 3の`libcrypto.so.3`が必�
 - [`docs/kitting-guide.ja.md`](docs/kitting-guide.ja.md): Attestation付きキッティング
 - [`docs/object-ranges.ja.md`](docs/object-ranges.ja.md): Object ID/Policy
 - [`docs/p256-ecdh.ja.md`](docs/p256-ecdh.ja.md): Envelope向けP-256 ECDH
+- [`docs/openssl-provider.ja.md`](docs/openssl-provider.ja.md): NXP OpenSSL Provider連携
+- [`docs/local-mtls-test.ja.md`](docs/local-mtls-test.ja.md): ローカルTLS 1.2/1.3 mTLS統合試験
+- [`docs/aws-iot.ja.md`](docs/aws-iot.ja.md): AWS IoT Core provisioning / 接続
+- [`docs/azure-iot.ja.md`](docs/azure-iot.ja.md): Azure IoT Hub provisioning / 接続
 
 ## License
 

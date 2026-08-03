@@ -2,7 +2,7 @@
 
 A lightweight Nim library, diagnostic CLI, and Attestation-backed kitting CSV exporter for NXP SE050 secure elements over T=1 over I2C.
 
-The project avoids the NXP Plug & Trust Middleware and talks to the SE050 directly from embedded Linux. It now provides not only low-level primitives, but also NXP attestation certificate validation, kitting records and CSV handling, offline verification, and live-device matching. Firmware-envelope formats, HKDF/AES-GCM processing, and firmware update logic belong to higher-level projects.
+The project avoids the NXP Plug & Trust Middleware and talks to the SE050 directly from embedded Linux. It now provides not only low-level primitives, but also NXP attestation certificate validation, kitting records and CSV handling, offline verification, live-device matching, and X.509/mTLS TLS client identity management. Actual OpenSSL/TLS integration uses the official NXP `se05x-openssl-provider`. Firmware-envelope formats, HKDF/AES-GCM processing, and firmware update logic belong to higher-level projects.
 
 ## Current status
 
@@ -21,6 +21,13 @@ The main paths verified with SE050 Applet 7.2.x devices include:
 - generation, append, and idempotent reuse of a multi-device attested CSV
 - offline cryptographic verification of CSV records
 - live comparison with the board serial, SE050 UID, object type, persistence, and public key
+- P-256 ECDSA/SHA-256 signing
+- TLS client identities managed as `identity N + A/B slot`
+- attested validation of TLS identity origin, policy, and public key
+- direct use of existing SE050 keys through NXP OpenSSL Provider 1.1.5 `nxp:0x...` URIs
+- PKCS#10 CSR generation with the SE050 private key and CSR self-signature verification
+- byte-for-byte comparison of the CSR public key with the SE050 public key
+- TLS 1.2 and TLS 1.3 mutual-TLS client authentication with OpenSSL 3.5.6 and NXP Provider 1.1.5
 
 The production creation path for `0x20000100` is implemented, but its irreversible hardware test is still pending.
 
@@ -31,6 +38,63 @@ P-256 ECDH + HKDF-SHA256 + AES-256-GCM
 ```
 
 X25519 key generation and public-key export worked on the tested Applet 7.2.0 path, but `ECDHGenerateSharedSecret` consistently returned `SW=0x6985`. P-256 therefore remains the supported product path.
+
+## TLS client identity
+
+TLS client identities are cloud-neutral P-256 client-signing keys. Each identity has A/B slots so certificates and keys can be rotated independently for multiple services.
+
+```text
+identity 0: slot A / slot B
+identity 1: slot A / slot B
+identity 2: slot A / slot B
+...
+```
+
+Object IDs follow a fixed mapping:
+
+```text
+test:       0x30000200 + identity * 2 + slotOffset
+production: 0x20000200 + identity * 2 + slotOffset
+slotOffset: A=0, B=1
+```
+
+The TLS key policy is `SIGN + READ + DELETE` (`0x10240000`). Private keys are generated inside the SE050 and are never exported to the filesystem or cloud. Existing objects are accepted only after NXP Attestation validates the type, internal origin, policy, and public key; mismatched objects are not automatically deleted or replaced.
+
+Typical CLI usage:
+
+```sh
+se050ctl tls-keygen \
+  -b 0 \
+  --profile test \
+  --identity 0 \
+  --slot A
+
+se050ctl tls-key-info \
+  -b 0 \
+  --profile test \
+  --identity 0 \
+  --slot A
+
+se050ctl tls-key-ref \
+  --profile test \
+  --identity 0 \
+  --slot A
+```
+
+`tls-key-ref` returns an NXP Provider URI such as `nxp:0x30000200`.
+
+Hardware testing has verified ECDSA signing, PKCS#10 CSR generation and verification, and TLS 1.2 / TLS 1.3 mutual-TLS client authentication through the NXP OpenSSL Provider using an SE050-resident private key. The local mTLS test also verifies that a connection without a client certificate is rejected.
+
+AWS IoT Core and Azure IoT Hub have been checked against their current official X.509/mTLS requirements, and provisioning/connection procedures are documented. This repository has not yet performed a live connection using actual AWS or Azure accounts.
+
+The Host OS is treated as a trusted environment and direct I2C uses a Plain session. The design goal is TLS private-key non-exportability; preventing SE050 misuse after Host OS compromise is outside this security boundary.
+
+Details:
+
+- [`docs/openssl-provider.md`](docs/openssl-provider.md): NXP OpenSSL Provider integration
+- [`docs/local-mtls-test.md`](docs/local-mtls-test.md): local mTLS integration test
+- [`docs/aws-iot.md`](docs/aws-iot.md): AWS IoT Core provisioning and connection
+- [`docs/azure-iot.md`](docs/azure-iot.md): Azure IoT Hub provisioning and connection
 
 ## Built commands
 
@@ -101,6 +165,10 @@ random              Generate random bytes
 version             Inspect Applet version/config
 exists/info/list    Inspect Secure Objects
 keygen/pubkey       Create development EC keys and read public keys
+tls-keygen           Create or validate a TLS client identity key
+tls-key-info          Show an Attestation-validated TLS identity
+tls-key-ref           Generate an NXP Provider `nxp:0x...` URI
+tls-key-pubkey        Export raw/SPKI DER TLS identity public keys
 derive              Perform P-256 ECDH
 attestation-cert    Export the NXP device certificate as DER
 attest-read         Diagnostic ReadObject-with-Attestation capture
@@ -141,6 +209,8 @@ P-256 public keys are 65-byte uncompressed points, and ECDH shared secrets are 3
 | Purpose | Object ID | Policy header | Status |
 |---|---:|---:|---|
 | Generic development key | development range | `0x043C0000` | Created by `se050ctl keygen` |
+| TLS identity test | `0x30000200 + identity * 2 + slotOffset` | `0x10240000` | Hardware-tested with identities 0 and 1 |
+| TLS identity production | `0x20000200 + identity * 2 + slotOffset` | `0x10240000` | CLI/policy implemented; live cloud connection not tested |
 | Test firmware KEX | `0x30000100` | `0x04240000` | Implemented and tested |
 | Production firmware KEX | `0x20000100` | `0x04200000` | Exporter implemented; irreversible device test pending |
 | NXP attestation key | `0xF0000012` | NXP provisioned | Used for verification |
@@ -161,6 +231,9 @@ See [`docs/object-ranges.md`](docs/object-ranges.md).
 - board identity, kitting profiles, records, and CSV handling
 - offline kitting verification
 - local-device identity verification
+- TLS identity profiles, identity numbering, and A/B slots
+- TLS identity Attestation semantic validation
+- NXP OpenSSL Provider Object URIs and P-256 SPKI DER conversion
 - exporter CSV merge helpers
 
 Firmware-envelope formats, HKDF, AES-GCM, release CEK handling, firmware signatures, and A/B updates remain out of scope.
@@ -191,6 +264,8 @@ src/se050_nim/certs/nxp-attestation-ecc-intermediate.der
 
 Targets that execute attestation verification must provide OpenSSL 3 `libcrypto.so.3`. OpenSSL headers and a development symlink are not required because the library is loaded dynamically at runtime.
 
+Using TLS client identities from OpenSSL/TLS additionally requires the official NXP `se05x-openssl-provider` `libsssProvider.so`. `se050_nim` itself remains independent of the NXP Plug & Trust Middleware; the provider is used only as the TLS runtime integration boundary.
+
 ## Documentation
 
 - [`docs/se050ctl-guide.md`](docs/se050ctl-guide.md): CLI
@@ -198,6 +273,10 @@ Targets that execute attestation verification must provide OpenSSL 3 `libcrypto.
 - [`docs/kitting-guide.md`](docs/kitting-guide.md): Attestation-backed kitting
 - [`docs/object-ranges.md`](docs/object-ranges.md): Object IDs and policies
 - [`docs/p256-ecdh.md`](docs/p256-ecdh.md): P-256 ECDH for envelopes
+- [`docs/openssl-provider.md`](docs/openssl-provider.md): NXP OpenSSL Provider integration
+- [`docs/local-mtls-test.md`](docs/local-mtls-test.md): local TLS 1.2/1.3 mTLS integration test
+- [`docs/aws-iot.md`](docs/aws-iot.md): AWS IoT Core provisioning and connection
+- [`docs/azure-iot.md`](docs/azure-iot.md): Azure IoT Hub provisioning and connection
 
 ## License
 
