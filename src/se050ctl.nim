@@ -701,6 +701,16 @@ proc printTlsIdentityInfo(info: TlsIdentityLiveInfo, created: Option[bool]) =
   echo "  attestation certificate chain: verified"
   echo "  attestation signature: verified"
 
+proc runTlsKeyRef(
+    profileText: string,
+    identityText: string,
+    slotText: string
+): int =
+  ## Prints only the NXP OpenSSL Provider URI for shell/script consumption.
+  let profile = parseTlsIdentityProfile(profileText, identityText, slotText)
+  echo profile.opensslProviderKeyUri()
+  result = 0
+
 proc runTlsKeygen(
     busText: string,
     addressText: string,
@@ -1589,6 +1599,18 @@ proc main(): int =
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
         quit(runVersion(opts.bus, opts.address, opts.debug))
+
+    command("tls-key-ref"):
+      help("Print the NXP OpenSSL Provider URI for one TLS identity slot.")
+      option("--profile", required = true, help = "TLS identity profile: test or production")
+      option("--identity", default = some("0"), help = "TLS identity number, default: 0")
+      option("--slot", required = true, help = "TLS identity slot: A or B")
+      run:
+        quit(runTlsKeyRef(
+          opts.profile,
+          opts.identity,
+          opts.slot
+        ))
 
     command("tls-keygen"):
       help("Create or validate one fixed SE050 TLS client identity A/B key.")

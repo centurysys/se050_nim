@@ -10,6 +10,7 @@ import se050_nim/[
   management,
   kitting_profile,
   tls_identity_profile,
+  tls_identity_openssl,
   tls_identity_attestation_verify,
   kitting_object_guard,
   attestation_cert,
@@ -28,4 +29,4 @@ import se050_nim/[
   kitting_local_verify,
   kitting_export
 ]
-export errors, transport, apdu, tlv, uid, random, objects, keys, management, kitting_profile, tls_identity_profile, tls_identity_attestation_verify, kitting_object_guard, attestation_cert, attestation, crypto_verify, x509_verify, trust_store, attestation_verify, attestation_attributes, kitting_attestation_verify, binary_encoding, board_identity, kitting_record, kitting_csv, kitting_verify, kitting_local_verify, kitting_export
+export errors, transport, apdu, tlv, uid, random, objects, keys, management, kitting_profile, tls_identity_profile, tls_identity_openssl, tls_identity_attestation_verify, kitting_object_guard, attestation_cert, attestation, crypto_verify, x509_verify, trust_store, attestation_verify, attestation_attributes, kitting_attestation_verify, binary_encoding, board_identity, kitting_record, kitting_csv, kitting_verify, kitting_local_verify, kitting_export

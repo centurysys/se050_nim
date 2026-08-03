@@ -110,6 +110,26 @@ identity 1 B  0x30000203
 
 Policyは全slot共通で`SIGN + READ + DELETE` (`0x10240000`)です。既存Objectは自動削除・上書きしません。
 
+### `tls-key-ref`
+
+NXP公式 `se05x-openssl-provider` が既存SE050鍵を参照するためのURIを表示します。SE050へアクセスしないため、`-b`は不要です。
+
+```sh
+se050ctl tls-key-ref --profile test --identity 0 --slot A
+# nxp:0x30000200
+
+se050ctl tls-key-ref --profile production --identity 1 --slot B
+# nxp:0x20000203
+```
+
+この出力はOpenSSL 3の `-key` / `-inkey` へそのまま渡せます。
+
+```sh
+KEY_URI=$(se050ctl tls-key-ref --profile test --identity 0 --slot A)
+openssl pkeyutl --provider /usr/local/lib/libsssProvider.so --provider default \
+  -inkey "$KEY_URI" -sign -rawin -in input.txt -out signature.der -digest sha256
+```
+
 ### `tls-keygen`
 
 ```sh

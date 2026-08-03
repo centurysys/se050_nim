@@ -70,6 +70,26 @@ production B  0x20000201
 
 All slots use `SIGN + READ + DELETE` policy `0x10240000`. Existing objects are never automatically deleted or overwritten.
 
+### `tls-key-ref`
+
+Prints the URI used by NXP `se05x-openssl-provider` to reference an existing SE050 key. This command does not access the SE050, so no `-b` option is required.
+
+```sh
+se050ctl tls-key-ref --profile test --identity 0 --slot A
+# nxp:0x30000200
+
+se050ctl tls-key-ref --profile production --identity 1 --slot B
+# nxp:0x20000203
+```
+
+The output can be passed directly to OpenSSL 3 `-key` / `-inkey` options.
+
+```sh
+KEY_URI=$(se050ctl tls-key-ref --profile test --identity 0 --slot A)
+openssl pkeyutl --provider /usr/local/lib/libsssProvider.so --provider default \
+  -inkey "$KEY_URI" -sign -rawin -in input.txt -out signature.der -digest sha256
+```
+
 ### `tls-keygen`
 
 ```sh
