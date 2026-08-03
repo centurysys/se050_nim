@@ -69,6 +69,12 @@ type
     objectId: uint32
     source: string
 
+  TlsIdentityLiveInfo = object
+    profile: TlsIdentityProfile
+    objectType: uint8
+    publicKey: seq[uint8]
+    semantics: TlsIdentityAttestationSemantics
+
 # =============================================================================
 # Utility
 # =============================================================================
@@ -399,6 +405,46 @@ proc parseCurveKind(s: string): EcCurveKind =
   else:
     raise newException(ValueError, &"unsupported curve for se050ctl keygen: {s}")
 
+proc parseTlsIdentityProfile(
+    profileText: string,
+    identityText: string,
+    slotText: string
+): TlsIdentityProfile =
+  let kind =
+    case profileText.strip().toLowerAscii()
+    of "test":
+      tipTest
+    of "production":
+      tipProduction
+    else:
+      raise newException(
+        ValueError,
+        &"TLS identity profile must be test or production: {profileText}"
+      )
+
+  let identity32 = parseIndex(identityText)
+  if identity32 > uint32(TlsIdentityMaxIdentity):
+    raise newException(
+      ValueError,
+      &"TLS identity index is out of range: {identityText} (max {TlsIdentityMaxIdentity})"
+    )
+
+  let slot =
+    case slotText.strip().toUpperAscii()
+    of "A":
+      tisSlotA
+    of "B":
+      tisSlotB
+    else:
+      raise newException(
+        ValueError,
+        &"TLS identity slot must be A or B: {slotText}"
+      )
+
+  result = tlsIdentityProfile(kind, uint16(identity32), slot)
+  if not result.isValid():
+    raise newException(ValueError, "resolved TLS identity profile is invalid")
+
 proc isReadableEcPublicObjectType(objectType: uint8): bool =
   ## Returns true for EC key-pair/public-key object types whose public key can
   ## be read using ReadObject.
@@ -503,6 +549,237 @@ proc openAndRequestAtr(busText: string, addressText: string, debug: bool): Se050
   if not atr.ok:
     printSe050Error("ATR failed", atr.error)
     quit(1)
+
+proc inspectTlsIdentity(
+    se: Se050Transport,
+    profile: TlsIdentityProfile
+): SE[TlsIdentityLiveInfo] =
+  ## Performs the trust checks required before accepting an existing TLS key.
+  ##
+  ## The object type and persistence come from the live ReadType response.
+  ## Object ID, key type, internal origin, policy, and public key are then
+  ## independently bound by NXP ReadObject-with-Attestation.
+  if not profile.isValid():
+    return fail[TlsIdentityLiveInfo](
+      seInvalidArgument,
+      "TLS identity profile is invalid"
+    )
+
+  let typ = se.readObjectType(
+    objectId = profile.keyObjectId,
+    selectFirst = false
+  )
+  if not typ.ok:
+    return fail[TlsIdentityLiveInfo](
+      typ.error.kind,
+      typ.error.message,
+      typ.error.sw
+    )
+
+  if typ.value.objectType != profile.expectedKeyType():
+    return fail[TlsIdentityLiveInfo](
+      seTlsIdentityValidationFailed,
+      &"live object type 0x{typ.value.objectType.toHex(2)} does not match expected P-256 key-pair type 0x{profile.expectedKeyType().toHex(2)}"
+    )
+
+  if typ.value.transientIndicator.isNone or
+      typ.value.transientIndicator.get() != 0x01'u8:
+    return fail[TlsIdentityLiveInfo](
+      seTlsIdentityValidationFailed,
+      "TLS identity object is not persistent"
+    )
+
+  let livePublicKey = se.readPublicKey(
+    objectId = profile.keyObjectId,
+    selectFirst = false
+  )
+  if not livePublicKey.ok:
+    return fail[TlsIdentityLiveInfo](
+      livePublicKey.error.kind,
+      livePublicKey.error.message,
+      livePublicKey.error.sw
+    )
+
+  let certificate = se.readAttestationCertificate(selectFirst = false)
+  if not certificate.ok:
+    return fail[TlsIdentityLiveInfo](
+      certificate.error.kind,
+      certificate.error.message,
+      certificate.error.sw
+    )
+
+  let chain = verifyCertificateChain(
+    leafCertificateDer = certificate.value,
+    trustAnchorsDer = nxpAttestationTrustAnchors(),
+    intermediatesDer = nxpAttestationIntermediates()
+  )
+  if not chain.ok:
+    return fail[TlsIdentityLiveInfo](
+      chain.error.kind,
+      chain.error.message,
+      chain.error.sw
+    )
+
+  let freshness = se.getRandomBytes(
+    TlsIdentityAttestationFreshnessLength,
+    selectFirst = false
+  )
+  if not freshness.ok:
+    return fail[TlsIdentityLiveInfo](
+      freshness.error.kind,
+      freshness.error.message,
+      freshness.error.sw
+    )
+
+  let attested = se.readObjectWithAttestation(
+    objectId = profile.keyObjectId,
+    freshness = freshness.value,
+    selectFirst = false
+  )
+  if not attested.ok:
+    return fail[TlsIdentityLiveInfo](
+      attested.error.kind,
+      attested.error.message,
+      attested.error.sw
+    )
+
+  let signature = verifyAttestationSignature(
+    attested = attested.value,
+    certificateDer = certificate.value
+  )
+  if not signature.ok:
+    return fail[TlsIdentityLiveInfo](
+      signature.error.kind,
+      signature.error.message,
+      signature.error.sw
+    )
+
+  let semantics = verifyTlsIdentityAttestationSemantics(
+    attested = attested.value,
+    profile = profile
+  )
+  if not semantics.ok:
+    return fail[TlsIdentityLiveInfo](
+      semantics.error.kind,
+      semantics.error.message,
+      semantics.error.sw
+    )
+
+  if livePublicKey.value != semantics.value.publicKey:
+    return fail[TlsIdentityLiveInfo](
+      seTlsIdentityValidationFailed,
+      "live public key does not match the attested public key"
+    )
+
+  result = ok(TlsIdentityLiveInfo(
+    profile: profile,
+    objectType: typ.value.objectType,
+    publicKey: livePublicKey.value,
+    semantics: semantics.value
+  ))
+
+proc printTlsIdentityInfo(info: TlsIdentityLiveInfo, created: Option[bool]) =
+  let profile = info.profile
+  let signedPolicy = info.semantics.attributes.policies[0]
+
+  echo "TLS client key"
+  echo &"  profile: {profile.name}"
+  echo &"  identity: {profile.identity}"
+  echo &"  slot: {profile.slot.slotName()}"
+  echo &"  object id: {objectIdHex(profile.keyObjectId)}"
+  echo &"  curve: {curveName(profile.curve)}"
+  if created.isSome:
+    let createdText = if created.get(): "yes" else: "no (reused)"
+    echo &"  created: {createdText}"
+  echo &"  type: {typeText(info.objectType)}"
+  echo "  persistence: persistent (live ReadType)"
+  echo &"  origin: {objectOriginName(info.semantics.attributes.origin)} (attested)"
+  echo "  policy: SIGN + READ + DELETE"
+  echo &"  policy header: 0x{signedPolicy.header.toHex(8)} (attested)"
+  echo &"  public key: {bytesToHex(info.publicKey)}"
+  echo "  public key match: live == attested"
+  echo "  attestation certificate chain: verified"
+  echo "  attestation signature: verified"
+
+proc runTlsKeygen(
+    busText: string,
+    addressText: string,
+    debug: bool,
+    profileText: string,
+    identityText: string,
+    slotText: string
+): int =
+  let profile = parseTlsIdentityProfile(profileText, identityText, slotText)
+  let se = openAndRequestAtr(busText, addressText, debug)
+
+  let exists = se.objectExists(
+    objectId = profile.keyObjectId,
+    selectFirst = true
+  )
+  if not exists.ok:
+    printSe050Error("CheckObjectExists failed", exists.error)
+    return 1
+
+  var created = false
+  if not exists.value:
+    let generated = se.generateP256KeyPair(
+      objectId = profile.keyObjectId,
+      policy = profile.keyPolicy(),
+      selectFirst = false
+    )
+    if not generated.ok:
+      printSe050Error("TLS key generation failed", generated.error)
+      return 1
+    created = true
+
+  let inspected = inspectTlsIdentity(se, profile)
+  if not inspected.ok:
+    if created:
+      stderr.writeLine(
+        &"TLS key was created at {objectIdHex(profile.keyObjectId)}, but post-generation validation failed. The object was left unchanged."
+      )
+    else:
+      stderr.writeLine(
+        &"tls-keygen refused to replace existing {objectIdHex(profile.keyObjectId)}; validation failed."
+      )
+    printSe050Error("TLS identity validation failed", inspected.error)
+    return 1
+
+  printTlsIdentityInfo(inspected.value, some(created))
+  result = 0
+
+proc runTlsKeyInfo(
+    busText: string,
+    addressText: string,
+    debug: bool,
+    profileText: string,
+    identityText: string,
+    slotText: string
+): int =
+  let profile = parseTlsIdentityProfile(profileText, identityText, slotText)
+  let se = openAndRequestAtr(busText, addressText, debug)
+
+  let exists = se.objectExists(
+    objectId = profile.keyObjectId,
+    selectFirst = true
+  )
+  if not exists.ok:
+    printSe050Error("CheckObjectExists failed", exists.error)
+    return 1
+
+  if not exists.value:
+    stderr.writeLine(
+      &"tls-key-info failed: {profile.name} slot {profile.slot.slotName()} ({objectIdHex(profile.keyObjectId)}) does not exist"
+    )
+    return 1
+
+  let inspected = inspectTlsIdentity(se, profile)
+  if not inspected.ok:
+    printSe050Error("TLS identity validation failed", inspected.error)
+    return 1
+
+  printTlsIdentityInfo(inspected.value, none(bool))
+  result = 0
 
 proc runUid(busText: string, addressText: string, debug: bool, separator: string): int =
   let se = openAndRequestAtr(busText, addressText, debug)
@@ -1312,6 +1589,42 @@ proc main(): int =
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
         quit(runVersion(opts.bus, opts.address, opts.debug))
+
+    command("tls-keygen"):
+      help("Create or validate one fixed SE050 TLS client identity A/B key.")
+      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
+      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("--profile", required = true, help = "TLS identity profile: test or production")
+      option("--identity", default = some("0"), help = "TLS identity number, default: 0")
+      option("--slot", required = true, help = "TLS identity slot: A or B")
+      flag("-d", "--debug", help = "Print T=1 over I2C frames")
+      run:
+        quit(runTlsKeygen(
+          opts.bus,
+          opts.address,
+          opts.debug,
+          opts.profile,
+          opts.identity,
+          opts.slot
+        ))
+
+    command("tls-key-info"):
+      help("Validate and show one fixed SE050 TLS client identity A/B key.")
+      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
+      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("--profile", required = true, help = "TLS identity profile: test or production")
+      option("--identity", default = some("0"), help = "TLS identity number, default: 0")
+      option("--slot", required = true, help = "TLS identity slot: A or B")
+      flag("-d", "--debug", help = "Print T=1 over I2C frames")
+      run:
+        quit(runTlsKeyInfo(
+          opts.bus,
+          opts.address,
+          opts.debug,
+          opts.profile,
+          opts.identity,
+          opts.slot
+        ))
 
     command("exists"):
       help("Check whether an SE050 Secure Object identifier exists.")

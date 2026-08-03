@@ -23,12 +23,11 @@
 | NXP device certificate | `0xF0000013` | BinaryFile / NXP | 事前搭載、X.509検証に使用 |
 | test firmware KEX | `0x30000100` | P-256 key pair / dev | Exporter実装・実機確認済み |
 | production firmware KEX | `0x20000100` | P-256 key pair / customer | 生成CLI・汎用変更ガード実装済み、不可逆実機試験待ち |
-| test TLS identity slot A | `0x30000200` | P-256 key pair / dev | profile / Policy定義済み |
-| test TLS identity slot B | `0x30000201` | P-256 key pair / dev | profile / Policy定義済み |
-| production TLS identity slot A | `0x20000200` | P-256 key pair / customer | profile / Policy定義済み |
-| production TLS identity slot B | `0x20000201` | P-256 key pair / customer | profile / Policy定義済み |
+| test TLS identity key0 A/B | `0x30000200..0x30000201` | P-256 key pair / dev | identity番号 + A/B slot、実機確認済み |
+| test TLS identity key1 A/B | `0x30000202..0x30000203` | P-256 key pair / dev | 複数identity mapping実機確認済み |
+| production TLS identity | `0x20000200..` | P-256 key pair / customer | identity番号 + A/B slot、生成はTLS専用CLIのみ |
 
-Firmware KEXはtest/productionとも下位16-bit indexを`0x0100`に揃えます。TLS client identityはslot A/Bを`0x0200`/`0x0201`に揃え、上位byteでtest/productionを見分けます。
+Firmware KEXはtest/productionとも下位16-bit indexを`0x0100`に揃えます。TLS client identityは`0x0200`をbaseとし、`identity * 2 + slotOffset`でObject IDを割り当てます。test/productionでは同じ下位16-bit indexを使い、Object areaでライフサイクルを分離します。
 
 ## Production firmware KEX IDの予約ガード
 
@@ -76,20 +75,36 @@ Firmware KEXはtest/productionとも下位16-bit indexを`0x0100`に揃えます
 
 `oneTimeDeviceKeyPolicy()`は現在`deviceEcKeyPolicy()`と同じ実効headerです。API名を分けることで、provisioning codeが不可逆な意図を明示し、将来Applet固有の属性を追加できるようにしています。
 
-TLS identityはcertificate/key rotationを前提とするため、productionでもDELETEを許可します。一方、既存鍵のsilent overwrite/regenerateを防ぐためWRITE/GENは許可しません。testとproductionで同じPolicy semanticsを使い、Object ID areaとA/B slotでライフサイクルを分離します。
+TLS identityはcertificate/key rotationを前提とするため、productionでもDELETEを許可します。一方、既存鍵のsilent overwrite/regenerateを防ぐためWRITE/GENは許可しません。testとproductionで同じPolicy semanticsを使い、Object ID area、identity番号、A/B slotでライフサイクルを分離します。
 
-## TLS client identity A/B profile
+## TLS client identity profile
 
-TLS client identityはCloud固有名を持たず、汎用のX.509/mTLS client signing keyとして次の4 objectを固定します。
+TLS client identityはCloud固有名を持たない汎用のX.509/mTLS client signing keyです。複数サービスで独立した鍵ペアを使えるよう、`identity`番号ごとにA/B slotを割り当てます。
 
-| Profile | Slot | Object ID | Policy |
-|---|:---:|---:|---:|
-| test | A | `0x30000200` | `0x10240000` |
-| test | B | `0x30000201` | `0x10240000` |
-| production | A | `0x20000200` | `0x10240000` |
-| production | B | `0x20000201` | `0x10240000` |
+Object IDは次式で決定します。
 
-Policyは`SIGN + READ + DELETE`です。秘密鍵はSE050内部生成とし、READは公開鍵取得に使用します。A/B方式で新しいslotへ鍵・証明書を準備して接続確認後に切り替え、旧slotを削除・再利用できる設計です。
+```text
+test:       0x30000200 + identity * 2 + slotOffset
+production: 0x20000200 + identity * 2 + slotOffset
+slotOffset: A=0, B=1
+```
+
+代表例:
+
+| Profile | Identity | Slot | Object ID | Policy |
+|---|---:|:---:|---:|---:|
+| test | 0 | A | `0x30000200` | `0x10240000` |
+| test | 0 | B | `0x30000201` | `0x10240000` |
+| test | 1 | A | `0x30000202` | `0x10240000` |
+| test | 1 | B | `0x30000203` | `0x10240000` |
+| production | 0 | A | `0x20000200` | `0x10240000` |
+| production | 0 | B | `0x20000201` | `0x10240000` |
+| production | 1 | A | `0x20000202` | `0x10240000` |
+| production | 1 | B | `0x20000203` | `0x10240000` |
+
+`identity 0`は従来のA/B Object IDと互換です。`identity 1`以降は別サービスや別接続先向けの独立したTLS client identityとして利用できます。
+
+Policyは全identity/slot共通で`SIGN + READ + DELETE`です。秘密鍵はSE050内部生成とし、READは公開鍵取得に使用します。各identityのA/B方式で新しいslotへ鍵・証明書を準備して接続確認後に切り替え、旧slotを削除・再利用できる設計です。
 
 AWS IoT Core / Azure IoT Hub固有のendpoint、device/Thing ID、CSR登録、certificate登録、MQTT parameterはこのprofileには含めません。
 
