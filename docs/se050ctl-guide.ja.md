@@ -1,6 +1,6 @@
 # se050ctlガイド
 
-`se050ctl`は`se050_nim`の開発・診断CLIです。SE050 primitive、Attestation診断、キッティングCSVとローカル実機の照合を提供します。Production鍵生成、firmware envelope、firmware updaterは扱いません。
+`se050ctl`は`se050_nim`の開発・診断CLIです。SE050 primitive、TLS client identity鍵、Attestation診断、キッティングCSVとローカル実機の照合を提供します。Firmware KEXのproduction鍵生成、firmware envelope、firmware updaterは扱いません。
 
 ## 対象範囲
 
@@ -9,6 +9,7 @@
 - UID、乱数、Applet version/config
 - Secure Objectのexists/info/list
 - dev rangeのEC鍵生成と削除
+- identity番号 + A/B slotで管理するTLS client identity鍵生成・検証（test/production）
 - 公開鍵export、P-256 ECDH derive
 - NXP個体証明書のDER export
 - ReadObject-with-Attestationのraw capture
@@ -17,7 +18,7 @@
 
 扱わないもの:
 
-- production one-time/no-delete鍵生成
+- firmware KEX用production one-time/no-delete鍵生成
 - customer/vendor objectの一般write/delete
 - PC専用CSV検証CLI
 - HKDF/AES-GCM envelope処理
@@ -87,6 +88,99 @@ type: 0x29 (EC_KEY_PAIR_NIST_P256)
 transient: 0x01 (persistent)
 size: 32
 ```
+
+## TLS client identity鍵
+
+TLS client identityは任意Object IDを指定せず、固定profile / identity / slotだけを操作します。
+
+```text
+test:       0x30000200 + identity * 2 + slotOffset
+production: 0x20000200 + identity * 2 + slotOffset
+slotOffset: A=0, B=1
+```
+
+例:
+
+```text
+identity 0 A  0x30000200
+identity 0 B  0x30000201
+identity 1 A  0x30000202
+identity 1 B  0x30000203
+```
+
+Policyは全slot共通で`SIGN + READ + DELETE` (`0x10240000`)です。既存Objectは自動削除・上書きしません。
+
+### `tls-key-ref`
+
+NXP公式 `se05x-openssl-provider` が既存SE050鍵を参照するためのURIを表示します。SE050へアクセスしないため、`-b`は不要です。
+
+```sh
+se050ctl tls-key-ref --profile test --identity 0 --slot A
+# nxp:0x30000200
+
+se050ctl tls-key-ref --profile production --identity 1 --slot B
+# nxp:0x20000203
+```
+
+この出力はOpenSSL 3の `-key` / `-inkey` へそのまま渡せます。
+
+```sh
+KEY_URI=$(se050ctl tls-key-ref --profile test --identity 0 --slot A)
+openssl pkeyutl --provider /usr/local/lib/libsssProvider.so --provider default \
+  -inkey "$KEY_URI" -sign -rawin -in input.txt -out signature.der -digest sha256
+```
+
+
+### `tls-key-pubkey`
+
+TLS identityをAttestation検証した後、公開鍵だけをファイルへ出力します。
+CSR内公開鍵との比較には`spki-der`を使用します。
+
+```sh
+se050ctl tls-key-pubkey \
+  -b 0 \
+  --profile test \
+  --identity 0 \
+  --slot A \
+  --format spki-der \
+  --out se050-public.der
+```
+
+`--format raw`ではSE050 ReadObjectの65-byte `0x04 || X || Y`をそのまま出力します。
+`spki-der`ではOpenSSL CSRの公開鍵と直接比較できるX.509 SubjectPublicKeyInfo DERを出力します。
+
+### `tls-keygen`
+
+```sh
+se050ctl tls-keygen -b 0 --profile test --identity 0 --slot A
+se050ctl tls-keygen -b 0 --profile production --identity 0 --slot A
+se050ctl tls-keygen -b 0 --profile production --identity 1 --slot B
+```
+
+対象slotが空ならSE050内部でP-256鍵を生成します。既存の場合は再生成せず、NXP Attestationを使って次を検証したうえで再利用します。
+
+- live Object typeがP-256 key pair
+- live ReadTypeでpersistent
+- NXP個体証明書chain
+- Attestation署名
+- signed Object ID/type
+- `origin = internal`
+- signed Policy `0x10240000`
+- live public keyとattested public keyの一致
+
+生成直後の検証が失敗した場合も自動削除は行いません。既存Objectの検証に失敗した場合も置換しません。
+
+### `tls-key-info`
+
+```sh
+se050ctl tls-key-info -b 0 --profile test --identity 0 --slot A
+se050ctl tls-key-info -b 0 --profile production --identity 0 --slot A
+se050ctl tls-key-info -b 0 --profile production --identity 1 --slot B
+```
+
+鍵を変更せず、`tls-keygen`と同じtrust/semantic検証を行ってprofile、identity、slot、Object ID、公開鍵、origin、Policyを表示します。`--identity`のdefaultは`0`です。
+
+汎用`keygen`/`delete`は従来どおりcustomer rangeを拒否します。Production TLS slotへ書き込める経路はTLS専用commandに限定します。
 
 ## 開発用EC鍵
 

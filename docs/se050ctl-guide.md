@@ -1,6 +1,6 @@
 # se050ctl Guide
 
-`se050ctl` is the development and diagnostic CLI for `se050_nim`. It provides SE050 primitives, attestation diagnostics, and local comparison of a kitting CSV with the current unit. It does not create production keys or process firmware envelopes.
+`se050ctl` is the development and diagnostic CLI for `se050_nim`. It provides SE050 primitives, TLS client identity keys, attestation diagnostics, and local comparison of a kitting CSV with the current unit. It does not create the production one-time firmware KEX key or process firmware envelopes.
 
 ## Scope
 
@@ -9,6 +9,7 @@ Included:
 - UID, random, and Applet version/config
 - Secure Object exists/info/list
 - development-range EC key creation and deletion
+- fixed A/B TLS client identity key creation and verification for test/production profiles
 - public-key export and P-256 ECDH derive
 - NXP device certificate DER export
 - raw ReadObject-with-Attestation capture
@@ -17,7 +18,7 @@ Included:
 
 Excluded:
 
-- production one-time/no-delete key creation
+- production one-time/no-delete firmware KEX key creation
 - general customer/vendor object writes and deletion
 - a PC-only CSV verification executable
 - HKDF/AES-GCM envelope processing
@@ -55,6 +56,81 @@ se050ctl list -b 0 --area dev --annotate
 ```
 
 Random length is 1..255 bytes. `exists --quiet` uses the exit status without printing.
+
+## TLS client identity keys
+
+TLS client identity commands do not accept arbitrary Object IDs. They operate only on fixed profile/slot mappings:
+
+```text
+test A        0x30000200
+test B        0x30000201
+production A  0x20000200
+production B  0x20000201
+```
+
+All slots use `SIGN + READ + DELETE` policy `0x10240000`. Existing objects are never automatically deleted or overwritten.
+
+### `tls-key-ref`
+
+Prints the URI used by NXP `se05x-openssl-provider` to reference an existing SE050 key. This command does not access the SE050, so no `-b` option is required.
+
+```sh
+se050ctl tls-key-ref --profile test --identity 0 --slot A
+# nxp:0x30000200
+
+se050ctl tls-key-ref --profile production --identity 1 --slot B
+# nxp:0x20000203
+```
+
+The output can be passed directly to OpenSSL 3 `-key` / `-inkey` options.
+
+```sh
+KEY_URI=$(se050ctl tls-key-ref --profile test --identity 0 --slot A)
+openssl pkeyutl --provider /usr/local/lib/libsssProvider.so --provider default \
+  -inkey "$KEY_URI" -sign -rawin -in input.txt -out signature.der -digest sha256
+```
+
+
+### `tls-key-pubkey`
+
+After attestation-validating the TLS identity, export only its public key to a
+file. Use `spki-der` when comparing against a CSR public key.
+
+```sh
+se050ctl tls-key-pubkey \
+  -b 0 \
+  --profile test \
+  --identity 0 \
+  --slot A \
+  --format spki-der \
+  --out se050-public.der
+```
+
+`--format raw` writes the 65-byte SE050 `0x04 || X || Y` point. `spki-der`
+writes X.509 SubjectPublicKeyInfo DER for direct comparison with OpenSSL CSR
+public-key output.
+
+### `tls-keygen`
+
+```sh
+se050ctl tls-keygen -b 0 --profile test --identity 0 --slot A
+se050ctl tls-keygen -b 0 --profile production --identity 0 --slot A
+se050ctl tls-keygen -b 0 --profile production --identity 1 --slot B
+```
+
+If the slot is empty, a P-256 key pair is generated inside the SE050. If it already exists, it is not regenerated. The command validates the live type/persistence, NXP device certificate chain, attestation signature, signed Object ID/type/internal origin/policy, and the match between live and attested public keys before accepting the object. A failed post-generation check never triggers automatic deletion.
+
+### `tls-key-info`
+
+```sh
+se050ctl tls-key-info -b 0 --profile test --identity 0 --slot A
+se050ctl tls-key-info -b 0 --profile production --identity 0 --slot A
+se050ctl tls-key-info -b 0 --profile production --identity 1 --slot B
+```
+
+This performs the same trust and semantic validation without changing the key, then prints its profile, slot, Object ID, public key, origin, and policy.
+
+Generic `keygen` and `delete` still reject the customer range. Production TLS slots are writable only through the dedicated TLS command.
 
 ## Development EC keys
 

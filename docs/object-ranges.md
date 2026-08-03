@@ -23,8 +23,11 @@ This document defines the Object IDs, access policies, and responsibility bounda
 | NXP device certificate | `0xF0000013` | BinaryFile / NXP | pre-provisioned, used for X.509 validation |
 | test firmware KEX | `0x30000100` | P-256 key pair / dev | exporter implemented and tested |
 | production firmware KEX | `0x20000100` | P-256 key pair / customer | creation CLI and generic mutation guard implemented; irreversible device test pending |
+| test TLS identity key0 A/B | `0x30000200..0x30000201` | P-256 key pair / dev | identity number + A/B slot, device-tested |
+| test TLS identity key1 A/B | `0x30000202..0x30000203` | P-256 key pair / dev | multi-identity mapping device-tested |
+| production TLS identities | `0x20000200..` | P-256 key pair / customer | identity number + A/B slot, creation through TLS-specific CLI only |
 
-Test and production use the same lower index `0x0100`, while the high byte makes the profile visible.
+Firmware KEX uses the same lower index `0x0100` for test and production. TLS client identities use `0x0200` as the base and derive Object IDs as `identity * 2 + slotOffset`. Test and production keep matching lower 16-bit indices while the Object area separates their lifecycle.
 
 ## Production firmware KEX ID reservation guard
 
@@ -59,14 +62,49 @@ This guard prevents accidents; it is not the security boundary. It does not bloc
 
 ## EC key policies
 
-| API / purpose | Header | KA | READ | WRITE | GEN | DELETE |
-|---|---:|:---:|:---:|:---:|:---:|:---:|
-| `developmentEcKeyPolicy()` | `0x043C0000` | yes | yes | yes | yes | yes |
-| `testDeviceKeyPolicy()` | `0x04240000` | yes | yes | no | no | yes |
-| `deviceEcKeyPolicy()` | `0x04200000` | yes | yes | no | no | no |
-| `oneTimeDeviceKeyPolicy()` | `0x04200000` | yes | yes | no | no | no |
+| API / purpose | Header | SIGN | KA | READ | WRITE | GEN | DELETE |
+|---|---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| `developmentEcKeyPolicy()` | `0x043C0000` | no | yes | yes | yes | yes | yes |
+| `developmentSigningEcKeyPolicy()` | `0x103C0000` | yes | no | yes | yes | yes | yes |
+| TLS identity `keyPolicy()` | `0x10240000` | yes | no | yes | no | no | yes |
+| `testDeviceKeyPolicy()` | `0x04240000` | no | yes | yes | no | no | yes |
+| `deviceEcKeyPolicy()` | `0x04200000` | no | yes | yes | no | no | no |
+| `oneTimeDeviceKeyPolicy()` | `0x04200000` | no | yes | yes | no | no | no |
 
 `oneTimeDeviceKeyPolicy()` currently has the same effective header as `deviceEcKeyPolicy()`. The distinct API name records irreversible provisioning intent and leaves room for future Applet-specific attributes.
+
+TLS identity keys remain deletable in production because certificate/key rotation is an explicit requirement. WRITE and GEN stay disabled so an existing identity key cannot be silently overwritten or regenerated in place. Test and production use the same policy semantics, with the Object ID area, identity number, and A/B slot defining their lifecycle.
+
+## TLS client identity profiles
+
+TLS client identities are cloud-neutral X.509/mTLS signing keys. To support independent key pairs for multiple services, each `identity` number owns an A/B slot pair.
+
+Object IDs are derived as:
+
+```text
+test:       0x30000200 + identity * 2 + slotOffset
+production: 0x20000200 + identity * 2 + slotOffset
+slotOffset: A=0, B=1
+```
+
+Examples:
+
+| Profile | Identity | Slot | Object ID | Policy |
+|---|---:|:---:|---:|---:|
+| test | 0 | A | `0x30000200` | `0x10240000` |
+| test | 0 | B | `0x30000201` | `0x10240000` |
+| test | 1 | A | `0x30000202` | `0x10240000` |
+| test | 1 | B | `0x30000203` | `0x10240000` |
+| production | 0 | A | `0x20000200` | `0x10240000` |
+| production | 0 | B | `0x20000201` | `0x10240000` |
+| production | 1 | A | `0x20000202` | `0x10240000` |
+| production | 1 | B | `0x20000203` | `0x10240000` |
+
+`identity 0` preserves the original A/B Object IDs. `identity 1` and later identities can be assigned to separate services or endpoints without sharing a private key.
+
+The policy is `SIGN + READ + DELETE` for every identity and slot. The private key is generated inside the SE050; READ is used for the public key. Each identity can rotate independently through its A/B pair: prepare a new key and certificate in the inactive slot, verify connectivity, switch the active slot, then delete and reuse the old slot.
+
+AWS IoT Core / Azure IoT Hub endpoints, device/Thing IDs, CSR enrollment, certificate registration, and MQTT parameters remain outside this profile.
 
 ## Test kitting safety
 
@@ -109,6 +147,8 @@ NXP objects in `0x7FFF...` and `0xF000...` are outside `se050ctl` write/delete c
 | Purpose | Area | Example Object ID |
 |---|---|---:|
 | production firmware KEX private key | `customer` | `0x20000100` |
+| production TLS identity slot A/B | `customer` | `0x20000200..0x20000201` |
+| test TLS identity slot A/B | `dev` | `0x30000200..0x30000201` |
 | product metadata/version | `customer` | `0x20000010` |
 | vendor-managed objects | `vendor` | `0x10000000..` |
 | disposable diagnostic objects | `dev` | `0x30000000..` |
