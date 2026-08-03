@@ -33,7 +33,8 @@ type
     seCryptoError,
     seSignatureInvalid,
     seCertificateUntrusted,
-    seKittingValidationFailed
+    seKittingValidationFailed,
+    seTlsIdentityValidationFailed
 
   Se050Error* = object
     kind*: Se050ErrorKind
