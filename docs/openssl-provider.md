@@ -190,3 +190,7 @@ cmp se050-public.der csr-public.der
 A zero exit status from `cmp` proves that the CSR contains the public key of
 the selected SE050 TLS identity object. No private-key file is created during
 this flow.
+
+## Local mutual-TLS integration test
+
+See `docs/local-mtls-test.md` for real TLS client-authentication validation.

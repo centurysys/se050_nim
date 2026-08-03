@@ -192,3 +192,7 @@ Objectの公開鍵と一致しています。CSR生成時に秘密鍵ファイ�
 
 この確認はCloud非依存です。AWS IoT Core / Azure IoT HubへCSRや証明書を
 登録する前に、SE050 + NXP Provider + OpenSSLの境界だけを独立して検証できます。
+
+## ローカルmTLS統合試験
+
+実際のTLS client authentication確認は `docs/local-mtls-test.ja.md` を参照。
