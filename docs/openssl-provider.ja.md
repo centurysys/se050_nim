@@ -70,7 +70,7 @@ export EX_SSS_BOOT_SSS_PORT=/dev/i2c-0:0x48
 
 この値は実機のbus/addressに合わせる。
 
-SCP03を導入する場合は構成が別になる。NXP Provider READMEはPlatformSCP03ではAccess Manager必須としている。今回の初期評価は現在の `se050_nim` と同じplain direct-I2C構成で行い、SCP03/Access Managerは同時アクセス・製品security要件が確定した段階で別途評価する。
+本プロジェクトではHost OSをtrusted environmentとして扱い、TLS秘密鍵のnon-exportabilityを主なsecurity boundaryとする。そのためdirect-I2Cのplain sessionを採用する。Providerが表示する `Communication channel is Plain` / `Not recommended for production use` 警告はこの設計では想定内である。Host OS侵害後のSE050不正利用防止は対象外とし、SCP03 / Access Manager / Host authentication credentialは導入しない。
 
 ## Step 5実機確認
 
@@ -141,3 +141,54 @@ default providerを先にloadする構成でNXP ECDSA implementationが選ばれ
 - Provider自身によるkey generationは行わず、Object lifecycleは引き続き`se050_nim`側が管理する
 
 次Stepでは、この同じURIを `openssl req -new -key nxp:...` に渡してCSR生成・自己検証を行う。
+
+
+## CSR生成と公開鍵一致確認
+
+TLS identity鍵からCSRを生成するときも、reference-key PEMは不要です。
+NXP ProviderのObject ID URIをそのまま`openssl req`へ渡します。
+
+例としてtest / identity 0 / slot Aを使用します。
+
+```sh
+export EX_SSS_BOOT_SSS_PORT=/dev/i2c-0:0x48
+PROVIDER=/usr/local/lib/libsssProvider.so
+KEY_URI=$(se050ctl tls-key-ref --profile test --identity 0 --slot A)
+
+se050ctl tls-key-pubkey \
+  -b 0 \
+  --profile test \
+  --identity 0 \
+  --slot A \
+  --format spki-der \
+  --out se050-public.der
+
+openssl req -new \
+  --provider "$PROVIDER" \
+  --provider default \
+  -key "$KEY_URI" \
+  -subj "/CN=se050-local-test" \
+  -out device.csr
+```
+
+CSR自身の署名を検証します。
+
+```sh
+openssl req -in device.csr -noout -verify
+```
+
+次にCSRのSubjectPublicKeyInfoをDERで取り出し、SE050からAttestation検証後に
+exportした公開鍵とbyte-for-byteで比較します。
+
+```sh
+openssl req -in device.csr -pubkey -noout | \
+  openssl pkey -pubin -outform DER -out csr-public.der
+
+cmp se050-public.der csr-public.der
+```
+
+`cmp`が終了コード0なら、CSRへ格納された公開鍵は選択したSE050 TLS identity
+Objectの公開鍵と一致しています。CSR生成時に秘密鍵ファイルは作成されません。
+
+この確認はCloud非依存です。AWS IoT Core / Azure IoT HubへCSRや証明書を
+登録する前に、SE050 + NXP Provider + OpenSSLの境界だけを独立して検証できます。

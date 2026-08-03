@@ -34,17 +34,6 @@ const
   DefaultDevIndex = 0x130'u32
   TestMessage = "se050_nim ECDSA signing test\n"
 
-  # SubjectPublicKeyInfo prefix for an uncompressed NIST P-256 public point:
-  #   id-ecPublicKey + prime256v1 + BIT STRING header.
-  P256SpkiPrefix = [
-    0x30'u8, 0x59'u8,
-    0x30'u8, 0x13'u8,
-    0x06'u8, 0x07'u8, 0x2A'u8, 0x86'u8, 0x48'u8, 0xCE'u8,
-    0x3D'u8, 0x02'u8, 0x01'u8,
-    0x06'u8, 0x08'u8, 0x2A'u8, 0x86'u8, 0x48'u8, 0xCE'u8,
-    0x3D'u8, 0x03'u8, 0x01'u8, 0x07'u8,
-    0x03'u8, 0x42'u8, 0x00'u8
-  ]
 
 proc usage(programName: string) =
   echo &"Usage: {programName} <bus> [dev-index]"
@@ -116,15 +105,6 @@ proc requireVoidOk(label: string, r: SE[void]) =
     echo label, " failed: ", r.error.kind, ": ", r.error.errorMessage()
     quit(1)
 
-proc makeP256Spki(publicKey: openArray[uint8]): seq[uint8] =
-  if publicKey.len != EcP256UncompressedPublicKeyLength or publicKey[0] != 0x04'u8:
-    raise newException(ValueError, "SE050 public key is not an uncompressed P-256 point")
-
-  result = @[]
-  for b in P256SpkiPrefix:
-    result.add(b)
-  for b in publicKey:
-    result.add(b)
 
 proc main(): int =
   let args = commandLineParams()
@@ -172,7 +152,7 @@ proc main(): int =
   let message = stringToBytes(TestMessage)
   let digestArray = requireOk("sha256", sha256(message))
   let signature = requireOk("signDigest", se.signDigest(objectId, digestArray))
-  let publicKeySpki = makeP256Spki(publicKey)
+  let publicKeySpki = p256PublicKeyToSpkiDer(publicKey)
 
   writeBytes("p256_sign_message.bin", message)
   writeBytes("p256_sign_digest.bin", digestArray)

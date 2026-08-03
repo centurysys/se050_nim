@@ -57,6 +57,10 @@ type
     oaInternal,
     oaOther
 
+  TlsPublicKeyFormat = enum
+    tpkRaw,
+    tpkSpkiDer
+
   ObjectAreaSpec = object
     area: ObjectArea
     name: string
@@ -445,6 +449,18 @@ proc parseTlsIdentityProfile(
   if not result.isValid():
     raise newException(ValueError, "resolved TLS identity profile is invalid")
 
+proc parseTlsPublicKeyFormat(value: string): TlsPublicKeyFormat =
+  case value.strip().toLowerAscii()
+  of "raw":
+    result = tpkRaw
+  of "spki-der", "spki", "der":
+    result = tpkSpkiDer
+  else:
+    raise newException(
+      ValueError,
+      &"TLS public-key format must be raw or spki-der: {value}"
+    )
+
 proc isReadableEcPublicObjectType(objectType: uint8): bool =
   ## Returns true for EC key-pair/public-key object types whose public key can
   ## be read using ReadObject.
@@ -709,6 +725,64 @@ proc runTlsKeyRef(
   ## Prints only the NXP OpenSSL Provider URI for shell/script consumption.
   let profile = parseTlsIdentityProfile(profileText, identityText, slotText)
   echo profile.opensslProviderKeyUri()
+  result = 0
+
+proc runTlsKeyPubkey(
+    busText: string,
+    addressText: string,
+    debug: bool,
+    profileText: string,
+    identityText: string,
+    slotText: string,
+    formatText: string,
+    outputPath: string
+): int =
+  ## Exports the validated TLS identity public key for CSR/key matching.
+  let profile = parseTlsIdentityProfile(profileText, identityText, slotText)
+  let outputFormat = parseTlsPublicKeyFormat(formatText)
+  if outputPath.strip().len == 0:
+    raise newException(ValueError, "--out is required for tls-key-pubkey")
+
+  let se = openAndRequestAtr(busText, addressText, debug)
+  let exists = se.objectExists(
+    objectId = profile.keyObjectId,
+    selectFirst = true
+  )
+  if not exists.ok:
+    printSe050Error("CheckObjectExists failed", exists.error)
+    return 1
+
+  if not exists.value:
+    stderr.writeLine(
+      &"tls-key-pubkey failed: {profile.name} identity {profile.identity} slot {profile.slot.slotName()} ({objectIdHex(profile.keyObjectId)}) does not exist"
+    )
+    return 1
+
+  let inspected = inspectTlsIdentity(se, profile)
+  if not inspected.ok:
+    printSe050Error("TLS identity validation failed", inspected.error)
+    return 1
+
+  let output =
+    case outputFormat
+    of tpkRaw:
+      inspected.value.publicKey
+    of tpkSpkiDer:
+      p256PublicKeyToSpkiDer(inspected.value.publicKey)
+
+  if not writeRawBytes(
+      outputPath,
+      output,
+      "tls-key-pubkey"
+  ):
+    return 1
+
+  let formatName = if outputFormat == tpkRaw: "raw" else: "spki-der"
+  echo &"{objectIdHex(profile.keyObjectId)}: validated public key written to {outputPath}"
+  echo &"identity: {profile.identity}"
+  echo &"slot: {profile.slot.slotName()}"
+  echo &"format: {formatName}"
+  echo &"length: {output.len}"
   result = 0
 
 proc runTlsKeygen(
@@ -1610,6 +1684,28 @@ proc main(): int =
           opts.profile,
           opts.identity,
           opts.slot
+        ))
+
+    command("tls-key-pubkey"):
+      help("Export an attestation-validated TLS identity public key.")
+      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
+      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("--profile", required = true, help = "TLS identity profile: test or production")
+      option("--identity", default = some("0"), help = "TLS identity number, default: 0")
+      option("--slot", required = true, help = "TLS identity slot: A or B")
+      option("--format", default = some("spki-der"), help = "Output format: raw or spki-der, default: spki-der")
+      option("--out", required = true, help = "Output file")
+      flag("-d", "--debug", help = "Print T=1 over I2C frames")
+      run:
+        quit(runTlsKeyPubkey(
+          opts.bus,
+          opts.address,
+          opts.debug,
+          opts.profile,
+          opts.identity,
+          opts.slot,
+          opts.format,
+          opts.out
         ))
 
     command("tls-keygen"):

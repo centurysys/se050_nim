@@ -130,6 +130,25 @@ openssl pkeyutl --provider /usr/local/lib/libsssProvider.so --provider default \
   -inkey "$KEY_URI" -sign -rawin -in input.txt -out signature.der -digest sha256
 ```
 
+
+### `tls-key-pubkey`
+
+TLS identityをAttestation検証した後、公開鍵だけをファイルへ出力します。
+CSR内公開鍵との比較には`spki-der`を使用します。
+
+```sh
+se050ctl tls-key-pubkey \
+  -b 0 \
+  --profile test \
+  --identity 0 \
+  --slot A \
+  --format spki-der \
+  --out se050-public.der
+```
+
+`--format raw`ではSE050 ReadObjectの65-byte `0x04 || X || Y`をそのまま出力します。
+`spki-der`ではOpenSSL CSRの公開鍵と直接比較できるX.509 SubjectPublicKeyInfo DERを出力します。
+
 ### `tls-keygen`
 
 ```sh

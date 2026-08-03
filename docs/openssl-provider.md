@@ -70,7 +70,7 @@ export EX_SSS_BOOT_SSS_PORT=/dev/i2c-0:0x48
 
 Adjust the bus/address for the target hardware.
 
-PlatformSCP03 is a separate configuration. The NXP provider README states that Access Manager is mandatory for PlatformSCP03. Initial evaluation remains on the same plain direct-I2C path currently used by `se050_nim`; SCP03/Access Manager is evaluated separately if concurrent access or product security requirements require it.
+This project treats the Host OS as a trusted environment and uses TLS private-key non-exportability as the primary security boundary. Therefore the direct-I2C plain session is intentional. Provider warnings such as `Communication channel is Plain` / `Not recommended for production use` are expected for this design. Preventing SE050 misuse after Host OS compromise is out of scope, so SCP03, Access Manager, and host-authentication credentials are not introduced.
 
 ## Step 5 hardware check
 
@@ -141,3 +141,52 @@ If the default provider is loaded first and NXP ECDSA is not selected, use the u
 - Key generation remains owned by `se050_nim`, not the provider
 
 The next step uses the same URI with `openssl req -new -key nxp:...` to generate and verify a CSR.
+
+
+## CSR generation and public-key matching
+
+A reference-key PEM is not required to create a CSR from a TLS identity key.
+Pass the NXP Provider Object-ID URI directly to `openssl req`.
+
+The following example uses test / identity 0 / slot A.
+
+```sh
+export EX_SSS_BOOT_SSS_PORT=/dev/i2c-0:0x48
+PROVIDER=/usr/local/lib/libsssProvider.so
+KEY_URI=$(se050ctl tls-key-ref --profile test --identity 0 --slot A)
+
+se050ctl tls-key-pubkey \
+  -b 0 \
+  --profile test \
+  --identity 0 \
+  --slot A \
+  --format spki-der \
+  --out se050-public.der
+
+openssl req -new \
+  --provider "$PROVIDER" \
+  --provider default \
+  -key "$KEY_URI" \
+  -subj "/CN=se050-local-test" \
+  -out device.csr
+```
+
+Verify the CSR signature itself:
+
+```sh
+openssl req -in device.csr -noout -verify
+```
+
+Then extract the CSR SubjectPublicKeyInfo in DER and compare it byte-for-byte
+with the attestation-validated SE050 public key:
+
+```sh
+openssl req -in device.csr -pubkey -noout | \
+  openssl pkey -pubin -outform DER -out csr-public.der
+
+cmp se050-public.der csr-public.der
+```
+
+A zero exit status from `cmp` proves that the CSR contains the public key of
+the selected SE050 TLS identity object. No private-key file is created during
+this flow.

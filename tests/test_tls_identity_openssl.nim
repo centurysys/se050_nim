@@ -41,3 +41,26 @@ suite "SE050 TLS identity OpenSSL Provider references":
 
     expect ValueError:
       discard opensslProviderKeyUri(profile)
+
+  test "wraps an uncompressed P-256 public key as SubjectPublicKeyInfo DER":
+    var raw = @[0x04'u8]
+    for i in 0 ..< 64:
+      raw.add(uint8(i))
+
+    let der = p256PublicKeyToSpkiDer(raw)
+    check der.len == 91
+    check der[0] == 0x30'u8
+    check der[1] == 0x59'u8
+    check der[23] == 0x03'u8
+    check der[24] == 0x42'u8
+    check der[25] == 0x00'u8
+    check der[26 .. ^1] == raw
+
+  test "rejects invalid P-256 public key encodings":
+    expect ValueError:
+      discard p256PublicKeyToSpkiDer(newSeq[uint8](64))
+
+    var compressed = newSeq[uint8](65)
+    compressed[0] = 0x02'u8
+    expect ValueError:
+      discard p256PublicKeyToSpkiDer(compressed)

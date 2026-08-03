@@ -90,6 +90,26 @@ openssl pkeyutl --provider /usr/local/lib/libsssProvider.so --provider default \
   -inkey "$KEY_URI" -sign -rawin -in input.txt -out signature.der -digest sha256
 ```
 
+
+### `tls-key-pubkey`
+
+After attestation-validating the TLS identity, export only its public key to a
+file. Use `spki-der` when comparing against a CSR public key.
+
+```sh
+se050ctl tls-key-pubkey \
+  -b 0 \
+  --profile test \
+  --identity 0 \
+  --slot A \
+  --format spki-der \
+  --out se050-public.der
+```
+
+`--format raw` writes the 65-byte SE050 `0x04 || X || Y` point. `spki-der`
+writes X.509 SubjectPublicKeyInfo DER for direct comparison with OpenSSL CSR
+public-key output.
+
 ### `tls-keygen`
 
 ```sh
