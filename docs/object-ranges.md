@@ -23,8 +23,12 @@ This document defines the Object IDs, access policies, and responsibility bounda
 | NXP device certificate | `0xF0000013` | BinaryFile / NXP | pre-provisioned, used for X.509 validation |
 | test firmware KEX | `0x30000100` | P-256 key pair / dev | exporter implemented and tested |
 | production firmware KEX | `0x20000100` | P-256 key pair / customer | creation CLI and generic mutation guard implemented; irreversible device test pending |
+| test TLS identity slot A | `0x30000200` | P-256 key pair / dev | profile and policy defined |
+| test TLS identity slot B | `0x30000201` | P-256 key pair / dev | profile and policy defined |
+| production TLS identity slot A | `0x20000200` | P-256 key pair / customer | profile and policy defined |
+| production TLS identity slot B | `0x20000201` | P-256 key pair / customer | profile and policy defined |
 
-Test and production use the same lower index `0x0100`, while the high byte makes the profile visible.
+Firmware KEX uses the same lower index `0x0100` for test and production. TLS client identity uses `0x0200`/`0x0201` for slots A/B, while the high byte distinguishes test from production.
 
 ## Production firmware KEX ID reservation guard
 
@@ -59,14 +63,33 @@ This guard prevents accidents; it is not the security boundary. It does not bloc
 
 ## EC key policies
 
-| API / purpose | Header | KA | READ | WRITE | GEN | DELETE |
-|---|---:|:---:|:---:|:---:|:---:|:---:|
-| `developmentEcKeyPolicy()` | `0x043C0000` | yes | yes | yes | yes | yes |
-| `testDeviceKeyPolicy()` | `0x04240000` | yes | yes | no | no | yes |
-| `deviceEcKeyPolicy()` | `0x04200000` | yes | yes | no | no | no |
-| `oneTimeDeviceKeyPolicy()` | `0x04200000` | yes | yes | no | no | no |
+| API / purpose | Header | SIGN | KA | READ | WRITE | GEN | DELETE |
+|---|---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| `developmentEcKeyPolicy()` | `0x043C0000` | no | yes | yes | yes | yes | yes |
+| `developmentSigningEcKeyPolicy()` | `0x103C0000` | yes | no | yes | yes | yes | yes |
+| TLS identity `keyPolicy()` | `0x10240000` | yes | no | yes | no | no | yes |
+| `testDeviceKeyPolicy()` | `0x04240000` | no | yes | yes | no | no | yes |
+| `deviceEcKeyPolicy()` | `0x04200000` | no | yes | yes | no | no | no |
+| `oneTimeDeviceKeyPolicy()` | `0x04200000` | no | yes | yes | no | no | no |
 
 `oneTimeDeviceKeyPolicy()` currently has the same effective header as `deviceEcKeyPolicy()`. The distinct API name records irreversible provisioning intent and leaves room for future Applet-specific attributes.
+
+TLS identity keys remain deletable in production because certificate/key rotation is an explicit requirement. WRITE and GEN stay disabled so an existing identity key cannot be silently overwritten or regenerated in place. Test and production use the same policy semantics, with the Object ID area and A/B slot defining their lifecycle.
+
+## TLS client identity A/B profiles
+
+TLS client identity profiles are cloud-neutral X.509/mTLS signing-key profiles with four fixed objects:
+
+| Profile | Slot | Object ID | Policy |
+|---|:---:|---:|---:|
+| test | A | `0x30000200` | `0x10240000` |
+| test | B | `0x30000201` | `0x10240000` |
+| production | A | `0x20000200` | `0x10240000` |
+| production | B | `0x20000201` | `0x10240000` |
+
+The policy is `SIGN + READ + DELETE`. The private key is generated inside the SE050; READ is used for the public key. A/B rotation prepares a new key and certificate in the inactive slot, verifies connectivity, switches the active identity, and then allows the old slot to be deleted and reused.
+
+AWS IoT Core / Azure IoT Hub endpoints, device/Thing IDs, CSR enrollment, certificate registration, and MQTT parameters remain outside this profile.
 
 ## Test kitting safety
 
@@ -109,6 +132,8 @@ NXP objects in `0x7FFF...` and `0xF000...` are outside `se050ctl` write/delete c
 | Purpose | Area | Example Object ID |
 |---|---|---:|
 | production firmware KEX private key | `customer` | `0x20000100` |
+| production TLS identity slot A/B | `customer` | `0x20000200..0x20000201` |
+| test TLS identity slot A/B | `dev` | `0x30000200..0x30000201` |
 | product metadata/version | `customer` | `0x20000010` |
 | vendor-managed objects | `vendor` | `0x10000000..` |
 | disposable diagnostic objects | `dev` | `0x30000000..` |
