@@ -13,7 +13,7 @@
 
 import std/options
 
-import ./keys
+import ../keys
 
 # =============================================================================
 # Constants

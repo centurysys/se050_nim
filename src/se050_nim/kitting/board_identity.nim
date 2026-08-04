@@ -2,8 +2,8 @@
 # Board identity helpers
 # =============================================================================
 
-import ./errors
-import ./kitting_profile
+import ../errors
+import ./profile
 
 proc parseBoardSerialNumber*(raw: string): SE[string] =
   ## Parses the Device Tree serial-number property.

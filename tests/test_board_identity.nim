@@ -1,6 +1,6 @@
 import std/unittest
 
-import se050_nim/board_identity
+import se050_nim/kitting/board_identity
 
 suite "board serial number":
   test "removes only trailing Device Tree terminators":

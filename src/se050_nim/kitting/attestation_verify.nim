@@ -1,36 +1,31 @@
 # =============================================================================
-# SE050 TLS client identity attestation semantic validation
+# SE050 kitting attestation semantic validation
 # =============================================================================
 #
-# Cryptographic signature and certificate-chain validation prove that a
-# ReadObject-with-Attestation response came from a trusted SE050. This layer
-# additionally proves that the signed Secure Object is the exact P-256 TLS
-# client identity key required by the selected A/B profile.
-#
-# Persistence is intentionally not claimed here: Applet 7.2 attested attributes
-# do not include the ReadType TransientIndicator. Callers that require a
-# persistent object must check ReadType separately on the live SE050.
+# Cryptographic signature and certificate-chain validation prove that the
+# response came from a trusted SE050. This layer additionally proves that the
+# signed object is the exact firmware key-agreement object required by the
+# selected test or production kitting profile.
 
 import std/strformat
 import std/strutils
 
-import ./errors
-import ./uid
-import ./keys
-import ./kitting_profile
-import ./attestation
-import ./attestation_attributes
-import ./tls_identity_profile
+import ../errors
+import ../uid
+import ../keys
+import ../attestation/constants
+import ../attestation/read
+import ../attestation/attributes
+import ./profile
 
 # =============================================================================
 # Constants
 # =============================================================================
 
 const
-  TlsIdentityAttestationFreshnessLength* = 16
-  TlsIdentityP256PublicKeyLength* = 65
-  TlsIdentityP256PrivateKeySizeBytes* = 32'u16
-  Se050AttestationTimestampLength = 12
+  P256UncompressedPublicKeyLength* = 65
+  P256PrivateKeySizeBytes* = 32'u16
+  Se050AttestationTimestampLength* = 12
   DefaultAuthObjectId = 0'u32
 
 # =============================================================================
@@ -38,11 +33,10 @@ const
 # =============================================================================
 
 type
-  TlsIdentityAttestationSemantics* = object
-    profile*: TlsIdentityProfile
+  KittingAttestationSemantics* = object
+    profile*: KittingProfile
     attributes*: AttestedObjectAttributes
     objectSize*: uint16
-    publicKey*: seq[uint8]
 
 # =============================================================================
 # Internal helpers
@@ -50,9 +44,9 @@ type
 
 proc semanticFailure(
     message: string
-): SE[TlsIdentityAttestationSemantics] =
-  result = fail[TlsIdentityAttestationSemantics](
-    seTlsIdentityValidationFailed,
+): SE[KittingAttestationSemantics] =
+  result = fail[KittingAttestationSemantics](
+    seKittingValidationFailed,
     message
   )
 
@@ -60,22 +54,19 @@ proc semanticFailure(
 # Public API
 # =============================================================================
 
-proc verifyTlsIdentityAttestationSemantics*(
+proc verifyKittingAttestationSemantics*(
     attested: AttestedObjectRead,
-    profile: TlsIdentityProfile
-): SE[TlsIdentityAttestationSemantics] =
-  ## Validates the signed fields needed to accept one TLS client identity key.
-  ##
-  ## Certificate-chain and ECDSA attestation-signature checks must be completed
-  ## separately before the caller treats these semantics as trusted.
-  ## Persistence must also be checked separately through ReadType because the
-  ## TransientIndicator is not part of the signed Applet 7.2 attributes.
+    profile: KittingProfile
+): SE[KittingAttestationSemantics] =
+  ## Validates all signed fields needed to accept a firmware KEX public key.
+  ## Certificate-chain and ECDSA checks must be completed separately before the
+  ## caller treats this result as trusted.
   if not profile.isValid():
-    return semanticFailure("TLS identity profile is invalid")
+    return semanticFailure("kitting profile is invalid")
 
   if attested.request.objectId != profile.keyObjectId:
     return semanticFailure(
-      &"attested request object ID 0x{attested.request.objectId.toHex(8)} does not match {profile.name} slot {profile.slot.slotName()} ID 0x{profile.keyObjectId.toHex(8)}"
+      &"attested request object ID 0x{attested.request.objectId.toHex(8)} does not match {profile.name} profile ID 0x{profile.keyObjectId.toHex(8)}"
     )
 
   if attested.request.attestationKeyId != Se050AttestationKeyObjectId:
@@ -87,17 +78,17 @@ proc verifyTlsIdentityAttestationSemantics*(
     return semanticFailure("attestation algorithm is not ECDSA with SHA-256")
 
   if attested.request.offset != 0'u16 or attested.request.length != 0'u16:
-    return semanticFailure("TLS identity public key must be attested as a complete object")
+    return semanticFailure("kitting public key must be attested as a complete object")
 
-  if attested.request.freshness.len != TlsIdentityAttestationFreshnessLength:
+  if attested.request.freshness.len != KittingFreshnessLength:
     return semanticFailure(
-      &"attestation freshness must be {TlsIdentityAttestationFreshnessLength} bytes"
+      &"attestation freshness must be {KittingFreshnessLength} bytes"
     )
 
   if not attested.response.objectDataPresent:
     return semanticFailure("attestation response does not contain a public key")
 
-  if attested.response.objectData.len != TlsIdentityP256PublicKeyLength or
+  if attested.response.objectData.len != P256UncompressedPublicKeyLength or
       attested.response.objectData[0] != 0x04'u8:
     return semanticFailure(
       "attested public key is not a 65-byte uncompressed P-256 point"
@@ -115,20 +106,20 @@ proc verifyTlsIdentityAttestationSemantics*(
 
   let objectSize = parseAttestedObjectSize(attested.response.objectInfo)
   if not objectSize.ok:
-    return fail[TlsIdentityAttestationSemantics](
+    return fail[KittingAttestationSemantics](
       objectSize.error.kind,
       objectSize.error.message,
       objectSize.error.sw
     )
 
-  if objectSize.value != TlsIdentityP256PrivateKeySizeBytes:
+  if objectSize.value != P256PrivateKeySizeBytes:
     return semanticFailure(
-      &"attested object size must be {TlsIdentityP256PrivateKeySizeBytes} bytes; got {objectSize.value}"
+      &"attested object size must be {P256PrivateKeySizeBytes} bytes; got {objectSize.value}"
     )
 
   let attributes = parseAttestedObjectAttributes(attested.response.attributes)
   if not attributes.ok:
-    return fail[TlsIdentityAttestationSemantics](
+    return fail[KittingAttestationSemantics](
       attributes.error.kind,
       attributes.error.message,
       attributes.error.sw
@@ -145,16 +136,16 @@ proc verifyTlsIdentityAttestationSemantics*(
     )
 
   if attributes.value.authAttribute != Se050SetIndicatorNotSet:
-    return semanticFailure("TLS identity object must not be an authentication object")
+    return semanticFailure("firmware KEX object must not be an authentication object")
 
   if attributes.value.ownerAuthObjectId != DefaultAuthObjectId:
     return semanticFailure(
-      &"TLS identity object owner auth ID must be 0x{DefaultAuthObjectId.toHex(8)}"
+      &"firmware KEX object owner auth ID must be 0x{DefaultAuthObjectId.toHex(8)}"
     )
 
   if attributes.value.origin != Se050ObjectOriginInternal:
     return semanticFailure(
-      &"TLS identity key origin must be internal; got {objectOriginName(attributes.value.origin)}"
+      &"firmware KEX key origin must be internal; got {objectOriginName(attributes.value.origin)}"
     )
 
   if not attributes.value.objectVersionPresent:
@@ -162,33 +153,32 @@ proc verifyTlsIdentityAttestationSemantics*(
 
   if attributes.value.policies.len != 1:
     return semanticFailure(
-      &"TLS identity object must contain exactly one policy entry; got {attributes.value.policies.len}"
+      &"firmware KEX object must contain exactly one policy entry; got {attributes.value.policies.len}"
     )
 
   let policy = attributes.value.policies[0]
   if policy.authObjectId != DefaultAuthObjectId:
     return semanticFailure(
-      &"TLS identity policy auth object must be 0x{DefaultAuthObjectId.toHex(8)}"
+      &"firmware KEX policy auth object must be 0x{DefaultAuthObjectId.toHex(8)}"
     )
 
   let expectedPolicyHeader = policyHeader(profile.keyPolicy())
   if policy.header != expectedPolicyHeader:
-    let developmentSigningHeader = policyHeader(developmentSigningEcKeyPolicy())
-    if profile.kind == tipTest and policy.header == developmentSigningHeader:
+    let developmentPolicyHeader = policyHeader(developmentEcKeyPolicy())
+    if profile.kind == kpTest and policy.header == developmentPolicyHeader:
       return semanticFailure(
-        &"signed policy header 0x{policy.header.toHex(8)} is the generic development signing policy; recreate 0x{profile.keyObjectId.toHex(8)} with the TLS identity policy 0x{expectedPolicyHeader.toHex(8)}"
+        &"signed policy header 0x{policy.header.toHex(8)} is the generic development policy; recreate 0x{profile.keyObjectId.toHex(8)} with the kitting test policy 0x{expectedPolicyHeader.toHex(8)}"
       )
 
     return semanticFailure(
-      &"signed policy header 0x{policy.header.toHex(8)} does not match {profile.name} slot {profile.slot.slotName()} policy 0x{expectedPolicyHeader.toHex(8)}"
+      &"signed policy header 0x{policy.header.toHex(8)} does not match {profile.name} profile policy 0x{expectedPolicyHeader.toHex(8)}"
     )
 
   if policy.extension.len != 0:
-    return semanticFailure("TLS identity policy must not contain an access-rule extension")
+    return semanticFailure("firmware KEX policy must not contain an access-rule extension")
 
-  result = ok(TlsIdentityAttestationSemantics(
+  result = ok(KittingAttestationSemantics(
     profile: profile,
     attributes: attributes.value,
-    objectSize: objectSize.value,
-    publicKey: attested.response.objectData
+    objectSize: objectSize.value
   ))

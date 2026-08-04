@@ -15,7 +15,7 @@ import std/options
 import std/strformat
 import std/strutils
 
-import ./kitting_profile
+import ./profile
 
 # =============================================================================
 # Types

@@ -19,9 +19,9 @@ import ./apdu
 import ./errors
 import ./transport
 import ./objects
-import ./attestation_cert
 import ./x509_verify
-import ./tls_identity_openssl
+import ./attestation/cert
+import ./tls/openssl
 
 # =============================================================================
 # Constants

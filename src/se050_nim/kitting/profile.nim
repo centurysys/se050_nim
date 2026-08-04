@@ -13,7 +13,7 @@
 
 import std/options
 
-import ./keys
+import ../keys
 
 # =============================================================================
 # Constants
@@ -26,10 +26,6 @@ const
   KittingKeyRoleFirmwareKex* = "firmware-kex"
   KittingFreshnessLength* = 16
   KittingNonceLength* = 16
-
-  # NXP pre-provisioned die-individual ECC attestation objects.
-  Se050AttestationKeyObjectId* = 0xF0000012'u32
-  Se050AttestationCertificateObjectId* = 0xF0000013'u32
 
   # The target applet currently used by Athena is 7.2.0. The exact
   # Read-with-Attestation APDU encoding is added only after it is verified

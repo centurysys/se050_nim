@@ -10,7 +10,7 @@
 import std/strformat
 import std/strutils
 
-import ./tls_identity_profile
+import ./profile
 
 const
   NxpOpenSslProviderUriPrefix* = "nxp:"

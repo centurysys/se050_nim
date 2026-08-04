@@ -2,9 +2,9 @@ import std/unittest
 import std/strutils
 
 import se050_nim/attestation
-import se050_nim/kitting_profile
-import se050_nim/kitting_record
-import se050_nim/kitting_csv
+import se050_nim/kitting/profile
+import se050_nim/kitting/record
+import se050_nim/kitting/csv
 
 proc addTlv(data: var seq[uint8], tag: uint8, value: openArray[uint8]) =
   doAssert value.len < 0x80

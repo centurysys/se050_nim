@@ -10,7 +10,7 @@
 import std/strformat
 import std/strutils
 
-import ./errors
+import ../errors
 
 # =============================================================================
 # Constants

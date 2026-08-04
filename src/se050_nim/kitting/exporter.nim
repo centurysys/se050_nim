@@ -9,9 +9,9 @@
 import std/strformat
 import std/strutils
 
-import ./errors
-import ./kitting_profile
-import ./kitting_record
+import ../errors
+import ./profile
+import ./record
 
 # =============================================================================
 # Types

@@ -15,12 +15,12 @@
 # file and that its leading bytes form one complete DER SEQUENCE followed by
 # optional zero padding.
 
-import ./errors
-import ./transport
-import ./apdu
-import ./objects
-import ./tlv
-import ./kitting_profile
+import ../errors
+import ../transport
+import ../apdu
+import ../objects
+import ../tlv
+import ./constants
 
 # =============================================================================
 # Constants

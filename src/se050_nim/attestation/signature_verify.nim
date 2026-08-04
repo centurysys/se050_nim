@@ -9,9 +9,10 @@
 # to later layers. This module verifies the cryptographic binding between the
 # captured request, response TLVs, and signature.
 
-import ./errors
-import ./attestation
-import ./crypto_verify
+import ../errors
+import ../crypto_verify
+import ./constants
+import ./read
 
 # =============================================================================
 # Types

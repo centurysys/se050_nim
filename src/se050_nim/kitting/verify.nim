@@ -9,14 +9,14 @@
 # This module does not access I2C. Factory exporters, local verification tools,
 # and future database importers can therefore share the same trust decision.
 
-import ./errors
-import ./x509_verify
-import ./attestation
+import ../errors
+import ../x509_verify
+import ../attestation/read
+import ../attestation/signature_verify
+import ./profile
+import ./record
+import ./csv
 import ./attestation_verify
-import ./kitting_profile
-import ./kitting_record
-import ./kitting_csv
-import ./kitting_attestation_verify
 
 # =============================================================================
 # Types

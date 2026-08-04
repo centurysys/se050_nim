@@ -19,12 +19,12 @@ import std/options
 import std/strformat
 import std/strutils
 
-import ./errors
-import ./uid
+import ../errors
+import ../uid
 import ./board_identity
-import ./kitting_profile
-import ./kitting_record
-import ./kitting_verify
+import ./profile
+import ./record
+import ./verify
 
 # =============================================================================
 # Constants

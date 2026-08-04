@@ -6,10 +6,10 @@ import std/options
 import std/strformat
 import std/strutils
 
-import ./errors
-import ./binary_encoding
-import ./kitting_profile
-import ./kitting_record
+import ../errors
+import ../binary_encoding
+import ../kitting/profile
+import ../kitting/record
 
 const
   KittingCsvHeader* = [

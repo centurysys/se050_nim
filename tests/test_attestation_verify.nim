@@ -2,7 +2,7 @@ import std/strutils
 import std/unittest
 
 import se050_nim/attestation
-import se050_nim/attestation_verify
+import se050_nim/kitting/attestation_verify
 import se050_nim/errors
 import se050_nim/crypto_verify
 

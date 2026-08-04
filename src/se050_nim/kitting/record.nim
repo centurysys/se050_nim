@@ -4,12 +4,12 @@
 
 import std/strformat
 
-import ./errors
-import ./uid
-import ./crypto_verify
-import ./attestation_cert
-import ./attestation
-import ./kitting_profile
+import ../errors
+import ../uid
+import ../crypto_verify
+import ../attestation/cert
+import ../attestation/read
+import ./profile
 import ./board_identity
 
 const
