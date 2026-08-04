@@ -15,6 +15,7 @@ import std/posix_utils
 import std/strformat
 
 import ../errors
+import ../objects
 import ../transport
 import ./profile
 import ./live_identity
@@ -138,6 +139,29 @@ proc writeTlsReferenceKeyFile*(
       outputChecked.error.kind,
       outputChecked.error.message,
       outputChecked.error.sw
+    )
+
+  if not profile.isValid():
+    return fail[TlsIdentityLiveInfo](
+      seInvalidArgument,
+      "TLS identity profile is invalid"
+    )
+
+  let exists = se.objectExists(
+    objectId = profile.keyObjectId,
+    selectFirst = true
+  )
+  if not exists.ok:
+    return fail[TlsIdentityLiveInfo](
+      exists.error.kind,
+      exists.error.message,
+      exists.error.sw
+    )
+
+  if not exists.value:
+    return fail[TlsIdentityLiveInfo](
+      seTlsIdentityValidationFailed,
+      &"TLS identity {profile.name} identity {profile.identity} slot {profile.slot.slotName()} does not exist"
     )
 
   let inspected = se.inspectTlsIdentity(profile)

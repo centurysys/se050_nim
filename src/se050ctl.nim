@@ -888,6 +888,33 @@ proc runTlsKeyRef(
   echo profile.opensslProviderKeyUri()
   result = 0
 
+proc runTlsKeyRefFile(
+    busText: string,
+    addressText: string,
+    debug: bool,
+    profileText: string,
+    identityText: string,
+    slotText: string,
+    outputPath: string
+): int =
+  ## Exports one validated TLS identity as an NXP OpenSSL reference-key PEM.
+  let profile = parseTlsIdentityProfile(profileText, identityText, slotText)
+  if outputPath.strip().len == 0:
+    raise newException(ValueError, "--out is required for tls-key-ref-file")
+
+  let se = openAndRequestAtr(busText, addressText, debug)
+  let written = se.writeTlsReferenceKeyFile(profile, outputPath)
+  if not written.ok:
+    printSe050Error("TLS reference-key export failed", written.error)
+    return 1
+
+  echo &"{objectIdHex(profile.keyObjectId)}: validated OpenSSL reference key written to {outputPath}"
+  echo &"identity: {profile.identity}"
+  echo &"slot: {profile.slot.slotName()}"
+  echo "format: NXP P-256 reference-key PEM"
+  echo "private key material: not exported"
+  result = 0
+
 proc runTlsKeyPubkey(
     busText: string,
     addressText: string,
@@ -1900,6 +1927,26 @@ proc main(): int =
           opts.profile,
           opts.identity,
           opts.slot
+        ))
+
+    command("tls-key-ref-file"):
+      help("Export an attestation-validated TLS identity as an NXP OpenSSL reference-key PEM.")
+      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
+      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("--profile", required = true, help = "TLS identity profile: test or production")
+      option("--identity", default = some("0"), help = "TLS identity number, default: 0")
+      option("--slot", required = true, help = "TLS identity slot: A or B")
+      option("--out", required = true, help = "Output reference-key PEM file; existing paths are not overwritten")
+      flag("-d", "--debug", help = "Print T=1 over I2C frames")
+      run:
+        quit(runTlsKeyRefFile(
+          opts.bus,
+          opts.address,
+          opts.debug,
+          opts.profile,
+          opts.identity,
+          opts.slot,
+          opts.out
         ))
 
     command("tls-key-pubkey"):
