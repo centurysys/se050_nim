@@ -44,6 +44,24 @@ proc x509Free(certificate: pointer) {.
   dynlib: LibCrypto
 .}
 
+proc x509GetPubkey(certificate: pointer): pointer {.
+  cdecl,
+  importc: "X509_get_pubkey",
+  dynlib: LibCrypto
+.}
+
+proc evpPkeyFree(publicKey: pointer) {.
+  cdecl,
+  importc: "EVP_PKEY_free",
+  dynlib: LibCrypto
+.}
+
+proc i2dPubkey(publicKey: pointer, output: ptr ptr uint8): cint {.
+  cdecl,
+  importc: "i2d_PUBKEY",
+  dynlib: LibCrypto
+.}
+
 proc x509StoreNew(): pointer {.
   cdecl,
   importc: "X509_STORE_new",
@@ -212,6 +230,63 @@ proc freeCertificates(certificates: var seq[pointer]) =
     if certificate != nil:
       x509Free(certificate)
   certificates.setLen(0)
+
+# =============================================================================
+# Public-key extraction
+# =============================================================================
+
+proc extractCertificatePublicKeySpkiDer*(
+    certificateDer: openArray[uint8]
+): SE[seq[uint8]] =
+  ## Extracts the certificate SubjectPublicKeyInfo in DER form.
+  ##
+  ## This works for both ECC and RSA certificates and is intentionally generic;
+  ## callers can compare or export the public key without any private-key
+  ## operation or Provider dependency.
+  let certificate = loadX509Certificate(certificateDer)
+  if not certificate.ok:
+    return fail[seq[uint8]](
+      certificate.error.kind,
+      certificate.error.message,
+      certificate.error.sw
+    )
+
+  defer:
+    x509Free(certificate.value)
+
+  try:
+    let publicKey = x509GetPubkey(certificate.value)
+    if publicKey == nil:
+      return fail[seq[uint8]](
+        seCryptoError,
+        opensslErrorMessage("OpenSSL failed to extract the certificate public key")
+      )
+
+    defer:
+      evpPkeyFree(publicKey)
+
+    let encodedLength = i2dPubkey(publicKey, nil)
+    if encodedLength <= 0:
+      return fail[seq[uint8]](
+        seCryptoError,
+        opensslErrorMessage("OpenSSL failed to measure SubjectPublicKeyInfo DER")
+      )
+
+    var encoded = newSeq[uint8](int(encodedLength))
+    var cursor = encoded.bytePointer()
+    let written = i2dPubkey(publicKey, addr cursor)
+    if written != encodedLength:
+      return fail[seq[uint8]](
+        seCryptoError,
+        opensslErrorMessage("OpenSSL failed to encode SubjectPublicKeyInfo DER")
+      )
+
+    result = ok(encoded)
+  except CatchableError as e:
+    result = fail[seq[uint8]](
+      seCryptoError,
+      "OpenSSL libcrypto is unavailable: " & e.msg
+    )
 
 # =============================================================================
 # DER bundle handling

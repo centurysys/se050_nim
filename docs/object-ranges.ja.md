@@ -21,6 +21,10 @@
 | `uid` | `0x7FFF0206` | NXP unique ID | 読出し確認済み |
 | NXP Attestation key | `0xF0000012` | P-256 key pair / NXP | 事前搭載、署名検証に使用 |
 | NXP device certificate | `0xF0000013` | BinaryFile / NXP | 事前搭載、X.509検証に使用 |
+| NXP factory Cloud ECC identity 0 | `0xF0000100` / `0xF0000101` | P-256 key pair + certificate / NXP | variant依存、read-only利用 |
+| NXP factory Cloud ECC identity 1 | `0xF0000102` / `0xF0000103` | P-256 key pair + certificate / NXP | variant依存、read-only利用 |
+| NXP factory Cloud RSA identity 0 | `0xF0000110` / `0xF0000111` | RSA-2048 key pair + certificate / NXP | variant依存、read-only利用 |
+| NXP factory Cloud RSA identity 1 | `0xF0000112` / `0xF0000113` | RSA-2048 key pair + certificate / NXP | variant依存、read-only利用 |
 | test firmware KEX | `0x30000100` | P-256 key pair / dev | Exporter実装・実機確認済み |
 | production firmware KEX | `0x20000100` | P-256 key pair / customer | 生成CLI・汎用変更ガード実装済み、不可逆実機試験待ち |
 | test TLS identity key0 A/B | `0x30000200..0x30000201` | P-256 key pair / dev | identity番号 + A/B slot、実機確認済み |
@@ -28,6 +32,14 @@
 | production TLS identity | `0x20000200..` | P-256 key pair / customer | identity番号 + A/B slot、生成はTLS専用CLIのみ |
 
 Firmware KEXはtest/productionとも下位16-bit indexを`0x0100`に揃えます。TLS client identityは`0x0200`をbaseとし、`identity * 2 + slotOffset`でObject IDを割り当てます。test/productionでは同じ下位16-bit indexを使い、Object areaでライフサイクルを分離します。
+
+## NXP factory Cloud identity Object
+
+`0xF0000100..0xF0000113`の既知Cloud connection credentialはNXP factory provisioning領域として扱います。SE050 variant/configurationによって存在する組み合わせが異なるため、`se050ctl factory-list`で実機確認してから使用します。
+
+`factory-cert`、`factory-pubkey`、`factory-key-ref`はread-onlyです。generic `keygen` / `delete`のmutation guardは`0xF0000000..0xFFFFFFFF`を引き続き拒否します。
+
+詳細は[`factory-identities.ja.md`](factory-identities.ja.md)を参照してください。
 
 ## Production firmware KEX IDの予約ガード
 

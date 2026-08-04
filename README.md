@@ -92,6 +92,7 @@ The Host OS is treated as a trusted environment and direct I2C uses a Plain sess
 Details:
 
 - [`docs/openssl-provider.md`](docs/openssl-provider.md): NXP OpenSSL Provider integration
+- [`docs/factory-identities.md`](docs/factory-identities.md): NXP factory-provisioned cloud identities
 - [`docs/local-mtls-test.md`](docs/local-mtls-test.md): local mTLS integration test
 - [`docs/aws-iot.md`](docs/aws-iot.md): AWS IoT Core provisioning and connection
 - [`docs/azure-iot.md`](docs/azure-iot.md): Azure IoT Hub provisioning and connection
@@ -109,6 +110,28 @@ bin/se050-kitting-export
 - `se050-kitting-export`: factory/development generation of attested CSV records
 
 The exporter implements both the deletable `test` profile and the no-delete/no-overwrite `production` profile. Because production creation is irreversible, treat that path as experimental until it has been exercised on a non-shipping evaluation device.
+
+## NXP factory-provisioned cloud identities
+
+Known NXP cloud connection credentials can be used read-only when they are present on the target SE050 variant. The catalog covers ECC P-256 and RSA-2048 identity 0/1 pairs; `factory-list` reports which objects actually exist.
+
+```sh
+se050ctl factory-list -b 0
+
+se050ctl factory-cert \
+  -b 0 \
+  --kind ecc \
+  --identity 0 \
+  --out device.crt
+
+KEY_URI=$(se050ctl factory-key-ref --kind ecc --identity 0)
+```
+
+This path avoids new key generation, CSR generation, and private-key files. Register the factory certificate with the target service and reference the private key through the NXP OpenSSL Provider `nxp:0x...` URI.
+
+Use the managed TLS identities for customer-controlled PKI, rotation, and multiple independent service identities. Factory-certificate validity, revocation, chain trust, and target-service acceptance must be checked for the deployment.
+
+See [`docs/factory-identities.md`](docs/factory-identities.md).
 
 ## Kitting
 
@@ -234,6 +257,7 @@ See [`docs/object-ranges.md`](docs/object-ranges.md).
 - TLS identity profiles, identity numbering, and A/B slots
 - TLS identity Attestation semantic validation
 - NXP OpenSSL Provider Object URIs and P-256 SPKI DER conversion
+- NXP factory cloud identity catalog and certificate/public-key readout
 - exporter CSV merge helpers
 
 Firmware-envelope formats, HKDF, AES-GCM, release CEK handling, firmware signatures, and A/B updates remain out of scope.
@@ -274,6 +298,7 @@ Using TLS client identities from OpenSSL/TLS additionally requires the official 
 - [`docs/object-ranges.md`](docs/object-ranges.md): Object IDs and policies
 - [`docs/p256-ecdh.md`](docs/p256-ecdh.md): P-256 ECDH for envelopes
 - [`docs/openssl-provider.md`](docs/openssl-provider.md): NXP OpenSSL Provider integration
+- [`docs/factory-identities.md`](docs/factory-identities.md): NXP factory-provisioned cloud identities
 - [`docs/local-mtls-test.md`](docs/local-mtls-test.md): local TLS 1.2/1.3 mTLS integration test
 - [`docs/aws-iot.md`](docs/aws-iot.md): AWS IoT Core provisioning and connection
 - [`docs/azure-iot.md`](docs/azure-iot.md): Azure IoT Hub provisioning and connection

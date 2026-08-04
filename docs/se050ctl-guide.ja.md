@@ -89,6 +89,48 @@ transient: 0x01 (persistent)
 size: 32
 ```
 
+## NXP factory-provisioned Cloud identity
+
+SE050 variantにNXP factory Cloud credentialが存在する場合、read-onlyでcertificateとProvider key URIを取得できます。
+
+まず搭載Objectを確認します。
+
+```sh
+se050ctl factory-list -b 0
+```
+
+ECC identity 0のcertificateをPEMで取得:
+
+```sh
+se050ctl factory-cert \
+  -b 0 \
+  --kind ecc \
+  --identity 0 \
+  --format pem \
+  --out device.crt
+```
+
+Provider URIだけをstdoutへ出力:
+
+```sh
+se050ctl factory-key-ref --kind ecc --identity 0
+```
+
+certificateのSubjectPublicKeyInfoを取得:
+
+```sh
+se050ctl factory-pubkey \
+  -b 0 \
+  --kind ecc \
+  --identity 0 \
+  --format pem \
+  --out device-public.pem
+```
+
+`--kind`は`ecc`または`rsa`、`--identity`は`0`または`1`です。factory Objectはvariantによって存在しない場合があります。このcommand群はfactory Objectを生成、上書き、削除しません。
+
+詳細は[`factory-identities.ja.md`](factory-identities.ja.md)を参照してください。
+
 ## TLS client identity鍵
 
 TLS client identityは任意Object IDを指定せず、固定profile / identity / slotだけを操作します。

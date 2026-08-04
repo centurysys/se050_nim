@@ -21,6 +21,10 @@ This document defines the Object IDs, access policies, and responsibility bounda
 | `uid` | `0x7FFF0206` | NXP unique ID | read path verified |
 | NXP attestation key | `0xF0000012` | P-256 key pair / NXP | pre-provisioned, used for signatures |
 | NXP device certificate | `0xF0000013` | BinaryFile / NXP | pre-provisioned, used for X.509 validation |
+| NXP factory Cloud ECC identity 0 | `0xF0000100` / `0xF0000101` | P-256 key pair + certificate / NXP | variant-dependent, read-only use |
+| NXP factory Cloud ECC identity 1 | `0xF0000102` / `0xF0000103` | P-256 key pair + certificate / NXP | variant-dependent, read-only use |
+| NXP factory Cloud RSA identity 0 | `0xF0000110` / `0xF0000111` | RSA-2048 key pair + certificate / NXP | variant-dependent, read-only use |
+| NXP factory Cloud RSA identity 1 | `0xF0000112` / `0xF0000113` | RSA-2048 key pair + certificate / NXP | variant-dependent, read-only use |
 | test firmware KEX | `0x30000100` | P-256 key pair / dev | exporter implemented and tested |
 | production firmware KEX | `0x20000100` | P-256 key pair / customer | creation CLI and generic mutation guard implemented; irreversible device test pending |
 | test TLS identity key0 A/B | `0x30000200..0x30000201` | P-256 key pair / dev | identity number + A/B slot, device-tested |
@@ -28,6 +32,14 @@ This document defines the Object IDs, access policies, and responsibility bounda
 | production TLS identities | `0x20000200..` | P-256 key pair / customer | identity number + A/B slot, creation through TLS-specific CLI only |
 
 Firmware KEX uses the same lower index `0x0100` for test and production. TLS client identities use `0x0200` as the base and derive Object IDs as `identity * 2 + slotOffset`. Test and production keep matching lower 16-bit indices while the Object area separates their lifecycle.
+
+## NXP factory cloud identity objects
+
+The known cloud connection credentials in `0xF0000100..0xF0000113` are treated as NXP factory-provisioned objects. Their presence depends on the SE050 variant/configuration, so inspect the target with `se050ctl factory-list` before use.
+
+`factory-cert`, `factory-pubkey`, and `factory-key-ref` are read-only. The generic `keygen` / `delete` mutation guard continues to reject the entire `0xF0000000..0xFFFFFFFF` internal range.
+
+See [`factory-identities.md`](factory-identities.md).
 
 ## Production firmware KEX ID reservation guard
 

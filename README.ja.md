@@ -92,9 +92,32 @@ Host OSはtrusted environmentとして扱い、SE050とのdirect I2C通信には
 詳細:
 
 - [`docs/openssl-provider.ja.md`](docs/openssl-provider.ja.md): NXP OpenSSL Provider連携
+- [`docs/factory-identities.ja.md`](docs/factory-identities.ja.md): NXP factory-provisioned Cloud identity
 - [`docs/local-mtls-test.ja.md`](docs/local-mtls-test.ja.md): ローカルmTLS統合試験
 - [`docs/aws-iot.ja.md`](docs/aws-iot.ja.md): AWS IoT Core接続手順
 - [`docs/azure-iot.ja.md`](docs/azure-iot.ja.md): Azure IoT Hub接続手順
+
+## NXP factory-provisioned Cloud identity
+
+SE050 variantに事前搭載されているNXP Cloud connection credentialをread-onlyで利用できます。対応catalogはECC P-256およびRSA-2048のidentity 0/1で、実機に存在するObjectは`factory-list`で確認します。
+
+```sh
+se050ctl factory-list -b 0
+
+se050ctl factory-cert \
+  -b 0 \
+  --kind ecc \
+  --identity 0 \
+  --out device.crt
+
+KEY_URI=$(se050ctl factory-key-ref --kind ecc --identity 0)
+```
+
+この経路では新規key generation、CSR、private-key fileが不要です。factory certificateをCloud側へ登録し、private keyはNXP OpenSSL Providerから`nxp:0x...` URIで参照できます。
+
+自社PKI、rotation、複数service identityが必要な場合は、上記のmanaged TLS client identityを使用します。factory credentialのcertificate validity/revocation/Cloud受入可否は利用時に確認してください。
+
+詳細は[`docs/factory-identities.ja.md`](docs/factory-identities.ja.md)を参照してください。
 
 ## 生成されるコマンド
 
@@ -234,6 +257,7 @@ P-256公開鍵は65 bytesの非圧縮point、ECDH shared secretは32 bytesです
 - TLS identity profile / A/B slot / identity番号管理
 - TLS identity Attestation semantic検証
 - NXP OpenSSL Provider用Object URIとP-256 SPKI DER変換
+- NXP factory Cloud identity catalog、certificate/public key readout
 - Exporter用CSV merge helper
 
 Firmware envelope format、HKDF、AES-GCM、release CEK、ファームウェア署名検証、A/B更新はこのライブラリの範囲外です。
@@ -274,6 +298,7 @@ TLS client identityをOpenSSL/TLSから利用する場合は、別途NXP公式`s
 - [`docs/object-ranges.ja.md`](docs/object-ranges.ja.md): Object ID/Policy
 - [`docs/p256-ecdh.ja.md`](docs/p256-ecdh.ja.md): Envelope向けP-256 ECDH
 - [`docs/openssl-provider.ja.md`](docs/openssl-provider.ja.md): NXP OpenSSL Provider連携
+- [`docs/factory-identities.ja.md`](docs/factory-identities.ja.md): NXP factory-provisioned Cloud identity
 - [`docs/local-mtls-test.ja.md`](docs/local-mtls-test.ja.md): ローカルTLS 1.2/1.3 mTLS統合試験
 - [`docs/aws-iot.ja.md`](docs/aws-iot.ja.md): AWS IoT Core provisioning / 接続
 - [`docs/azure-iot.ja.md`](docs/azure-iot.ja.md): Azure IoT Hub provisioning / 接続
