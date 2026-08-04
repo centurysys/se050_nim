@@ -61,6 +61,14 @@ type
     tpkRaw,
     tpkSpkiDer
 
+  FactoryCertificateFormat = enum
+    fcfDer,
+    fcfPem
+
+  FactoryPublicKeyFormat = enum
+    fpkSpkiDer,
+    fpkPem
+
   ObjectAreaSpec = object
     area: ObjectArea
     name: string
@@ -461,6 +469,55 @@ proc parseTlsPublicKeyFormat(value: string): TlsPublicKeyFormat =
       &"TLS public-key format must be raw or spki-der: {value}"
     )
 
+proc parseFactoryCloudIdentityProfile(
+    kindText: string,
+    identityText: string
+): FactoryCloudIdentityProfile =
+  let kind =
+    case kindText.strip().toLowerAscii()
+    of "ecc", "p256", "ecc-p256", "prime256v1", "secp256r1":
+      fciEccP256
+    of "rsa", "rsa2048", "rsa-2048":
+      fciRsa2048
+    else:
+      raise newException(
+        ValueError,
+        &"factory identity kind must be ecc or rsa: {kindText}"
+      )
+
+  let identity = parseIndex(identityText)
+  if identity >= uint32(FactoryCloudIdentityCount):
+    raise newException(
+      ValueError,
+      &"factory identity number must be 0 or 1: {identityText}"
+    )
+
+  result = factoryCloudIdentityProfile(kind, uint8(identity))
+
+proc parseFactoryCertificateFormat(value: string): FactoryCertificateFormat =
+  case value.strip().toLowerAscii()
+  of "der":
+    result = fcfDer
+  of "pem":
+    result = fcfPem
+  else:
+    raise newException(
+      ValueError,
+      &"factory certificate format must be der or pem: {value}"
+    )
+
+proc parseFactoryPublicKeyFormat(value: string): FactoryPublicKeyFormat =
+  case value.strip().toLowerAscii()
+  of "spki-der", "spki", "der":
+    result = fpkSpkiDer
+  of "pem":
+    result = fpkPem
+  else:
+    raise newException(
+      ValueError,
+      &"factory public-key format must be spki-der or pem: {value}"
+    )
+
 proc isReadableEcPublicObjectType(objectType: uint8): bool =
   ## Returns true for EC key-pair/public-key object types whose public key can
   ## be read using ReadObject.
@@ -716,6 +773,244 @@ proc printTlsIdentityInfo(info: TlsIdentityLiveInfo, created: Option[bool]) =
   echo "  public key match: live == attested"
   echo "  attestation certificate chain: verified"
   echo "  attestation signature: verified"
+
+proc factoryObjectStatus(
+    se: Se050Transport,
+    objectId: uint32,
+    selectFirst: bool
+): SE[string] =
+  let exists = se.objectExists(
+    objectId = objectId,
+    selectFirst = selectFirst
+  )
+  if not exists.ok:
+    return fail[string](
+      exists.error.kind,
+      exists.error.message,
+      exists.error.sw
+    )
+
+  if not exists.value:
+    return ok("missing")
+
+  let objectType = se.readObjectType(
+    objectId = objectId,
+    selectFirst = false
+  )
+  if not objectType.ok:
+    return fail[string](
+      objectType.error.kind,
+      objectType.error.message,
+      objectType.error.sw
+    )
+
+  result = ok(&"present, type {typeText(objectType.value.objectType)}")
+
+proc runFactoryList(
+    busText: string,
+    addressText: string,
+    debug: bool
+): int =
+  ## Shows the known NXP factory cloud credentials and attestation objects.
+  let se = openAndRequestAtr(busText, addressText, debug)
+  var selectFirst = true
+
+  echo "NXP factory-provisioned objects"
+  echo "cloud connection identities:"
+
+  for profile in factoryCloudIdentityProfiles():
+    let keyStatus = se.factoryObjectStatus(
+      profile.keyObjectId,
+      selectFirst = selectFirst
+    )
+    selectFirst = false
+    if not keyStatus.ok:
+      printSe050Error("factory-list key inspection failed", keyStatus.error)
+      return 1
+
+    let certificateStatus = se.factoryObjectStatus(
+      profile.certificateObjectId,
+      selectFirst = false
+    )
+    if not certificateStatus.ok:
+      printSe050Error(
+        "factory-list certificate inspection failed",
+        certificateStatus.error
+      )
+      return 1
+
+    echo &"  {profile.name}"
+    echo &"    key {objectIdHex(profile.keyObjectId)}: {keyStatus.value}"
+    echo &"    certificate {objectIdHex(profile.certificateObjectId)}: {certificateStatus.value}"
+
+  echo "attestation identity:"
+  let attestationKeyStatus = se.factoryObjectStatus(
+    Se050AttestationKeyObjectId,
+    selectFirst = selectFirst
+  )
+  selectFirst = false
+  if not attestationKeyStatus.ok:
+    printSe050Error(
+      "factory-list attestation key inspection failed",
+      attestationKeyStatus.error
+    )
+    return 1
+
+  let attestationCertificateStatus = se.factoryObjectStatus(
+    Se050AttestationCertificateObjectId,
+    selectFirst = false
+  )
+  if not attestationCertificateStatus.ok:
+    printSe050Error(
+      "factory-list attestation certificate inspection failed",
+      attestationCertificateStatus.error
+    )
+    return 1
+
+  echo &"  key {objectIdHex(Se050AttestationKeyObjectId)}: {attestationKeyStatus.value}"
+  echo &"  certificate {objectIdHex(Se050AttestationCertificateObjectId)}: {attestationCertificateStatus.value}"
+  result = 0
+
+proc requireFactoryIdentityObjects(
+    se: Se050Transport,
+    profile: FactoryCloudIdentityProfile
+): SE[void] =
+  let keyExists = se.objectExists(
+    objectId = profile.keyObjectId,
+    selectFirst = true
+  )
+  if not keyExists.ok:
+    return fail[void](
+      keyExists.error.kind,
+      keyExists.error.message,
+      keyExists.error.sw
+    )
+  if not keyExists.value:
+    return fail[void](
+      seInvalidArgument,
+      &"factory key {objectIdHex(profile.keyObjectId)} does not exist on this SE050"
+    )
+
+  let certificateExists = se.objectExists(
+    objectId = profile.certificateObjectId,
+    selectFirst = false
+  )
+  if not certificateExists.ok:
+    return fail[void](
+      certificateExists.error.kind,
+      certificateExists.error.message,
+      certificateExists.error.sw
+    )
+  if not certificateExists.value:
+    return fail[void](
+      seInvalidArgument,
+      &"factory certificate {objectIdHex(profile.certificateObjectId)} does not exist on this SE050"
+    )
+
+  result = ok()
+
+proc runFactoryKeyRef(
+    kindText: string,
+    identityText: string
+): int =
+  ## Prints only the NXP OpenSSL Provider URI for shell/script consumption.
+  let profile = parseFactoryCloudIdentityProfile(kindText, identityText)
+  echo profile.opensslProviderKeyUri()
+  result = 0
+
+proc runFactoryCert(
+    busText: string,
+    addressText: string,
+    debug: bool,
+    kindText: string,
+    identityText: string,
+    formatText: string,
+    outputPath: string
+): int =
+  let profile = parseFactoryCloudIdentityProfile(kindText, identityText)
+  let outputFormat = parseFactoryCertificateFormat(formatText)
+  if outputPath.strip().len == 0:
+    raise newException(ValueError, "--out is required for factory-cert")
+
+  let se = openAndRequestAtr(busText, addressText, debug)
+  let available = se.requireFactoryIdentityObjects(profile)
+  if not available.ok:
+    printSe050Error("factory identity is unavailable", available.error)
+    return 1
+
+  let certificate = se.readFactoryCertificate(
+    profile,
+    selectFirst = false
+  )
+  if not certificate.ok:
+    printSe050Error("factory certificate read failed", certificate.error)
+    return 1
+
+  case outputFormat
+  of fcfDer:
+    if not writeRawBytes(outputPath, certificate.value, "factory-cert"):
+      return 1
+  of fcfPem:
+    try:
+      writeFile(outputPath, factoryCertificateDerToPem(certificate.value))
+    except CatchableError as e:
+      stderr.writeLine &"factory-cert: cannot write {outputPath}: {e.msg}"
+      return 1
+
+  let formatName = if outputFormat == fcfDer: "der" else: "pem"
+  echo &"{objectIdHex(profile.certificateObjectId)}: factory certificate written to {outputPath}"
+  echo &"kind: {profile.kind.factoryCloudIdentityKindName()}"
+  echo &"identity: {profile.identity}"
+  echo &"format: {formatName}"
+  echo &"DER length: {certificate.value.len}"
+  result = 0
+
+proc runFactoryPubkey(
+    busText: string,
+    addressText: string,
+    debug: bool,
+    kindText: string,
+    identityText: string,
+    formatText: string,
+    outputPath: string
+): int =
+  let profile = parseFactoryCloudIdentityProfile(kindText, identityText)
+  let outputFormat = parseFactoryPublicKeyFormat(formatText)
+  if outputPath.strip().len == 0:
+    raise newException(ValueError, "--out is required for factory-pubkey")
+
+  let se = openAndRequestAtr(busText, addressText, debug)
+  let available = se.requireFactoryIdentityObjects(profile)
+  if not available.ok:
+    printSe050Error("factory identity is unavailable", available.error)
+    return 1
+
+  let publicKey = se.readFactoryCertificatePublicKeySpkiDer(
+    profile,
+    selectFirst = false
+  )
+  if not publicKey.ok:
+    printSe050Error("factory public-key extraction failed", publicKey.error)
+    return 1
+
+  case outputFormat
+  of fpkSpkiDer:
+    if not writeRawBytes(outputPath, publicKey.value, "factory-pubkey"):
+      return 1
+  of fpkPem:
+    try:
+      writeFile(outputPath, subjectPublicKeyInfoDerToPem(publicKey.value))
+    except CatchableError as e:
+      stderr.writeLine &"factory-pubkey: cannot write {outputPath}: {e.msg}"
+      return 1
+
+  let formatName = if outputFormat == fpkSpkiDer: "spki-der" else: "pem"
+  echo &"{objectIdHex(profile.certificateObjectId)}: certificate public key written to {outputPath}"
+  echo &"kind: {profile.kind.factoryCloudIdentityKindName()}"
+  echo &"identity: {profile.identity}"
+  echo &"format: {formatName}"
+  echo &"length: {publicKey.value.len}"
+  result = 0
 
 proc runTlsKeyRef(
     profileText: string,
@@ -1673,6 +1968,61 @@ proc main(): int =
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
         quit(runVersion(opts.bus, opts.address, opts.debug))
+
+    command("factory-list"):
+      help("Show known NXP factory-provisioned cloud and attestation objects.")
+      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
+      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      flag("-d", "--debug", help = "Print T=1 over I2C frames")
+      run:
+        quit(runFactoryList(opts.bus, opts.address, opts.debug))
+
+    command("factory-key-ref"):
+      help("Print the NXP OpenSSL Provider URI for one factory cloud identity.")
+      option("--kind", default = some("ecc"), help = "Factory identity kind: ecc or rsa, default: ecc")
+      option("--identity", default = some("0"), help = "Factory identity number: 0 or 1, default: 0")
+      run:
+        quit(runFactoryKeyRef(opts.kind, opts.identity))
+
+    command("factory-cert"):
+      help("Export an NXP factory-provisioned cloud identity certificate.")
+      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
+      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("--kind", default = some("ecc"), help = "Factory identity kind: ecc or rsa, default: ecc")
+      option("--identity", default = some("0"), help = "Factory identity number: 0 or 1, default: 0")
+      option("--format", default = some("pem"), help = "Output format: pem or der, default: pem")
+      option("--out", required = true, help = "Output file")
+      flag("-d", "--debug", help = "Print T=1 over I2C frames")
+      run:
+        quit(runFactoryCert(
+          opts.bus,
+          opts.address,
+          opts.debug,
+          opts.kind,
+          opts.identity,
+          opts.format,
+          opts.out
+        ))
+
+    command("factory-pubkey"):
+      help("Export the public key from an NXP factory cloud certificate.")
+      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
+      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("--kind", default = some("ecc"), help = "Factory identity kind: ecc or rsa, default: ecc")
+      option("--identity", default = some("0"), help = "Factory identity number: 0 or 1, default: 0")
+      option("--format", default = some("spki-der"), help = "Output format: spki-der or pem, default: spki-der")
+      option("--out", required = true, help = "Output file")
+      flag("-d", "--debug", help = "Print T=1 over I2C frames")
+      run:
+        quit(runFactoryPubkey(
+          opts.bus,
+          opts.address,
+          opts.debug,
+          opts.kind,
+          opts.identity,
+          opts.format,
+          opts.out
+        ))
 
     command("tls-key-ref"):
       help("Print the NXP OpenSSL Provider URI for one TLS identity slot.")

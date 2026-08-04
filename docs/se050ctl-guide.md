@@ -57,6 +57,34 @@ se050ctl list -b 0 --area dev --annotate
 
 Random length is 1..255 bytes. `exists --quiet` uses the exit status without printing.
 
+## NXP factory-provisioned cloud identities
+
+When the target SE050 variant contains NXP factory cloud credentials, the CLI can export their certificates and Provider references without modifying the objects.
+
+```sh
+se050ctl factory-list -b 0
+
+se050ctl factory-cert \
+  -b 0 \
+  --kind ecc \
+  --identity 0 \
+  --format pem \
+  --out device.crt
+
+se050ctl factory-key-ref --kind ecc --identity 0
+
+se050ctl factory-pubkey \
+  -b 0 \
+  --kind ecc \
+  --identity 0 \
+  --format pem \
+  --out device-public.pem
+```
+
+`--kind` accepts `ecc` or `rsa`; `--identity` accepts `0` or `1`. Object presence depends on the SE050 variant. These commands never create, overwrite, or delete factory objects.
+
+See [`factory-identities.md`](factory-identities.md).
+
 ## TLS client identity keys
 
 TLS client identity commands do not accept arbitrary Object IDs. They operate only on fixed profile/slot mappings:
