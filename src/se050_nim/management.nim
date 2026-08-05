@@ -35,6 +35,26 @@ const
   CurveListP1Curve = 0x0B'u8
   CurveListP2List = 0x25'u8
 
+  # SE05x EC curve management APDUs:
+  #
+  #   CreateECCurve     80 01 0B 04
+  #   SetECCurveParam   80 01 0B 40
+  #   DeleteECCurve     80 04 0B 28
+  #
+  # DeleteECCurve deliberately uses the documented P2_DELETE_OBJECT value
+  # 0x28. Some newer header files also define P2_DELETE_CURVE, but AN12543
+  # continues to specify 0x28 for the command itself.
+  CurveMgmtCla = 0x80'u8
+  CurveMgmtInsWrite = 0x01'u8
+  CurveMgmtInsMgmt = 0x04'u8
+  CurveMgmtP1Curve = 0x0B'u8
+  CurveMgmtP2Create = 0x04'u8
+  CurveMgmtP2Param = 0x40'u8
+  CurveMgmtP2Delete = 0x28'u8
+
+  Tag2 = 0x42'u8
+  Tag3 = 0x43'u8
+
   SetIndicatorNotSet = 0x01'u8
   SetIndicatorSet = 0x02'u8
 
@@ -84,6 +104,17 @@ type
     ## identifiers without making the parser reject an otherwise valid response.
     indicators*: seq[uint8]
 
+  EcCurveParam* = enum
+    ## One of the five Weierstrass parameters required by SetECCurveParam.
+    ##
+    ## The enum intentionally uses ordinary Nim ordinals. ecCurveParamWireValue()
+    ## maps these names to the non-contiguous SE05x wire identifiers.
+    ecCurveParamA,
+    ecCurveParamB,
+    ecCurveParamG,
+    ecCurveParamN,
+    ecCurveParamPrime
+
 # =============================================================================
 # Internal helpers
 # =============================================================================
@@ -126,6 +157,166 @@ proc knownFeatureBits*(): seq[uint16] =
     ConfigFipsModeDisabled,
     ConfigI2cm,
   ]
+
+proc ecCurveParamWireValue*(param: EcCurveParam): uint8 =
+  ## Returns the SE05x_ECCurveParam_t value used in TAG_2.
+  result = case param
+  of ecCurveParamA: 0x01'u8
+  of ecCurveParamB: 0x02'u8
+  of ecCurveParamG: 0x04'u8
+  of ecCurveParamN: 0x08'u8
+  of ecCurveParamPrime: 0x10'u8
+
+proc ecCurveParamName*(param: EcCurveParam): string =
+  result = case param
+  of ecCurveParamA: "A"
+  of ecCurveParamB: "B"
+  of ecCurveParamG: "G"
+  of ecCurveParamN: "N"
+  of ecCurveParamPrime: "PRIME"
+
+proc isKnownWeierstrassCurveId(curveId: uint8): bool =
+  ## The current SE05x enum defines consecutive Weierstrass identifiers
+  ## 0x01..0x11. Reserved Ed/Montgomery identifiers start at 0x40.
+  result = curveId >= 0x01'u8 and curveId <= 0x11'u8
+
+proc appendCurveTlvLength(buf: var seq[uint8], length: int) =
+  ## BER-TLV length encoding used by SetECCurveParam.
+  ##
+  ## P-521 G is 133 bytes, so the 0x81 form is required even though the whole
+  ## command still fits in a short APDU.
+  doAssert length >= 0
+
+  if length < 0x80:
+    buf.add(uint8(length))
+  elif length <= 0xFF:
+    buf.add(0x81'u8)
+    buf.add(uint8(length))
+  elif length <= 0xFFFF:
+    buf.add(0x82'u8)
+    buf.add(uint8((length shr 8) and 0xFF))
+    buf.add(uint8(length and 0xFF))
+  else:
+    # The caller rejects the resulting payload as too large for this short-APDU
+    # helper. Keeping the encoder total makes that failure deterministic.
+    buf.add(0x83'u8)
+    buf.add(uint8((length shr 16) and 0xFF))
+    buf.add(uint8((length shr 8) and 0xFF))
+    buf.add(uint8(length and 0xFF))
+
+proc appendCurveTlvU8(buf: var seq[uint8], tag: uint8, value: uint8) =
+  buf.add(tag)
+  buf.add(0x01'u8)
+  buf.add(value)
+
+proc appendCurveTlvBytes(
+    buf: var seq[uint8],
+    tag: uint8,
+    value: openArray[uint8]
+) =
+  buf.add(tag)
+  buf.appendCurveTlvLength(value.len)
+  for b in value:
+    buf.add(b)
+
+proc buildCurveManagementApdu(
+    ins: uint8,
+    p2: uint8,
+    payload: openArray[uint8],
+    commandName: string
+): SE[seq[uint8]] =
+  if payload.len > 255:
+    return fail[seq[uint8]](
+      seApduTooLarge,
+      commandName & " payload is too large for a short APDU"
+    )
+
+  result.value = @[
+    CurveMgmtCla,
+    ins,
+    CurveMgmtP1Curve,
+    p2,
+    uint8(payload.len)
+  ]
+  for b in payload:
+    result.value.add(b)
+  result.ok = true
+
+proc buildCreateEcCurveApdu*(curveId: uint8): SE[seq[uint8]] =
+  ## Builds CreateECCurve.
+  ##
+  ## This only encodes the APDU. It does not alter the SE05x until a caller
+  ## explicitly transmits the returned bytes.
+  if not isKnownWeierstrassCurveId(curveId):
+    return fail[seq[uint8]](
+      seInvalidArgument,
+      &"curve ID 0x{curveId.toHex(2)} is not a known Weierstrass curve identifier"
+    )
+
+  var payload: seq[uint8] = @[]
+  payload.appendCurveTlvU8(Tag1, curveId)
+
+  result = buildCurveManagementApdu(
+    CurveMgmtInsWrite,
+    CurveMgmtP2Create,
+    payload,
+    "CreateECCurve"
+  )
+
+proc buildSetEcCurveParamApdu*(
+    curveId: uint8,
+    param: EcCurveParam,
+    value: openArray[uint8]
+): SE[seq[uint8]] =
+  ## Builds SetECCurveParam for one standard Weierstrass parameter.
+  ##
+  ## NXP requires all five A/B/G/N/PRIME parameters to be configured before a
+  ## newly created Weierstrass curve becomes usable. The secure element checks
+  ## that the supplied values match the selected standard curve.
+  if not isKnownWeierstrassCurveId(curveId):
+    return fail[seq[uint8]](
+      seInvalidArgument,
+      &"curve ID 0x{curveId.toHex(2)} is not a known Weierstrass curve identifier"
+    )
+
+  if value.len == 0:
+    return fail[seq[uint8]](
+      seInvalidArgument,
+      &"EC curve parameter {param.ecCurveParamName()} must not be empty"
+    )
+
+  var payload: seq[uint8] = @[]
+  payload.appendCurveTlvU8(Tag1, curveId)
+  payload.appendCurveTlvU8(Tag2, param.ecCurveParamWireValue())
+  payload.appendCurveTlvBytes(Tag3, value)
+
+  result = buildCurveManagementApdu(
+    CurveMgmtInsWrite,
+    CurveMgmtP2Param,
+    payload,
+    "SetECCurveParam"
+  )
+
+proc buildDeleteEcCurveApdu*(curveId: uint8): SE[seq[uint8]] =
+  ## Builds DeleteECCurve for rollback/recovery of a non-default curve.
+  ##
+  ## This helper is added before any live provisioning API so a future
+  ## transaction can always construct its documented rollback command first.
+  if not isKnownWeierstrassCurveId(curveId):
+    return fail[seq[uint8]](
+      seInvalidArgument,
+      &"curve ID 0x{curveId.toHex(2)} is not a known Weierstrass curve identifier"
+    )
+
+  var payload: seq[uint8] = @[]
+  payload.appendCurveTlvU8(Tag1, curveId)
+
+  result = buildCurveManagementApdu(
+    CurveMgmtInsMgmt,
+    CurveMgmtP2Delete,
+    payload,
+    "DeleteECCurve"
+  )
 
 proc ecCurveName*(curveId: uint8): string =
   ## Human-readable names for the consecutive SE05x Weierstrass curve IDs.
