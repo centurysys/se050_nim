@@ -1297,6 +1297,82 @@ proc runCurveList(
 
   result = 0
 
+proc runCurveProvisionP384(
+    busText: string,
+    addressText: string,
+    debug: bool,
+    confirmed: bool
+): int =
+  ## Explicitly provisions the standard NIST P-384 curve domain parameters.
+  ##
+  ## Curve state is global SE05x state, not a disposable key object. Require an
+  ## affirmative flag before opening the transport so accidental invocation of
+  ## the command cannot mutate a device.
+  if not confirmed:
+    stderr.writeLine(
+      "curve-provision-p384 refused: this changes persistent global SE05x curve state; " &
+      "re-run with --yes after checking 'se050ctl curve-list'"
+    )
+    return 2
+
+  let se = openAndRequestAtr(busText, addressText, debug)
+
+  let before = se.readEcCurveList(selectFirst = true)
+  if not before.ok:
+    printSe050Error("ReadECCurveList before P-384 provisioning failed", before.error)
+    return 1
+
+  let beforeState = before.value.ecCurveSetState(Se050CurveNistP384)
+  if not beforeState.ok:
+    printSe050Error("P-384 curve-state lookup failed", beforeState.error)
+    return 1
+
+  let beforeText =
+    if beforeState.value == ecCurveSet:
+      "set"
+    else:
+      "not-set"
+
+  echo "NIST P-384 curve provisioning:"
+  echo &"  before: {beforeText}"
+  echo "  parameters: fixed standard secp384r1 / NIST P-384 values"
+
+  let provisioned = se.provisionNistP384Curve(selectFirst = false)
+  if not provisioned.ok:
+    printSe050Error("NIST P-384 curve provisioning failed", provisioned.error)
+    return 1
+
+  case provisioned.value
+  of ecCurveAlreadyInstantiated:
+    echo "  action: none (already instantiated)"
+  of ecCurveProvisioned:
+    echo "  action: CreateECCurve + A/B/G/N/PRIME"
+
+  let after = se.readEcCurveList(selectFirst = false)
+  if not after.ok:
+    printSe050Error("ReadECCurveList after P-384 provisioning failed", after.error)
+    return 1
+
+  let afterState = after.value.ecCurveSetState(Se050CurveNistP384)
+  if not afterState.ok:
+    printSe050Error("P-384 post-provision curve-state lookup failed", afterState.error)
+    return 1
+
+  let afterText =
+    if afterState.value == ecCurveSet:
+      "set"
+    else:
+      "not-set"
+
+  echo &"  after: {afterText}"
+
+  if afterState.value != ecCurveSet:
+    stderr.writeLine("NIST P-384 provisioning did not leave the curve instantiated")
+    return 1
+
+  echo "NIST P-384 curve provisioning: OK"
+  result = 0
+
 proc runVersion(
     busText: string,
     addressText: string,
@@ -2072,6 +2148,20 @@ proc main(): int =
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
         quit(runCurveList(opts.bus, opts.address, opts.debug))
+
+    command("curve-provision-p384"):
+      help("Provision the fixed standard NIST P-384 curve parameters when currently not-set.")
+      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
+      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      flag("--yes", help = "Confirm modification of persistent global SE05x curve state")
+      flag("-d", "--debug", help = "Print T=1 over I2C frames")
+      run:
+        quit(runCurveProvisionP384(
+          opts.bus,
+          opts.address,
+          opts.debug,
+          opts.yes
+        ))
 
     command("version"):
       help("Read SE050 applet version and feature configuration.")
