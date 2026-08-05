@@ -203,6 +203,55 @@ suite "external TLS P-384 private-key preparation":
       check matched.error.kind in {seCryptoError, seInvalidResponse}
 
 
+
+  test "P-384 managed import rejects a P-256 profile before transport access":
+    let profile = testTlsIdentityProfile(0'u16, tisSlotA)
+    let se: Se050Transport = nil
+    let imported = se.importP384TlsIdentity(
+      profile,
+      P384SupportedPkcs8Pem,
+      bytesFromBase64(MatchingP384CertificateDerBase64)
+    )
+
+    check not imported.ok
+    check imported.error.kind == seInvalidArgument
+    check imported.error.message.contains("requires a P-384 profile")
+
+  test "P-384 managed import rejects a mismatched certificate before transport access":
+    let profile = testTlsIdentityProfile(
+      0'u16,
+      tisSlotA,
+      ecCurveP384
+    )
+    let se: Se050Transport = nil
+    let imported = se.importP384TlsIdentity(
+      profile,
+      P384SupportedPkcs8Pem,
+      bytesFromBase64(OtherP384CertificateDerBase64)
+    )
+
+    check not imported.ok
+    check imported.error.kind == seInvalidArgument
+    check imported.error.message.contains("does not match")
+
+  test "P-256 managed import rejects a P-384 profile before transport access":
+    let profile = testTlsIdentityProfile(
+      0'u16,
+      tisSlotA,
+      ecCurveP384
+    )
+    let se: Se050Transport = nil
+    let imported = se.importP256TlsIdentity(
+      profile,
+      P256Pkcs8Pem,
+      bytesFromBase64(MatchingCertificateDerBase64)
+    )
+
+    check not imported.ok
+    check imported.error.kind == seInvalidArgument
+    check imported.error.message.contains("requires a P-256 profile")
+
+
 suite "external TLS P-256 private-key parsing":
   test "parses PKCS#8 PEM and returns only public metadata":
     let parsed = parseP256PrivateKey(P256Pkcs8Pem)

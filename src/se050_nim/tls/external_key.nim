@@ -4,14 +4,13 @@
 #
 # Parses externally supplied private keys through OpenSSL 3 without invoking
 # the openssl command-line tool. Host-side recognition supports NIST P-256,
-# P-384, and P-521. The current managed SE050 import path remains deliberately
-# limited to P-256 until device curve capability/provisioning is handled.
+# P-384, and P-521. Managed SE050 import currently supports P-256 and P-384;
+# P-384 additionally requires the curve to be instantiated on the live applet.
 #
 # No public API exports or retains the private scalar. The decoded EVP_PKEY
 # exists only while the input is being validated. P-256 import extracts its
 # scalar only after all host-side checks and the SE050 empty-slot guard. P-384
-# now has the same private scalar extraction primitive prepared internally, but
-# it is not connected to the managed SE050 import workflow in this step.
+# follows the same rule after an additional read-only curve-instantiation guard.
 
 import ../errors
 import ../openssl_ffi
@@ -20,6 +19,7 @@ import ../transport
 import ../apdu
 import ../objects
 import ../keys
+import ../management
 import ./profile
 import ./live_identity
 
@@ -875,6 +875,12 @@ proc importP256TlsIdentityBytes(
       "TLS identity profile is invalid"
     )
 
+  if profile.curve != ecCurveP256:
+    return fail[TlsIdentityLiveInfo](
+      seInvalidArgument,
+      "P-256 TLS identity import requires a P-256 profile"
+    )
+
   let decoded = loadValidatedP256PrivateKey(encodedKey)
   if not decoded.ok:
     return fail[TlsIdentityLiveInfo](
@@ -965,6 +971,147 @@ proc importP256TlsIdentityBytes(
     let mismatch = Se050Error(
       kind: seTlsIdentityValidationFailed,
       message: "imported TLS public key does not match the validated external key",
+      sw: 0
+    )
+    return withCleanupNote(
+      mismatch,
+      cleanupNewTlsIdentityObject(se, profile)
+    )
+
+  result = live
+
+proc importP384TlsIdentityBytes(
+    se: Se050Transport,
+    profile: TlsIdentityProfile,
+    encodedKey: openArray[uint8],
+    certificateDer: openArray[uint8]
+): SE[TlsIdentityLiveInfo] =
+  ## Imports one externally generated P-384 TLS identity after host-side
+  ## key/certificate validation and a read-only curve-instantiation check.
+  if not profile.isValid():
+    return fail[TlsIdentityLiveInfo](
+      seInvalidArgument,
+      "TLS identity profile is invalid"
+    )
+
+  if profile.curve != ecCurveP384:
+    return fail[TlsIdentityLiveInfo](
+      seInvalidArgument,
+      "P-384 TLS identity import requires a P-384 profile"
+    )
+
+  let decoded = loadValidatedP384PrivateKey(encodedKey)
+  if not decoded.ok:
+    return fail[TlsIdentityLiveInfo](
+      decoded.error.kind,
+      decoded.error.message,
+      decoded.error.sw
+    )
+
+  defer:
+    evpPublicKeyFree(decoded.value.handle)
+
+  let keyInfo = validateP384PrivateKeyCertificateMatchHandle(
+    decoded.value,
+    certificateDer
+  )
+  if not keyInfo.ok:
+    return fail[TlsIdentityLiveInfo](
+      keyInfo.error.kind,
+      keyInfo.error.message,
+      keyInfo.error.sw
+    )
+
+  # Complete every host-side key/certificate check before the first SE050
+  # command. Curve provisioning is intentionally not implicit here.
+  let selected = se.selectApplet()
+  if not selected.ok:
+    return fail[TlsIdentityLiveInfo](
+      selected.error.kind,
+      selected.error.message,
+      selected.error.sw
+    )
+
+  let curves = se.readEcCurveList(selectFirst = false)
+  if not curves.ok:
+    return fail[TlsIdentityLiveInfo](
+      curves.error.kind,
+      curves.error.message,
+      curves.error.sw
+    )
+
+  let p384Instantiated = curves.value.isEcCurveInstantiated(Se050CurveNistP384)
+  if not p384Instantiated.ok:
+    return fail[TlsIdentityLiveInfo](
+      p384Instantiated.error.kind,
+      p384Instantiated.error.message,
+      p384Instantiated.error.sw
+    )
+
+  if not p384Instantiated.value:
+    return fail[TlsIdentityLiveInfo](
+      seInvalidArgument,
+      "NIST P-384 is not instantiated in the selected SE05x applet"
+    )
+
+  let exists = se.objectExists(
+    objectId = profile.keyObjectId,
+    selectFirst = false
+  )
+  if not exists.ok:
+    return fail[TlsIdentityLiveInfo](
+      exists.error.kind,
+      exists.error.message,
+      exists.error.sw
+    )
+
+  if exists.value:
+    return fail[TlsIdentityLiveInfo](
+      seInvalidArgument,
+      "TLS identity import refused because the managed object slot already exists"
+    )
+
+  # Extract the private scalar only after host validation, the curve-state
+  # guard, and the empty-slot guard have all completed.
+  var privateScalar: array[Se050P384PrivateKeyLength, uint8]
+  let scalar = readP384PrivateScalar(decoded.value.handle, privateScalar)
+  if not scalar.ok:
+    secureZero(privateScalar)
+    return fail[TlsIdentityLiveInfo](
+      scalar.error.kind,
+      scalar.error.message,
+      scalar.error.sw
+    )
+
+  var imported: SE[void]
+  try:
+    imported = se.importP384KeyPair(
+      objectId = profile.keyObjectId,
+      privateKey = privateScalar,
+      publicKey = keyInfo.value.publicKey,
+      policy = profile.keyPolicy(),
+      selectFirst = false
+    )
+  finally:
+    secureZero(privateScalar)
+
+  if not imported.ok:
+    return withCleanupNote(
+      imported.error,
+      cleanupNewTlsIdentityObject(se, profile)
+    )
+
+  let live = se.inspectImportedTlsIdentity(profile)
+  if not live.ok:
+    return withCleanupNote(
+      live.error,
+      cleanupNewTlsIdentityObject(se, profile)
+    )
+
+  if live.value.publicKey != @(keyInfo.value.publicKey):
+    let mismatch = Se050Error(
+      kind: seTlsIdentityValidationFailed,
+      message: "imported TLS public key does not match the validated external P-384 key",
       sw: 0
     )
     return withCleanupNote(
@@ -1143,3 +1290,42 @@ proc importP256TlsIdentity*(
     certificateDer = certificateDer
   )
 
+
+proc importP384TlsIdentity*(
+    se: Se050Transport,
+    profile: TlsIdentityProfile,
+    encodedKey: openArray[uint8],
+    certificateDer: openArray[uint8]
+): SE[TlsIdentityLiveInfo] =
+  ## Imports an externally generated P-384 private key into one managed TLS slot.
+  ##
+  ## The standard P-384 curve must already be instantiated. This API never
+  ## modifies global curve state. Existing key objects are never overwritten.
+  ## The private scalar exists as an additional CPU-side copy only immediately
+  ## around the sensitive WriteECKey transaction and is cleared afterward.
+  result = importP384TlsIdentityBytes(
+    se = se,
+    profile = profile,
+    encodedKey = encodedKey,
+    certificateDer = certificateDer
+  )
+
+proc importP384TlsIdentity*(
+    se: Se050Transport,
+    profile: TlsIdentityProfile,
+    encodedKey: string,
+    certificateDer: openArray[uint8]
+): SE[TlsIdentityLiveInfo] =
+  ## Binary-safe string overload for private-key file contents.
+  if encodedKey.len == 0:
+    return fail[TlsIdentityLiveInfo](
+      seInvalidArgument,
+      "external private key must not be empty"
+    )
+
+  result = importP384TlsIdentityBytes(
+    se = se,
+    profile = profile,
+    encodedKey = encodedKey.toOpenArrayByte(0, encodedKey.high),
+    certificateDer = certificateDer
+  )

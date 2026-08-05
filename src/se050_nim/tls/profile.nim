@@ -128,9 +128,14 @@ proc identityName*(identity: uint16): string =
 proc tlsIdentityProfile*(
     kind: TlsIdentityProfileKind,
     identity: uint16,
-    slot: TlsIdentitySlot
+    slot: TlsIdentitySlot,
+    curve: EcCurveKind
 ): TlsIdentityProfile =
-  ## Returns the fixed TLS client identity profile for one identity/slot pair.
+  ## Returns one TLS client identity profile for an explicit supported curve.
+  ##
+  ## The Secure Object ID identifies the lifecycle slot, not the EC curve.
+  ## Callers that use a non-default curve must therefore carry the curve in the
+  ## profile explicitly.
   result = TlsIdentityProfile(
     kind: kind,
     name: (if kind == tipTest: "test" else: "production"),
@@ -138,30 +143,55 @@ proc tlsIdentityProfile*(
     slot: slot,
     keyRole: TlsIdentityKeyRole,
     keyObjectId: objectIdFor(kind, identity, slot),
-    curve: ecCurveP256
+    curve: curve
   )
+
+proc tlsIdentityProfile*(
+    kind: TlsIdentityProfileKind,
+    identity: uint16,
+    slot: TlsIdentitySlot
+): TlsIdentityProfile =
+  ## Backward-compatible default: managed TLS identities remain P-256 unless
+  ## the caller explicitly selects another supported curve.
+  result = tlsIdentityProfile(kind, identity, slot, ecCurveP256)
 
 proc tlsIdentityProfile*(
     kind: TlsIdentityProfileKind,
     slot: TlsIdentitySlot
 ): TlsIdentityProfile =
-  ## Compatibility overload: identity 0.
+  ## Compatibility overload: identity 0, P-256.
   result = tlsIdentityProfile(kind, TlsIdentityDefaultIdentity, slot)
 
-proc testTlsIdentityProfile*(identity: uint16, slot: TlsIdentitySlot): TlsIdentityProfile =
+proc testTlsIdentityProfile*(
+    identity: uint16,
+    slot: TlsIdentitySlot,
+    curve: EcCurveKind
+): TlsIdentityProfile =
   ## Returns a disposable development-area TLS identity profile.
+  result = tlsIdentityProfile(tipTest, identity, slot, curve)
+
+proc testTlsIdentityProfile*(identity: uint16, slot: TlsIdentitySlot): TlsIdentityProfile =
+  ## Backward-compatible P-256 development profile.
   result = tlsIdentityProfile(tipTest, identity, slot)
 
 proc testTlsIdentityProfile*(slot: TlsIdentitySlot): TlsIdentityProfile =
-  ## Compatibility overload: identity 0.
+  ## Compatibility overload: identity 0, P-256.
   result = testTlsIdentityProfile(TlsIdentityDefaultIdentity, slot)
 
-proc productionTlsIdentityProfile*(identity: uint16, slot: TlsIdentitySlot): TlsIdentityProfile =
+proc productionTlsIdentityProfile*(
+    identity: uint16,
+    slot: TlsIdentitySlot,
+    curve: EcCurveKind
+): TlsIdentityProfile =
   ## Returns a customer-area TLS identity profile intended for production use.
+  result = tlsIdentityProfile(tipProduction, identity, slot, curve)
+
+proc productionTlsIdentityProfile*(identity: uint16, slot: TlsIdentitySlot): TlsIdentityProfile =
+  ## Backward-compatible P-256 production profile.
   result = tlsIdentityProfile(tipProduction, identity, slot)
 
 proc productionTlsIdentityProfile*(slot: TlsIdentitySlot): TlsIdentityProfile =
-  ## Compatibility overload: identity 0.
+  ## Compatibility overload: identity 0, P-256.
   result = productionTlsIdentityProfile(TlsIdentityDefaultIdentity, slot)
 
 proc isValid*(profile: TlsIdentityProfile): bool =
@@ -172,7 +202,7 @@ proc isValid*(profile: TlsIdentityProfile): bool =
   if not profile.identity.isValidIdentity():
     return false
 
-  if profile.curve != ecCurveP256:
+  if profile.curve notin {ecCurveP256, ecCurveP384}:
     return false
 
   if profile.keyObjectId != objectIdFor(profile.kind, profile.identity, profile.slot):
@@ -191,9 +221,13 @@ proc isValid*(profile: TlsIdentityProfile): bool =
       profile.keyObjectId <= CustomerObjectEnd
 
 proc tlsIdentityProfileForObjectId*(
-    objectId: uint32
+    objectId: uint32,
+    curve: EcCurveKind
 ): Option[TlsIdentityProfile] =
-  ## Resolves one TLS identity profile by Secure Object ID.
+  ## Resolves one TLS identity profile by Secure Object ID and explicit curve.
+  ##
+  ## The object ID alone does not encode whether the slot contains P-256 or
+  ## P-384, so non-default callers must supply the curve separately.
   let kind =
     if objectId >= DevelopmentObjectStart and objectId <= DevelopmentObjectEnd:
       some(tipTest)
@@ -214,12 +248,28 @@ proc tlsIdentityProfileForObjectId*(
   if identity32 > uint32(TlsIdentityMaxIdentity):
     return none(TlsIdentityProfile)
 
-  let slot = if (delta mod TlsIdentitySlotStride) == 0'u32: tisSlotA else: tisSlotB
-  let profile = tlsIdentityProfile(kind.get(), uint16(identity32), slot)
+  let slot =
+    if (delta mod TlsIdentitySlotStride) == 0'u32:
+      tisSlotA
+    else:
+      tisSlotB
+
+  let profile = tlsIdentityProfile(
+    kind.get(),
+    uint16(identity32),
+    slot,
+    curve
+  )
   if profile.isValid() and profile.keyObjectId == objectId:
     result = some(profile)
   else:
     result = none(TlsIdentityProfile)
+
+proc tlsIdentityProfileForObjectId*(
+    objectId: uint32
+): Option[TlsIdentityProfile] =
+  ## Backward-compatible resolver: object-ID-only resolution means P-256.
+  result = tlsIdentityProfileForObjectId(objectId, ecCurveP256)
 
 proc isProduction*(profile: TlsIdentityProfile): bool =
   result = profile.kind == tipProduction
@@ -241,8 +291,22 @@ proc keyPolicy*(profile: TlsIdentityProfile): EcKeyPolicy =
   result = customEcKeyPolicy(TlsIdentityPolicyHeader)
 
 proc expectedKeyType*(profile: TlsIdentityProfile): uint8 =
-  ## Returns the SecureObjectType expected after P-256 key generation.
+  ## Returns the Applet 7.2 SecureObjectType expected for the profile curve.
   result = expectedKeyPairType(profile.curve)
+
+proc expectedPrivateKeySizeBytes*(profile: TlsIdentityProfile): uint16 =
+  ## Returns the fixed-width private scalar size attested by ReadObject.
+  result = case profile.curve
+  of ecCurveP256: uint16(Se050P256PrivateKeyLength)
+  of ecCurveP384: uint16(Se050P384PrivateKeyLength)
+  of ecCurveX25519: 0'u16
+
+proc expectedPublicKeyLength*(profile: TlsIdentityProfile): int =
+  ## Returns the public-key byte length expected from ReadObject.
+  result = case profile.curve
+  of ecCurveP256: Se050P256UncompressedPublicKeyLength
+  of ecCurveP384: Se050P384UncompressedPublicKeyLength
+  of ecCurveX25519: 0
 
 static:
   doAssert TlsIdentityTestSlotAObjectId == objectIdFor(tipTest, 0'u16, tisSlotA)

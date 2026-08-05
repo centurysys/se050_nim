@@ -7,9 +7,9 @@
 # live ReadType/ReadPublicKey results with NXP attestation so persistence,
 # object type, policy, origin, and public-key binding are all verified.
 #
-# Internal and imported P-256 keys intentionally use separate public entry
-# points. They share all live and attestation checks except for the explicitly
-# required signed object origin.
+# Internal and imported keys intentionally use separate public entry points.
+# They share all live and attestation checks except for the explicitly required
+# signed object origin. The selected profile also binds the expected EC curve.
 
 import std/options
 import std/strformat
@@ -80,7 +80,7 @@ proc inspectTlsIdentityForOrigin(
   if typ.value.objectType != profile.expectedKeyType():
     return fail[TlsIdentityLiveInfo](
       seTlsIdentityValidationFailed,
-      &"live object type 0x{typ.value.objectType.toHex(2)} does not match expected P-256 key-pair type 0x{profile.expectedKeyType().toHex(2)}"
+      &"live object type 0x{typ.value.objectType.toHex(2)} does not match expected {profile.curve.curveDisplayName()} key-pair type 0x{profile.expectedKeyType().toHex(2)}"
     )
 
   if typ.value.transientIndicator.isNone or

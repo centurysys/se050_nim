@@ -54,11 +54,16 @@ const
   Se050CurveNistP521* = 0x05'u8
   Se050CurveX25519* = 0x41'u8
 
-  # SecureObjectType constants used by ReadType after key generation.
+  # SecureObjectType constants used by ReadType after key creation.
+  # Applet >= 7.2 uses curve-specific EC object types; the P-384 values below
+  # match NXP Plug & Trust se05x_enums.h.
   Se050TypeEcKeyPair* = 0x01'u8
   Se050TypeEcKeyPairNistP256* = 0x29'u8
   Se050TypeEcPrivKeyNistP256* = 0x2A'u8
   Se050TypeEcPubKeyNistP256* = 0x2B'u8
+  Se050TypeEcKeyPairNistP384* = 0x2D'u8
+  Se050TypeEcPrivKeyNistP384* = 0x2E'u8
+  Se050TypeEcPubKeyNistP384* = 0x2F'u8
   Se050TypeEcKeyPairMontDh25519* = 0x69'u8
   Se050TypeEcPrivKeyMontDh25519* = 0x6A'u8
   Se050TypeEcPubKeyMontDh25519* = 0x6B'u8
@@ -151,7 +156,8 @@ const
 type
   EcCurveKind* = enum
     ecCurveP256,
-    ecCurveX25519
+    ecCurveX25519,
+    ecCurveP384
 
   EcKeyPolicy* = object
     ## Access-rule header for an SE050 EC key object policy entry.
@@ -210,16 +216,25 @@ proc appendTlvBytes(buf: var seq[uint8], tag: uint8, value: openArray[uint8]) =
 proc curveId*(curve: EcCurveKind): uint8 =
   result = case curve
   of ecCurveP256: Se050CurveNistP256
+  of ecCurveP384: Se050CurveNistP384
   of ecCurveX25519: Se050CurveX25519
 
 proc curveName*(curve: EcCurveKind): string =
   result = case curve
   of ecCurveP256: "p256"
+  of ecCurveP384: "p384"
   of ecCurveX25519: "x25519"
+
+proc curveDisplayName*(curve: EcCurveKind): string =
+  result = case curve
+  of ecCurveP256: "P-256"
+  of ecCurveP384: "P-384"
+  of ecCurveX25519: "X25519"
 
 proc expectedKeyPairType*(curve: EcCurveKind): uint8 =
   result = case curve
   of ecCurveP256: Se050TypeEcKeyPairNistP256
+  of ecCurveP384: Se050TypeEcKeyPairNistP384
   of ecCurveX25519: Se050TypeEcKeyPairMontDh25519
 
 proc developmentEcKeyPolicy*(): EcKeyPolicy =
