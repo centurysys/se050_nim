@@ -2,208 +2,27 @@
 # OpenSSL-backed host cryptographic verification
 # =============================================================================
 #
-# Minimal OpenSSL 3 binding used by the SE050 attestation verification path.
-# The binding intentionally uses opaque pointers and runtime symbol loading so
-# building se050_nim does not require OpenSSL C headers or a libcrypto.so
-# development symlink. The target system must provide libcrypto.so.3.
-
-import std/strutils
+# Uses the shared minimal OpenSSL 3 FFI for SE050 attestation verification.
+# The host binding remains isolated in openssl_ffi.nim so verification logic
+# does not duplicate libcrypto declarations.
 
 import ./errors
+import ./openssl_ffi
 
 # =============================================================================
-# Constants and OpenSSL imports
+# Constants
 # =============================================================================
 
 const
-  LibCrypto = "libcrypto.so.3"
   Sha256DigestLength* = 32
   EcP256UncompressedPublicKeyLength* = 65
 
   OpenSslParamGroupName = "group"
   OpenSslParamPublicKey = "pub"
 
-proc opensslSha256(
-    data: ptr uint8,
-    length: csize_t,
-    digest: ptr uint8
-): ptr uint8 {.cdecl, importc: "SHA256", dynlib: LibCrypto.}
-
-proc d2iX509(
-    certificate: ptr pointer,
-    input: ptr ptr uint8,
-    length: clong
-): pointer {.cdecl, importc: "d2i_X509", dynlib: LibCrypto.}
-
-proc x509Free(certificate: pointer) {.
-  cdecl,
-  importc: "X509_free",
-  dynlib: LibCrypto
-.}
-
-proc x509GetPublicKey(certificate: pointer): pointer {.
-  cdecl,
-  importc: "X509_get_pubkey",
-  dynlib: LibCrypto
-.}
-
-proc evpPublicKeyFree(publicKey: pointer) {.
-  cdecl,
-  importc: "EVP_PKEY_free",
-  dynlib: LibCrypto
-.}
-
-proc evpPublicKeyIsA(publicKey: pointer, name: cstring): cint {.
-  cdecl,
-  importc: "EVP_PKEY_is_a",
-  dynlib: LibCrypto
-.}
-
-proc evpPublicKeyGetBits(publicKey: pointer): cint {.
-  cdecl,
-  importc: "EVP_PKEY_get_bits",
-  dynlib: LibCrypto
-.}
-
-proc evpPublicKeyGetUtf8StringParam(
-    publicKey: pointer,
-    key: cstring,
-    buffer: cstring,
-    bufferSize: csize_t,
-    outputLength: ptr csize_t
-): cint {.
-  cdecl,
-  importc: "EVP_PKEY_get_utf8_string_param",
-  dynlib: LibCrypto
-.}
-
-proc evpPublicKeyGetOctetStringParam(
-    publicKey: pointer,
-    key: cstring,
-    buffer: ptr uint8,
-    bufferSize: csize_t,
-    outputLength: ptr csize_t
-): cint {.
-  cdecl,
-  importc: "EVP_PKEY_get_octet_string_param",
-  dynlib: LibCrypto
-.}
-
-proc evpMdContextNew(): pointer {.
-  cdecl,
-  importc: "EVP_MD_CTX_new",
-  dynlib: LibCrypto
-.}
-
-proc evpMdContextFree(context: pointer) {.
-  cdecl,
-  importc: "EVP_MD_CTX_free",
-  dynlib: LibCrypto
-.}
-
-proc evpSha256(): pointer {.
-  cdecl,
-  importc: "EVP_sha256",
-  dynlib: LibCrypto
-.}
-
-proc evpDigestVerifyInit(
-    context: pointer,
-    publicKeyContext: ptr pointer,
-    digest: pointer,
-    engine: pointer,
-    publicKey: pointer
-): cint {.
-  cdecl,
-  importc: "EVP_DigestVerifyInit",
-  dynlib: LibCrypto
-.}
-
-proc evpDigestVerify(
-    context: pointer,
-    signature: ptr uint8,
-    signatureLength: csize_t,
-    data: ptr uint8,
-    dataLength: csize_t
-): cint {.
-  cdecl,
-  importc: "EVP_DigestVerify",
-  dynlib: LibCrypto
-.}
-
-proc opensslErrorGet(): culong {.
-  cdecl,
-  importc: "ERR_get_error",
-  dynlib: LibCrypto
-.}
-
-proc opensslErrorString(
-    errorCode: culong,
-    buffer: cstring,
-    bufferLength: csize_t
-) {.
-  cdecl,
-  importc: "ERR_error_string_n",
-  dynlib: LibCrypto
-.}
-
 # =============================================================================
 # Internal helpers
 # =============================================================================
-
-proc bytePointer(data: openArray[uint8]): ptr uint8 =
-  if data.len == 0:
-    result = nil
-  else:
-    result = cast[ptr uint8](unsafeAddr data[0])
-
-proc opensslErrorMessage(fallback: string): string =
-  var messages: seq[string] = @[]
-  var errorCode = opensslErrorGet()
-
-  while errorCode != 0 and messages.len < 4:
-    var buffer: array[256, char]
-    opensslErrorString(errorCode, cast[cstring](addr buffer[0]), csize_t(buffer.len))
-    messages.add($cast[cstring](addr buffer[0]))
-    errorCode = opensslErrorGet()
-
-  if messages.len == 0:
-    result = fallback
-  else:
-    result = fallback & ": " & messages.join("; ")
-
-proc loadX509Certificate(certificateDer: openArray[uint8]): SE[pointer] =
-  if certificateDer.len == 0:
-    return fail[pointer](
-      seInvalidArgument,
-      "X.509 certificate DER must not be empty"
-    )
-
-  try:
-    let start = certificateDer.bytePointer()
-    var cursor = start
-    let certificate = d2iX509(nil, addr cursor, clong(certificateDer.len))
-
-    if certificate == nil:
-      return fail[pointer](
-        seCryptoError,
-        opensslErrorMessage("OpenSSL failed to parse the X.509 certificate")
-      )
-
-    let consumed = cast[uint](cursor) - cast[uint](start)
-    if consumed != uint(certificateDer.len):
-      x509Free(certificate)
-      return fail[pointer](
-        seInvalidResponse,
-        "X.509 certificate DER contains trailing or unparsed bytes"
-      )
-
-    result = ok(certificate)
-  except CatchableError as e:
-    result = fail[pointer](
-      seCryptoError,
-      "OpenSSL libcrypto is unavailable: " & e.msg
-    )
 
 proc loadEcP256PublicKey(certificateDer: openArray[uint8]): SE[pointer] =
   let certificate = loadX509Certificate(certificateDer)
