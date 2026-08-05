@@ -3,9 +3,9 @@
 # =============================================================================
 #
 # Parses externally supplied private keys through OpenSSL 3 without invoking
-# the openssl command-line tool. This first implementation deliberately
-# accepts only NIST P-256 EC private keys, matching the currently supported
-# managed TLS identity profile.
+# the openssl command-line tool. Host-side recognition supports NIST P-256,
+# P-384, and P-521. The current managed SE050 import path remains deliberately
+# limited to P-256 until device curve capability/provisioning is handled.
 #
 # No public API exports or retains the private scalar. The decoded EVP_PKEY
 # exists only while the input is being validated. The import path extracts the
@@ -27,15 +27,38 @@ import ./live_identity
 # =============================================================================
 
 type
-  P256PrivateKeyInfo* = object
-    ## Validated public metadata derived from an external P-256 private key.
+  ExternalEcCurve* = enum
+    ## Host-side NIST curves accepted for external TLS private-key parsing.
+    ##
+    ## This enum intentionally describes OpenSSL input recognition only. Mapping
+    ## these curves onto an SE050 managed TLS profile is handled separately so
+    ## parser support does not imply that a curve is provisioned on the device.
+    eecP256,
+    eecP384,
+    eecP521
+
+  EcPrivateKeyInfo* = object
+    ## Validated public metadata derived from an external EC private key.
     ##
     ## The original private material and OpenSSL EVP_PKEY are intentionally not
     ## retained in this value.
+    curve*: ExternalEcCurve
+    bits*: int
+    curveName*: string
+    publicKey*: seq[uint8]
+    publicKeySpkiDer*: seq[uint8]
+
+  P256PrivateKeyInfo* = object
+    ## Backward-compatible P-256 metadata used by the current SE050 import path.
     bits*: int
     curveName*: string
     publicKey*: array[65, uint8]
     publicKeySpkiDer*: seq[uint8]
+
+  ValidatedEcPrivateKey = object
+    handle: pointer
+    curve: ExternalEcCurve
+    curveName: string
 
   ValidatedP256PrivateKey = object
     handle: pointer
@@ -43,6 +66,13 @@ type
 
 const
   P256Bits = 256
+  P384Bits = 384
+  P521Bits = 521
+
+  P256CoordinateLength = 32
+  P384CoordinateLength = 48
+  P521CoordinateLength = 66
+
   P256UncompressedPublicKeyLength = 65
 
   OpenSslParamGroupName = "group"
@@ -136,35 +166,75 @@ proc readGroupName(publicKey: pointer): SE[string] =
 
   result = ok($cast[cstring](addr buffer[0]))
 
-proc validateP256PrivateKey(publicKey: pointer): SE[string] =
+proc curveBits(curve: ExternalEcCurve): int =
+  case curve
+  of eecP256:
+    result = P256Bits
+  of eecP384:
+    result = P384Bits
+  of eecP521:
+    result = P521Bits
+
+proc curveCoordinateLength(curve: ExternalEcCurve): int =
+  case curve
+  of eecP256:
+    result = P256CoordinateLength
+  of eecP384:
+    result = P384CoordinateLength
+  of eecP521:
+    result = P521CoordinateLength
+
+proc supportedCurve(
+    bits: int,
+    groupName: string
+): SE[ExternalEcCurve] =
+  case bits
+  of P256Bits:
+    if groupName in ["prime256v1", "secp256r1", "P-256"]:
+      return ok(eecP256)
+  of P384Bits:
+    if groupName in ["secp384r1", "P-384"]:
+      return ok(eecP384)
+  of P521Bits:
+    if groupName in ["secp521r1", "P-521"]:
+      return ok(eecP521)
+  else:
+    discard
+
+  result = fail[ExternalEcCurve](
+    seInvalidArgument,
+    "external TLS EC private key uses unsupported group: " & groupName
+  )
+
+proc validateEcPrivateKey(
+    publicKey: pointer
+): SE[tuple[curve: ExternalEcCurve, curveName: string]] =
   if evpPublicKeyIsA(publicKey, "EC") != 1:
-    return fail[string](
+    return fail[tuple[curve: ExternalEcCurve, curveName: string]](
       seInvalidArgument,
       "external TLS private key is not an EC key"
     )
 
-  let bits = evpPublicKeyGetBits(publicKey)
-  if int(bits) != P256Bits:
-    return fail[string](
-      seInvalidArgument,
-      "external TLS EC private key is not a 256-bit P-256 key"
-    )
-
+  let bits = int(evpPublicKeyGetBits(publicKey))
   let group = readGroupName(publicKey)
   if not group.ok:
-    return group
+    return fail[tuple[curve: ExternalEcCurve, curveName: string]](
+      group.error.kind,
+      group.error.message,
+      group.error.sw
+    )
 
-  if group.value != "prime256v1" and
-      group.value != "secp256r1" and
-      group.value != "P-256":
-    return fail[string](
-      seInvalidArgument,
-      "external TLS EC private key uses unsupported group: " & group.value
+  let curve = supportedCurve(bits, group.value)
+  if not curve.ok:
+    return fail[tuple[curve: ExternalEcCurve, curveName: string]](
+      curve.error.kind,
+      curve.error.message,
+      curve.error.sw
     )
 
   let validationContext = evpPublicKeyContextNewFromPkey(nil, publicKey, nil)
   if validationContext == nil:
-    return fail[string](
+    return fail[tuple[curve: ExternalEcCurve, curveName: string]](
       seCryptoError,
       opensslErrorMessage("OpenSSL failed to create the private-key validation context")
     )
@@ -173,43 +243,44 @@ proc validateP256PrivateKey(publicKey: pointer): SE[string] =
     evpPublicKeyContextFree(validationContext)
 
   if evpPublicKeyPrivateCheck(validationContext) != 1:
-    return fail[string](
+    return fail[tuple[curve: ExternalEcCurve, curveName: string]](
       seInvalidArgument,
-      opensslErrorMessage("external TLS P-256 private key failed private-key validation")
+      opensslErrorMessage("external TLS EC private key failed private-key validation")
     )
 
   if evpPublicKeyPairwiseCheck(validationContext) != 1:
-    return fail[string](
+    return fail[tuple[curve: ExternalEcCurve, curveName: string]](
       seInvalidArgument,
-      opensslErrorMessage("external TLS P-256 key pair failed pairwise validation")
+      opensslErrorMessage("external TLS EC key pair failed pairwise validation")
     )
 
-  result = ok(group.value)
+  result = ok((curve: curve.value, curveName: group.value))
 
-proc readP256PublicCoordinate(
+proc readEcPublicCoordinate(
     publicKey: pointer,
     parameterName: cstring,
-    output: var array[32, uint8]
-): SE[void] =
+    coordinateLength: int
+): SE[seq[uint8]] =
   var value: pointer = nil
   if evpPublicKeyGetBnParam(publicKey, parameterName, addr value) != 1 or
       value == nil:
-    return fail[void](
+    return fail[seq[uint8]](
       seCryptoError,
-      opensslErrorMessage("OpenSSL failed to read a P-256 public coordinate")
+      opensslErrorMessage("OpenSSL failed to read an EC public coordinate")
     )
 
   defer:
     bnFree(value)
 
+  var output = newSeq[uint8](coordinateLength)
   let written = bnToBinaryPadded(value, addr output[0], cint(output.len))
   if written != cint(output.len):
-    return fail[void](
+    return fail[seq[uint8]](
       seCryptoError,
-      opensslErrorMessage("OpenSSL failed to encode a P-256 public coordinate")
+      opensslErrorMessage("OpenSSL failed to encode an EC public coordinate")
     )
 
-  result = ok()
+  result = ok(output)
 
 proc readP256PrivateScalar(
     publicKey: pointer,
@@ -240,31 +311,41 @@ proc readP256PrivateScalar(
 
   result = ok()
 
-proc readP256PublicKey(publicKey: pointer): SE[array[65, uint8]] =
-  var x: array[32, uint8]
-  var y: array[32, uint8]
+proc readEcPublicKey(
+    publicKey: pointer,
+    curve: ExternalEcCurve
+): SE[seq[uint8]] =
+  let coordinateLength = curve.curveCoordinateLength()
 
-  let xResult = readP256PublicCoordinate(publicKey, OpenSslParamPublicX, x)
+  let xResult = readEcPublicCoordinate(
+    publicKey,
+    OpenSslParamPublicX,
+    coordinateLength
+  )
   if not xResult.ok:
-    return fail[array[65, uint8]](
+    return fail[seq[uint8]](
       xResult.error.kind,
       xResult.error.message,
       xResult.error.sw
     )
 
-  let yResult = readP256PublicCoordinate(publicKey, OpenSslParamPublicY, y)
+  let yResult = readEcPublicCoordinate(
+    publicKey,
+    OpenSslParamPublicY,
+    coordinateLength
+  )
   if not yResult.ok:
-    return fail[array[65, uint8]](
+    return fail[seq[uint8]](
       yResult.error.kind,
       yResult.error.message,
       yResult.error.sw
     )
 
-  var encoded: array[65, uint8]
+  var encoded = newSeq[uint8](1 + coordinateLength * 2)
   encoded[0] = 0x04'u8
-  for i in 0 ..< x.len:
-    encoded[1 + i] = x[i]
-    encoded[33 + i] = y[i]
+  for i in 0 ..< coordinateLength:
+    encoded[1 + i] = xResult.value[i]
+    encoded[1 + coordinateLength + i] = yResult.value[i]
 
   result = ok(encoded)
 
@@ -287,10 +368,36 @@ proc encodePublicKeySpkiDer(publicKey: pointer): SE[seq[uint8]] =
 
   result = ok(encoded)
 
+proc loadValidatedEcPrivateKey(
+    encodedKey: openArray[uint8]
+): SE[ValidatedEcPrivateKey] =
+  let decoded = decodePrivateKey(encodedKey)
+  if not decoded.ok:
+    return fail[ValidatedEcPrivateKey](
+      decoded.error.kind,
+      decoded.error.message,
+      decoded.error.sw
+    )
+
+  let validation = validateEcPrivateKey(decoded.value)
+  if not validation.ok:
+    evpPublicKeyFree(decoded.value)
+    return fail[ValidatedEcPrivateKey](
+      validation.error.kind,
+      validation.error.message,
+      validation.error.sw
+    )
+
+  result = ok(ValidatedEcPrivateKey(
+    handle: decoded.value,
+    curve: validation.value.curve,
+    curveName: validation.value.curveName
+  ))
+
 proc loadValidatedP256PrivateKey(
     encodedKey: openArray[uint8]
 ): SE[ValidatedP256PrivateKey] =
-  let decoded = decodePrivateKey(encodedKey)
+  let decoded = loadValidatedEcPrivateKey(encodedKey)
   if not decoded.ok:
     return fail[ValidatedP256PrivateKey](
       decoded.error.kind,
@@ -298,30 +405,61 @@ proc loadValidatedP256PrivateKey(
       decoded.error.sw
     )
 
-  let validation = validateP256PrivateKey(decoded.value)
-  if not validation.ok:
-    evpPublicKeyFree(decoded.value)
+  if decoded.value.curve != eecP256:
+    evpPublicKeyFree(decoded.value.handle)
     return fail[ValidatedP256PrivateKey](
-      validation.error.kind,
-      validation.error.message,
-      validation.error.sw
+      seInvalidArgument,
+      "external TLS EC private key is not a P-256 key"
     )
 
   result = ok(ValidatedP256PrivateKey(
-    handle: decoded.value,
-    curveName: validation.value
+    handle: decoded.value.handle,
+    curveName: decoded.value.curveName
+  ))
+
+proc extractEcPrivateKeyInfo(
+    decoded: ValidatedEcPrivateKey
+): SE[EcPrivateKeyInfo] =
+  let publicKey = readEcPublicKey(decoded.handle, decoded.curve)
+  if not publicKey.ok:
+    return fail[EcPrivateKeyInfo](
+      publicKey.error.kind,
+      publicKey.error.message,
+      publicKey.error.sw
+    )
+
+  let spki = encodePublicKeySpkiDer(decoded.handle)
+  if not spki.ok:
+    return fail[EcPrivateKeyInfo](
+      spki.error.kind,
+      spki.error.message,
+      spki.error.sw
+    )
+
+  result = ok(EcPrivateKeyInfo(
+    curve: decoded.curve,
+    bits: decoded.curve.curveBits(),
+    curveName: decoded.curveName,
+    publicKey: publicKey.value,
+    publicKeySpkiDer: spki.value
   ))
 
 proc extractP256PrivateKeyInfo(
     publicKeyHandle: pointer,
     curveName: string
 ): SE[P256PrivateKeyInfo] =
-  let publicKey = readP256PublicKey(publicKeyHandle)
+  let publicKey = readEcPublicKey(publicKeyHandle, eecP256)
   if not publicKey.ok:
     return fail[P256PrivateKeyInfo](
       publicKey.error.kind,
       publicKey.error.message,
       publicKey.error.sw
+    )
+
+  if publicKey.value.len != P256UncompressedPublicKeyLength:
+    return fail[P256PrivateKeyInfo](
+      seCryptoError,
+      "OpenSSL returned an unexpected P-256 public-key length"
     )
 
   let spki = encodePublicKeySpkiDer(publicKeyHandle)
@@ -332,12 +470,38 @@ proc extractP256PrivateKeyInfo(
       spki.error.sw
     )
 
+  var fixedPublicKey: array[65, uint8]
+  for i in 0 ..< fixedPublicKey.len:
+    fixedPublicKey[i] = publicKey.value[i]
+
   result = ok(P256PrivateKeyInfo(
     bits: P256Bits,
     curveName: curveName,
-    publicKey: publicKey.value,
+    publicKey: fixedPublicKey,
     publicKeySpkiDer: spki.value
   ))
+
+proc parseEcPrivateKeyBytes(
+    encodedKey: openArray[uint8]
+): SE[EcPrivateKeyInfo] =
+  let decoded = loadValidatedEcPrivateKey(encodedKey)
+  if not decoded.ok:
+    return fail[EcPrivateKeyInfo](
+      decoded.error.kind,
+      decoded.error.message,
+      decoded.error.sw
+    )
+
+  defer:
+    evpPublicKeyFree(decoded.value.handle)
+
+  try:
+    result = extractEcPrivateKeyInfo(decoded.value)
+  except CatchableError as e:
+    result = fail[EcPrivateKeyInfo](
+      seCryptoError,
+      "OpenSSL EC private-key handling failed: " & e.msg
+    )
 
 proc parseP256PrivateKeyBytes(
     encodedKey: openArray[uint8]
@@ -603,6 +767,28 @@ proc importP256TlsIdentityBytes(
 # =============================================================================
 # Public API
 # =============================================================================
+
+proc parseEcPrivateKey*(
+    encodedKey: openArray[uint8]
+): SE[EcPrivateKeyInfo] =
+  ## Parses and validates one unencrypted NIST P-256, P-384, or P-521 private
+  ## key from PEM or DER.
+  ##
+  ## This is a host-only recognition API. Successful parsing does not imply
+  ## that the corresponding curve is currently available in the SE050.
+  result = parseEcPrivateKeyBytes(encodedKey)
+
+proc parseEcPrivateKey*(encodedKey: string): SE[EcPrivateKeyInfo] =
+  ## String overload suitable for binary-safe `readFile()` input.
+  if encodedKey.len == 0:
+    return fail[EcPrivateKeyInfo](
+      seInvalidArgument,
+      "external private key must not be empty"
+    )
+
+  result = parseEcPrivateKeyBytes(
+    encodedKey.toOpenArrayByte(0, encodedKey.high)
+  )
 
 proc parseP256PrivateKey*(
     encodedKey: openArray[uint8]

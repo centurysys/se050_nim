@@ -46,6 +46,45 @@ PxRRm9eWjBplQbgw6ztMqEJ9zQKv8Ml5j6lgQhR6LFA0KikAVptvXuDmtJg3ed4K
 -----END PRIVATE KEY-----
 """
 
+  P384SupportedPkcs8Pem = """-----BEGIN PRIVATE KEY-----
+MIG2AgEAMBAGByqGSM49AgEGBSuBBAAiBIGeMIGbAgEBBDBvL/J7b4MYvNVNJUU8
+raZEUibwMwYyUAkKtRbkNUGUTfpCTMz6ucbsnZaQew5j9SihZANiAATGZbukg2ZS
+hY/z6gg/U5e8j5VBy+Z+hDYTFJHnQFPRRfqzdYcGwyq6b1kbvDY6sha61Ee7gVGD
+aJr27HFNkPpkFdfN/FFD5/TD1W1cgq3lmfAFhXL6wirXN23xAl701WY=
+-----END PRIVATE KEY-----
+"""
+
+  P521Pkcs8Pem = """-----BEGIN PRIVATE KEY-----
+MIHuAgEAMBAGByqGSM49AgEGBSuBBAAjBIHWMIHTAgEBBEIAXljZhw1cuf+vnGmY
+NjAOWt3bOVSp0e/myR5wPDCTxYAk7S5YZxzfc3YD47oZboWDd0HWj2zwke7EnNKt
+7rMz072hgYkDgYYABACz0QCaqHWHfQJ4a4FKPxP6yFQ/tTlcof4w5+zcLRUtsARE
+2/w3VH8CHvrElh+fzbtCbKfjbwFxl492Ty865T8aawCgHWpOFIFidC14H22DvxfL
+aqDiNgzhRiVb+3tzJas1jJnAzubQHvPPVo2stOBgVVBPyAsZ6l201IY+iC7R1BEr
+LQ==
+-----END PRIVATE KEY-----
+"""
+
+  P384PublicKeyHex =
+    "04c665bba4836652858ff3ea083f5397bc8f9541cbe67e8436131491e74053d1" &
+    "45fab3758706c32aba6f591bbc363ab216bad447bb815183689af6ec714d90fa" &
+    "6415d7cdfc5143e7f4c3d56d5c82ade599f0058572fac22ad7376df1025ef4d" &
+    "566"
+
+  P384SpkiDerHex =
+    "3076301006072a8648ce3d020106052b81040022036200" &
+    P384PublicKeyHex
+
+  P521PublicKeyHex =
+    "0400b3d1009aa875877d02786b814a3f13fac8543fb5395ca1fe30e7ecdc2d" &
+    "152db00444dbfc37547f021efac4961f9fcdbb426ca7e36f0171978f764f2f3" &
+    "ae53f1a6b00a01d6a4e148162742d781f6d83bf17cb6aa0e2360ce146255bfb" &
+    "7b7325ab358c99c0cee6d01ef3cf568dacb4e06055504fc80b19ea5db4d4863" &
+    "e882ed1d4112b2d"
+
+  P521SpkiDerHex =
+    "30819b301006072a8648ce3d020106052b8104002303818600" &
+    P521PublicKeyHex
+
   P256Pkcs8DerHex =
     "308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b" &
     "0201010420cb7b00924ad5604dc04ce3f9e7ecbb3720b27177be8e86d78237" &
@@ -67,6 +106,42 @@ PxRRm9eWjBplQbgw6ztMqEJ9zQKv8Ml5j6lgQhR6LFA0KikAVptvXuDmtJg3ed4K
 
   OtherP256CertificateDerBase64 =
     "MIIBhTCCASugAwIBAgIURftoL3F8tzeGu9Gf75byVH3ZBe8wCgYIKoZIzj0EAwIwGDEWMBQGA1UEAwwNb3RoZXIuZXhhbXBsZTAeFw0yNjA4MDUwNDU4MzJaFw0zNjA4MDIwNDU4MzJaMBgxFjAUBgNVBAMMDW90aGVyLmV4YW1wbGUwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAATx09KA8oElZNdQp0HLwkC8t2e6i+lE7PmymdJoer0czzmC10YSC0GRmXeKV+0BgQgdp7In0QEUCp1LbI43kwW1o1MwUTAdBgNVHQ4EFgQUVCB/WyOCliPklOSjCQH4yFMQaGcwHwYDVR0jBBgwFoAUVCB/WyOCliPklOSjCQH4yFMQaGcwDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBFAiBpBniUCH7da/kSMO92rt26Z1avCma3z46jZ+WvzKrkSgIhAKYVXMqOjICBbshd8xQuk1xH72OrAtdIUWeZEm0AJsKb"
+
+suite "external TLS EC private-key recognition":
+  test "recognizes P-256 without changing the existing P-256 API":
+    let parsed = parseEcPrivateKey(P256Pkcs8Pem)
+
+    check parsed.ok
+    if parsed.ok:
+      check parsed.value.curve == eecP256
+      check parsed.value.bits == 256
+      check parsed.value.curveName in ["prime256v1", "secp256r1", "P-256"]
+      check parsed.value.publicKey == bytesFromHex(P256PublicKeyHex)
+      check parsed.value.publicKeySpkiDer == bytesFromHex(P256SpkiDerHex)
+
+  test "recognizes P-384 and returns its 97-byte uncompressed public point":
+    let parsed = parseEcPrivateKey(P384SupportedPkcs8Pem)
+
+    check parsed.ok
+    if parsed.ok:
+      check parsed.value.curve == eecP384
+      check parsed.value.bits == 384
+      check parsed.value.curveName in ["secp384r1", "P-384"]
+      check parsed.value.publicKey.len == 97
+      check parsed.value.publicKey == bytesFromHex(P384PublicKeyHex)
+      check parsed.value.publicKeySpkiDer == bytesFromHex(P384SpkiDerHex)
+
+  test "recognizes P-521 with 66-byte coordinates":
+    let parsed = parseEcPrivateKey(P521Pkcs8Pem)
+
+    check parsed.ok
+    if parsed.ok:
+      check parsed.value.curve == eecP521
+      check parsed.value.bits == 521
+      check parsed.value.curveName in ["secp521r1", "P-521"]
+      check parsed.value.publicKey.len == 133
+      check parsed.value.publicKey == bytesFromHex(P521PublicKeyHex)
+      check parsed.value.publicKeySpkiDer == bytesFromHex(P521SpkiDerHex)
 
 suite "external TLS P-256 private-key parsing":
   test "parses PKCS#8 PEM and returns only public metadata":
@@ -102,7 +177,7 @@ suite "external TLS P-256 private-key parsing":
     check not parsed.ok
     if not parsed.ok:
       check parsed.error.kind == seInvalidArgument
-      check parsed.error.message.contains("256-bit P-256") or
+      check parsed.error.message.contains("not a P-256 key") or
         parsed.error.message.contains("unsupported group")
 
   test "rejects a public-only key":
