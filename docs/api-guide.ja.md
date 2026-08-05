@@ -1,6 +1,6 @@
 # se050_nim APIガイド
 
-`se050_nim`は、SE050 primitive、Attestation検証、キッティングrecord/CSV検証を提供します。Firmware envelope format、HKDF/AES-GCM、firmware updaterは上位projectへ分離します。
+`se050_nim`は、SE050 primitive、Attestation、managed TLS identity、external key import、OpenSSL Reference Key、およびキッティングrecord/CSV検証を提供します。Firmware envelope format、HKDF/AES-GCM、firmware updaterは上位projectへ分離します。
 
 ## Entry point
 
@@ -8,39 +8,35 @@
 import se050_nim
 ```
 
-トップレベルは次の機能群をre-exportします。
+`src/se050_nim.nim`は次をre-exportします。
 
-- `errors`, `transport`, `apdu`, `tlv`
-- `uid`, `random`, `objects`, `keys`, `management`
-- `attestation_cert`, `attestation`
-- `crypto_verify`, `x509_verify`, `trust_store`
-- `attestation_verify`, `attestation_attributes`, `kitting_attestation_verify`
-- `binary_encoding`, `board_identity`
-- `kitting_profile`, `kitting_record`, `kitting_csv`
-- `kitting_verify`, `kitting_local_verify`, `kitting_export`
+```text
+errors, transport, apdu, tlv
+uid, random, objects, keys, management
+binary_encoding, crypto_verify, x509_verify
+factory_identity, attestation, tls, kitting
+```
+
+`tls`はさらに`profile`, `live_identity`, `attestation_verify`, `external_key`, `openssl`, `reference_key`, `reference_key_file`をexportします。
 
 ## Result形式
 
-通常のエラーは例外ではなく`SE[T]`で返します。
+通常のruntime errorは`SE[T]`で返します。
 
 ```nim
-let r = se.readUidHex()
-if not r.ok:
-  echo r.error.errorMessage()
+let uid = se.readUidHex()
+if not uid.ok:
+  echo uid.error.errorMessage()
   quit 1
-
-echo r.value
 ```
 
-`Se050Error.sw`が0以外ならAPDU status word由来です。
+`Se050Error.sw != 0`ならAPDU status word由来です。Host-side input validationの一部は`ValueError`を使うpure encoder/helperもあります。
 
-## Device / primitive
+## Transport / device primitive
 
 ```nim
 let se = openSe050(bus = 0, address = 0x48'u8, debug = false)
-let atr = se.requestAtr()
-let uid = se.readUidRaw()
-let random = se.getRandomBytes(32)
+discard se.requestAtr()
 ```
 
 主なAPI:
@@ -52,243 +48,218 @@ let random = se.getRandomBytes(32)
 - `objectExists()` / `readObjectType()` / `readObjectSize()` / `listObjectIds()`
 - `deleteSecureObject()`
 
-Raw APIには`se050ctl`のdev-range safety guardはありません。上位toolがObject ID policyを強制してください。
+Raw library APIには`se050ctl`のObject-range mutation guardはありません。上位provisioning layerが対象Object IDを制限してください。
 
 ## EC key API
 
-```nim
-let created = se.generateP256KeyPair(
-  0x30000120'u32,
-  developmentEcKeyPolicy()
-)
-let publicKey = se.readPublicKey(0x30000120'u32)
-let secret = se.deriveSharedSecret(0x30000120'u32, peerPublicKey)
-```
-
-Curve:
-
-- `ecCurveP256`
-- `ecCurveX25519`
-
-Policy helper:
-
-| API | Header | 用途 |
-|---|---:|---|
-| `developmentEcKeyPolicy()` | `0x043C0000` | 汎用development |
-| `testDeviceKeyPolicy()` | `0x04240000` | 削除可能なproduction相当test |
-| `deviceEcKeyPolicy()` | `0x04200000` | provision済みdevice key |
-| `oneTimeDeviceKeyPolicy()` | `0x04200000` | one-time作成意図 |
-| `customEcKeyPolicy()` | caller-defined | advanced use |
-
-P-256公開鍵は65 bytes、shared secretは32 bytesです。
-
-## Attestation certificate
+Managed curve enum:
 
 ```nim
-let cert = se.readAttestationCertificate()
+ecCurveP256
+ecCurveX25519
+ecCurveP384
 ```
+
+主なlow-level API:
+
+```nim
+se.generateP256KeyPair(objectId, policy)
+se.importP256KeyPair(objectId, privateScalar, publicKey, policy)
+se.importP384KeyPair(objectId, privateScalar, publicKey, policy)
+se.readPublicKey(objectId)
+se.deriveSharedSecret(objectId, peerPublicKey)
+```
+
+P-256 private scalar/public pointは32/65 bytes、P-384は48/97 bytesです。P-256/P-384 public pointはuncompressed `0x04 || X || Y`です。
+
+`importP256KeyPair()` / `importP384KeyPair()`はlow-level WriteECKey primitiveで、managed slot ownership、certificate match、curve state、origin validationは行いません。TLS用途では後述の`importP256TlsIdentity()` / `importP384TlsIdentity()`を使用してください。
+
+## Sensitive memory / transport
+
+`secure_memory.nim`は`secureZero()`を提供し、mutable string/seq/fixed array等をvolatile write loopでclearします。
+
+ECDH shared secretやexternal key importのAPDUは`sensitive` transport pathを使い、debugでもraw T=1 TX/RX frameを表示しません。temporary APDU/frame/private-key bufferは処理後にclearします。
+
+## EC curve management
+
+`ReadECCurveList`関連:
+
+- `readEcCurveList()`
+- `ecCurveSetState()`
+- `isEcCurveInstantiated()`
+- `ecCurveName()`
+
+このstateは現在のWeierstrass curve instantiationであり、silicon capabilityではありません。
+
+P-384 provisioning:
+
+- `buildCreateEcCurveApdu()`
+- `buildSetEcCurveParamApdu()`
+- `buildDeleteEcCurveApdu()`
+- `buildNistP384ProvisioningApdus()`
+- `provisionNistP384Curve()`
+
+`provisionNistP384Curve()`はstandard secp384r1 A/B/G/N/PRIMEを使用し、既にsetならno-opです。Create成功後のparameter設定/final verification failureではbest-effort delete rollbackを行います。
+
+## TLS identity profile
+
+```nim
+let p256 = testTlsIdentityProfile(0'u16, tisSlotA)
+let p384 = testTlsIdentityProfile(0'u16, tisSlotB, ecCurveP384)
+```
+
+`TlsIdentityProfile`はprofile kind、identity number、A/B slot、Object ID、curveを保持します。Object IDはcurveをencodeしないため、non-default curveはprofile metadataとして明示的に保持します。
+
+Object ID規則:
+
+```text
+test:       0x30000200 + identity * 2 + slotOffset
+production: 0x20000200 + identity * 2 + slotOffset
+```
+
+`profile.isValid()`が受け付けるmanaged TLS curveは現在P-256/P-384です。TLS Policyは`0x10240000` (`SIGN + READ + DELETE`)です。
+
+## Internal / imported TLS identity validation
+
+内部生成と外部importはorigin semanticsを混ぜません。
+
+- `inspectTlsIdentity()`: `origin = internal`を要求
+- `inspectImportedTlsIdentity()`: `origin = external`を要求
+- `verifyTlsIdentityAttestationSemantics()`
+- `verifyImportedTlsIdentityAttestationSemantics()`
+
+curveごとにexpected key-pair type、private size、public point lengthを検証し、さらにpersistent、Object ID、Policy、Attestation certificate/signature、live/attested public key一致を確認します。
+
+## External private-key parser / certificate match
+
+`tls/external_key.nim`はOpenSSL 3 decoderを使い、real private keyをSE050へ書く前にhost-side validationを完了します。
+
+主なAPI:
+
+- `parseEcPrivateKey()` — P-256/P-384/P-521をrecognizeしpublic metadataを返す
+- `parseP256PrivateKey()`
+- `parseP384PrivateKey()`
+- `validateP256PrivateKeyCertificateMatch()`
+- `validateP384PrivateKeyCertificateMatch()`
+- `importP256TlsIdentity()`
+- `importP384TlsIdentity()`
+
+public parse resultはcurve、bits、group name、uncompressed public point、SPKI DERを保持します。private scalarはpublic APIへ返しません。import workflow内部でfixed-width scalarを取り出し、WriteECKey後にclearします。
+
+Managed importの順序:
+
+```text
+profile validation
+-> private key decode/curve validation
+-> certificate/public-key match
+-> P-384 curve state check
+-> target slot empty check
+-> private scalar extraction
+-> sensitive WriteECKey
+-> imported-origin live Attestation validation
+-> source/live public-key equality
+```
+
+既存Objectを上書きしません。新規import後のvalidation failureでは、このworkflow自身が作成したObjectだけをbest-effort rollbackします。
+
+## OpenSSL public-key helpers
+
+- `p256PublicKeyToSpkiDer()`
+- `p384PublicKeyToSpkiDer()`
+- `ecPublicKeyToSpkiDer()`
+- `opensslProviderKeyUri()`
+
+SPKI DERはcertificate/CSR public keyとのbyte比較に使用できます。
+
+## NXP Reference Key
+
+Pure encoder:
+
+- `encodeP256ReferenceKeyDer()` / `encodeP256ReferenceKeyPem()`
+- `encodeP384ReferenceKeyDer()` / `encodeP384ReferenceKeyPem()`
+
+Reference Keyには実private scalarを含みません。SEC1 privateKey fieldへObject ID + NXP magic/class/indexをkey-widthに合わせてencodeします。
+
+File API:
+
+- `writeP256ReferenceKeyFile()`
+- `writeP384ReferenceKeyFile()`
+- `writeTlsReferenceKeyFile()` — internal origin
+- `writeImportedTlsReferenceKeyFile()` — external origin
+
+live TLS identityを検証してから、0600・atomic・non-overwriteでPEMをinstallします。
+
+## OpenSSL host verification
+
+実行時にOpenSSL 3 `libcrypto.so.3`を動的loadします。共通FFIは`openssl_ffi.nim`へ集約されています。
+
+主な用途:
+
+- SHA-256 / certificate fingerprint
+- ECDSA verification
+- X.509 parse / chain verification
+- certificate public-key extraction/comparison
+- OpenSSL 3 `OSSL_DECODER`によるexternal private-key decode
+
+C headerやOpenSSL development symlinkはruntimeには不要です。
+
+## Attestation / Trust Store
 
 主なAPI:
 
 - `readAttestationCertificate()`
-- `extractAttestationCertificateDer()`
-- `validateAttestationCertificateDer()`
-
-`0xF0000013`のBinaryFile全体を読み、先頭DER SEQUENCEを返します。末尾のゼロ埋めは許可し、非ゼロtailは拒否します。
-
-## ReadObject-with-Attestation
-
-```nim
-let attested = se.readObjectWithAttestation(
-  objectId = 0x30000100'u32,
-  freshness = freshness
-)
-```
-
-主なAPI:
-
-- `buildReadObjectWithAttestationRequest()`
-- `parseReadObjectWithAttestationResponse()`
 - `readObjectWithAttestation()`
+- `verifyAttestationSignature()`
+- embedded NXP Root/Intermediate trust helpers
 
-`AttestedObjectRead`は署名対象command、送信APDU、raw response、object data、attributes、chip UID、timestamp、signatureを保持します。
+TLS/kittingとも、certificate chainとsignatureを検証したうえでsigned Object ID/type/origin/Policy等のsemanticsを評価します。
 
-## OpenSSL host verification
+## Kitting
 
-実行時にOpenSSL 3 `libcrypto.so.3`を動的loadします。
+既存kitting APIは引き続きP-256 firmware KEX用です。
 
-主なAPI:
+主なlayer:
 
-- `sha256()`
-- `certificateSha256()`
-- `extractCertificateEcPublicKey()`
-- `verifyEcdsaSha256WithCertificate()`
-- `verifyCertificateChain()`
-- `splitDerCertificateBundle()`
-- `readDerCertificateBundleFile()`
-
-C headerやOpenSSL development symlinkは不要です。
-
-## Embedded NXP Trust Store
-
-```nim
-let roots = nxpAttestationTrustAnchors()
-let intermediates = nxpAttestationIntermediates()
+```text
+board serial / profile
+-> freshness
+-> attested record
+-> CSV encode/decode
+-> offline certificate/signature/semantic verification
+-> local board/SE050/live-object comparison
 ```
 
-関連API:
+代表API:
 
-- `nxpAttestationRootDer()`
-- `nxpAttestationIntermediateDer()`
-- `nxpAttestationTrustAnchors()`
-- `nxpAttestationIntermediates()`
-
-DERは`src/se050_nim/certs/`から`staticRead()`で組み込みます。
-
-## Attestation signature / semantics
-
-```nim
-let signature = verifyAttestationSignature(attested, cert)
-let semantics = verifyKittingAttestationSemantics(
-  attested,
-  testKittingProfile()
-)
-```
-
-`verifyKittingAttestationSemantics()`はsigned fieldについて次を確認します。
-
-- configured Object ID
-- Attestation key ID `0xF0000012`
-- ECDSA/SHA-256 algorithm
-- 完全な65-byte P-256公開鍵
-- SE050 UID、timestamp、private key size
-- P-256 key-pair type
-- internal origin
-- owner/auth object
-- exactly one Policyとexpected header
-
-証明書chainと署名検証を先に成功させてからsemanticsを信頼してください。
-
-## Board identity / Profile
-
-```nim
-let serial = readBoardSerialNumber()
-let testProfile = testKittingProfile()
-let productionProfile = productionKittingProfile()
-```
-
-主なAPI:
-
-- `parseBoardSerialNumber()`
-- `readBoardSerialNumber()`
-- `kittingProfile()` / `kittingProfileForName()` / `kittingProfileForObjectId()`
-- `keyPolicy()` / `expectedKeyType()` / `isDeletable()`
-
-Board serial default pathは`/proc/device-tree/board/serialno`です。
-
-## Kitting record / freshness
-
-```nim
-let freshness = deriveKittingFreshness(
-  serialNumber,
-  createdAt,
-  testProfile,
-  nonce
-)
-```
-
-主なAPI:
-
-- `validateKittingTimestamp()`
+- `testKittingProfile()` / `productionKittingProfile()`
 - `deriveKittingFreshness()`
 - `createKittingRecord()`
-- `encodeAttestationContainer()` / `decodeAttestationContainer()`
-- `restoreKittingAttestation()`
-
-`KittingRecord`はserial、format version、profile、UTC時刻、key role、SE050 UID、Object ID、nonce、公開鍵、個体証明書、Attestation containerを保持します。
-
-## CSV
-
-```nim
-let text = encodeKittingCsv(records)
-let records = decodeKittingCsv(text)
-let one = findKittingRecord(
-  records.value,
-  serialNumber,
-  kpTest
-)
-```
-
-API:
-
-- `encodeKittingCsv()`
-- `decodeKittingCsv()`
-- `findKittingRecord()`
-- `KittingCsvHeader`
-
-Binary fieldはstrict Base64です。Record selectionはserial/profile/key roleでexactly oneを要求します。
-
-## Offline verification
-
-```nim
-let verified = verifyKittingCsvRecord(
-  csvText = csvText,
-  serialNumber = "11900000015",
-  profileKind = kpTest,
-  trustAnchorsDer = nxpAttestationTrustAnchors(),
-  intermediatesDer = nxpAttestationIntermediates()
-)
-```
-
-API:
-
-- `verifyKittingRecord()`
-- `verifyKittingCsvRecord()`
-- `VerifiedKittingRecord`
-
-これはI2Cへアクセスせず、record復元、freshness、証明書chain、Attestation署名、signed semanticsを検証します。将来のPC importer/DB登録処理から再利用できます。
-
-## Local-device verification
-
-```nim
-let local = verifyLocalKittingIdentity(
-  verified = verified.value,
-  boardSerialNumber = serial,
-  liveSe050Uid = uid,
-  liveObjectType = objectType,
-  liveTransientIndicator = persistence,
-  livePublicKey = publicKey
-)
-```
-
-オフライン検証済みrecordを、現在の基板serial、SE050 UID、P-256 object type、persistent属性、公開鍵と比較します。I2C read自体はCLI/呼び出し側で行い、このAPIはpure comparisonとしてunit test可能です。
-
-## Exporter merge helper
-
-- `sameKittingRecordKey()`
-- `sameKittingDeviceKey()`
+- `encodeKittingCsv()` / `decodeKittingCsv()`
+- `verifyKittingRecord()` / `verifyKittingCsvRecord()`
+- `verifyLocalKittingIdentity()`
 - `mergeKittingRecord()`
-
-論理キー`serial + profile + role`が同じでUID/Object ID/public keyが異なるrecordは競合として拒否します。
 
 ## 推奨layering
 
 ```text
 se050_nim:
-  SE050 primitive + Attestation + reusable kitting verification
+  SE050 primitive
+  + Attestation
+  + managed TLS identity / external key import
+  + OpenSSL Reference Key
+  + reusable kitting verification
 
 se050ctl:
-  development/diagnostic CLI + local kitting verification
+  diagnostic / explicit provisioning CLI
+  + curve state/provisioning
+  + TLS import/reference-key tooling
 
-se050-kitting-export:
-  current test factory exporter
+NXP OpenSSL Provider:
+  OpenSSL runtime -> SE050 private-key operation boundary
 
-future production kitting:
-  irreversible customer-range key creation
+ordinary application:
+  normal certificate/key/CA filenames only
 
 fwkeys / fw-envelope:
   P-256 ECDH + HKDF + AES-GCM envelope
-
-fw-update:
-  firmware verification, decryption, A/B update
 ```

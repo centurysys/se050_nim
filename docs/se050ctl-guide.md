@@ -9,8 +9,8 @@ Included:
 - UID, random, and Applet version/config
 - Secure Object exists/info/list
 - development-range EC key creation and deletion
-- fixed A/B TLS client identity key creation and verification for test/production profiles
-- public-key export and P-256 ECDH derive
+- managed TLS identities by identity number + A/B slot (internal P-256 generation and external P-256/P-384 import)
+- EC curve-state/P-384 provisioning, TLS public/Reference Key export, and P-256 ECDH derive
 - NXP device certificate DER export
 - raw ReadObject-with-Attestation capture
 - live attestation diagnostics with explicit CA files
@@ -85,80 +85,122 @@ se050ctl factory-pubkey \
 
 See [`factory-identities.md`](factory-identities.md).
 
+## EC curve state
+
+```sh
+se050ctl curve-list -b 0
+```
+
+The reported `set` / `not-set` state is current persistent SE05x Weierstrass curve instantiation, not silicon capability.
+
+To explicitly provision the fixed standard NIST P-384 parameters when P-384 is not set:
+
+```sh
+se050ctl curve-provision-p384 -b 0 --yes
+```
+
+`--yes` is mandatory because this changes persistent global curve state rather than a disposable key object. An already-instantiated P-384 curve is left unchanged; failures after a confirmed create use best-effort rollback.
+
 ## TLS client identity keys
 
-TLS client identity commands do not accept arbitrary Object IDs. They operate only on fixed profile/slot mappings:
+Managed TLS commands use fixed `profile / identity / slot / curve` metadata rather than arbitrary Object IDs. The Object ID does not encode the curve.
 
 ```text
-test A        0x30000200
-test B        0x30000201
-production A  0x20000200
-production B  0x20000201
+test:       0x30000200 + identity * 2 + slotOffset
+production: 0x20000200 + identity * 2 + slotOffset
+slotOffset: A=0, B=1
 ```
 
-All slots use `SIGN + READ + DELETE` policy `0x10240000`. Existing objects are never automatically deleted or overwritten.
+All slots use `SIGN + READ + DELETE` policy `0x10240000`. Existing objects are never automatically overwritten or deleted.
 
-### `tls-key-ref`
-
-Prints the URI used by NXP `se05x-openssl-provider` to reference an existing SE050 key. This command does not access the SE050, so no `-b` option is required.
-
-```sh
-se050ctl tls-key-ref --profile test --identity 0 --slot A
-# nxp:0x30000200
-
-se050ctl tls-key-ref --profile production --identity 1 --slot B
-# nxp:0x20000203
-```
-
-The output can be passed directly to OpenSSL 3 `-key` / `-inkey` options.
-
-```sh
-KEY_URI=$(se050ctl tls-key-ref --profile test --identity 0 --slot A)
-openssl pkeyutl --provider /usr/local/lib/libsssProvider.so --provider default \
-  -inkey "$KEY_URI" -sign -rawin -in input.txt -out signature.der -digest sha256
-```
-
-
-### `tls-key-pubkey`
-
-After attestation-validating the TLS identity, export only its public key to a
-file. Use `spki-der` when comparing against a CSR public key.
-
-```sh
-se050ctl tls-key-pubkey \
-  -b 0 \
-  --profile test \
-  --identity 0 \
-  --slot A \
-  --format spki-der \
-  --out se050-public.der
-```
-
-`--format raw` writes the 65-byte SE050 `0x04 || X || Y` point. `spki-der`
-writes X.509 SubjectPublicKeyInfo DER for direct comparison with OpenSSL CSR
-public-key output.
+P-256 and P-384 are managed curves, but **`tls-keygen` internal generation is currently P-256 only**. P-384 is supported through external import.
 
 ### `tls-keygen`
 
 ```sh
 se050ctl tls-keygen -b 0 --profile test --identity 0 --slot A
-se050ctl tls-keygen -b 0 --profile production --identity 0 --slot A
-se050ctl tls-keygen -b 0 --profile production --identity 1 --slot B
 ```
 
-If the slot is empty, a P-256 key pair is generated inside the SE050. If it already exists, it is not regenerated. The command validates the live type/persistence, NXP device certificate chain, attestation signature, signed Object ID/type/internal origin/policy, and the match between live and attested public keys before accepting the object. A failed post-generation check never triggers automatic deletion.
+Creates or validates an internally generated P-256 identity and requires persistent P-256 key-pair type, valid NXP attestation chain/signature, `origin = internal`, policy `0x10240000`, and live/attested public-key equality. Invalid existing objects are never replaced.
+
+### `tls-key-import`
+
+```sh
+se050ctl tls-key-import \
+  -b 0 \
+  --profile test --identity 0 --slot B \
+  --curve p384 \
+  --key client.key \
+  --cert client.crt
+```
+
+`--curve` accepts `p256` or `p384` and defaults to `p256`. Private keys must be unencrypted PEM or DER; certificates may be PEM or DER.
+
+Before writing the SE050, OpenSSL 3 validates the private key, curve/key-pair consistency, and matching X.509 certificate public key. P-384 also requires the curve to already be instantiated. The target slot must be empty.
+
+After writing, the CLI validates `origin = external`, type/size, persistence, policy, attestation, and source/live public-key equality. Sensitive import transport is redacted and temporary private material is cleared.
 
 ### `tls-key-info`
 
+Internal P-256:
+
 ```sh
 se050ctl tls-key-info -b 0 --profile test --identity 0 --slot A
-se050ctl tls-key-info -b 0 --profile production --identity 0 --slot A
-se050ctl tls-key-info -b 0 --profile production --identity 1 --slot B
 ```
 
-This performs the same trust and semantic validation without changing the key, then prints its profile, slot, Object ID, public key, origin, and policy.
+Imported P-384:
 
-Generic `keygen` and `delete` still reject the customer range. Production TLS slots are writable only through the dedicated TLS command.
+```sh
+se050ctl tls-key-info \
+  -b 0 --profile test --identity 0 --slot B \
+  --curve p384 --imported
+```
+
+Without `--imported`, validation requires `origin = internal`; with it, validation requires `origin = external`. Origin is never auto-detected to weaken validation.
+
+### `tls-key-pubkey`
+
+```sh
+se050ctl tls-key-pubkey \
+  -b 0 --profile test --identity 0 --slot B \
+  --curve p384 --imported \
+  --format spki-der \
+  --out se050-public.der
+```
+
+Raw public points are 65 bytes for P-256 and 97 bytes for P-384. SPKI DER export supports both curves.
+
+### `tls-key-ref`
+
+```sh
+se050ctl tls-key-ref --profile test --identity 0 --slot A
+# nxp:0x30000200
+```
+
+This Provider-native URI is useful for explicit Provider diagnostics and does not access the SE050.
+
+### `tls-key-ref-file`
+
+Export an attestation-validated NXP Reference Key PEM for transparent normal key-file APIs.
+
+Internal P-256:
+
+```sh
+se050ctl tls-key-ref-file \
+  -b 0 --profile test --identity 0 --slot A \
+  --out device.key
+```
+
+Imported P-384:
+
+```sh
+se050ctl tls-key-ref-file \
+  -b 0 --profile test --identity 0 --slot B \
+  --curve p384 --imported \
+  --out device.key
+```
+
+The Reference Key contains no real private scalar. It is atomically installed with private-key-style 0600 permissions and existing paths are not overwritten. With NXP/default Providers autoloaded through `openssl.cnf`, an ordinary OpenSSL/Nim application can use it as a normal `keyFile`.
 
 ## Development EC keys
 

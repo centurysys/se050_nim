@@ -23,13 +23,18 @@ NXP Plug & Trust Middlewareには依存せず、組み込みLinux製品から必
 - CSVとローカル基板serial、SE050 UID、公開鍵の実機照合
 - P-256 ECDSA/SHA-256署名
 - TLS client identityの`identity N + A/B slot`管理
-- TLS identity鍵の`origin = internal`、Policy、公開鍵のAttestation検証
-- NXP OpenSSL Provider 1.1.5から`nxp:0x...`で既存SE050鍵を直接参照
-- SE050鍵によるPKCS#10 CSR生成とCSR自己署名検証
-- CSR内公開鍵とSE050公開鍵のbyte-for-byte一致確認
-- OpenSSL 3.5.6 + NXP Provider 1.1.5でTLS 1.2 / TLS 1.3 mTLS client authentication
+- SE050内部生成P-256 TLS identityのstrict Attestation検証（`origin = internal`）
+- 外部P-256/P-384 private keyのPEM/DER parse、X.509 certificateとの公開鍵一致検証、空slotへのimport
+- imported TLS identityのstrict Attestation検証（`origin = external`）
+- P-384 curve instantiation状態の読出しと、standard secp384r1 parameterのtransactional provisioning
+- P-256/P-384 NXP Reference Key DER/PEM生成（private scalarは含まない）
+- Attestation検証済みTLS identityから0600・非上書きでReference Key PEMをexport
+- sensitive key-import/ECDH transportのraw T=1 log redactionと一時buffer zeroization
+- NXP OpenSSL ProviderによるP-256/P-384 Reference KeyからのSE050 ECDSA署名
+- `openssl.cnf`からNXP/default Providerをautoloadし、普通のkey file APIからReference Keyを使用
+- SE050固有コードを含まないNim `std/net` clientでP-256/P-384 TLS 1.2 / TLS 1.3 mTLS client authentication
 
-Production用`0x20000100`の生成経路も実装済みですが、不可逆な実機試験はまだ完了していません。
+Production用`0x20000100`のfirmware KEX生成経路も実装済みですが、不可逆な実機試験はまだ完了していません。
 
 Firmware envelope用の鍵共有本線は以下です。
 
@@ -41,7 +46,7 @@ X25519は、確認したApplet 7.2.0経路では鍵生成と公開鍵exportは�
 
 ## TLS client identity
 
-TLS client identityはCloud固有名を持たず、汎用のP-256 client signing keyとして管理します。各identityはA/Bの2 slotを持ち、証明書・鍵rotationに使用できます。
+TLS client identityはCloud固有名を持たない汎用X.509/mTLS client signing keyとして管理します。各identityはA/Bの2 slotを持ち、証明書・鍵rotationに使用できます。
 
 ```text
 identity 0: slot A / slot B
@@ -50,7 +55,7 @@ identity 2: slot A / slot B
 ...
 ```
 
-Object IDは次の規則で固定します。
+Object IDはcurveに依存せず、次の規則で固定します。
 
 ```text
 test:       0x30000200 + identity * 2 + slotOffset
@@ -58,9 +63,25 @@ production: 0x20000200 + identity * 2 + slotOffset
 slotOffset: A=0, B=1
 ```
 
-TLS鍵Policyは`SIGN + READ + DELETE` (`0x10240000`)です。秘密鍵はSE050内部で生成し、filesystemやCloudへexportしません。既存Objectのtype、origin、Policy、公開鍵はNXP Attestationで検証し、不整合時に自動削除・再生成は行いません。
+TLS鍵Policyは`SIGN + READ + DELETE` (`0x10240000`)です。Object IDだけではP-256/P-384を区別できないため、P-384を扱うAPI/CLIではcurveを明示します。
 
-主なCLI例:
+現在のprovisioning経路は次の2種類です。
+
+- `tls-keygen`: SE050内部でP-256鍵を生成し、`origin = internal`を要求して検証
+- `tls-key-import`: 外部のunencrypted P-256/P-384 private keyを、対応するX.509 certificateと照合した後で空slotへimportし、`origin = external`を要求して検証
+
+外部importは既存Objectを上書きしません。private key/certificateのalgorithm・curve・公開鍵一致をhost側で先に検証し、書込み後はlive public key、Object type、persistence、Policy、Attestation originを再検証します。private key fileのbufferとWriteECKey用一時bufferはzeroizeし、debug時もsensitive T=1 frameはredactします。
+
+P-384 importにはstandard NIST P-384 curveがSE05xへinstantiate済みである必要があります。状態確認と明示的provisioningは次のとおりです。
+
+```sh
+se050ctl curve-list -b 0
+se050ctl curve-provision-p384 -b 0 --yes
+```
+
+`curve-provision-p384`はkey objectではなくpersistent global curve stateを変更するため、`--yes`なしでは実行しません。
+
+P-256内部生成例:
 
 ```sh
 se050ctl tls-keygen \
@@ -68,32 +89,72 @@ se050ctl tls-keygen \
   --profile test \
   --identity 0 \
   --slot A
+```
+
+外部P-384 import例:
+
+```sh
+se050ctl tls-key-import \
+  -b 0 \
+  --profile test \
+  --identity 0 \
+  --slot B \
+  --curve p384 \
+  --key client.key \
+  --cert client.crt
 
 se050ctl tls-key-info \
   -b 0 \
   --profile test \
   --identity 0 \
-  --slot A
-
-se050ctl tls-key-ref \
-  --profile test \
-  --identity 0 \
-  --slot A
+  --slot B \
+  --curve p384 \
+  --imported
 ```
 
-`tls-key-ref`はNXP OpenSSL Providerから直接参照できる`nxp:0x30000200`形式のURIを返します。
+NXP Provider固有のObject URIが必要な場合は従来どおり`tls-key-ref`を使えます。
 
-実機では、SE050内部鍵をNXP OpenSSL Provider経由でOpenSSL 3から使用し、ECDSA署名、PKCS#10 CSR生成、CSR検証、TLS 1.2 / TLS 1.3の相互TLS client authenticationまで確認済みです。ローカルmTLS試験ではclient certificateなしの接続が拒否されることも確認しています。
+```sh
+se050ctl tls-key-ref --profile test --identity 0 --slot A
+# nxp:0x30000200
+```
 
-AWS IoT Core / Azure IoT Hubについては、現行の公式X.509/mTLS仕様と今回のSE050構成を照合し、接続・provisioning手順を文書化済みです。実AWS/Azureアカウントを使用したCloud接続試験はこのrepositoryでは未実施です。
+一方、**通常のOpenSSL/Nim TLS applicationへ透過的に渡す標準経路**はReference Key fileです。ApplicationはSE050やProvider URIを知らず、普通のprivate-key filenameとして扱います。
+
+```sh
+se050ctl tls-key-ref-file \
+  -b 0 \
+  --profile test \
+  --identity 0 \
+  --slot B \
+  --curve p384 \
+  --imported \
+  --out device.key
+```
+
+NXP Providerとdefault Providerを`openssl.cnf`からautoloadすれば、Nim側は通常の`std/net` APIだけで動作します。
+
+```nim
+let ctx = newContext(
+  verifyMode = CVerifyPeer,
+  certFile = certFile,
+  keyFile = keyFile,
+  caFile = caFile
+)
+```
+
+P-256/P-384の双方について、TLS 1.3とTLS 1.2のmutual TLSをAthena実機で確認済みです。
+
+AWS IoT Core / Azure IoT Hubについては既存documentを参照してください。Cloud側で許容されるcurve/algorithmはservice仕様に依存するため、P-384を使用する場合は各serviceの現行仕様を別途確認します。
 
 Host OSはtrusted environmentとして扱い、SE050とのdirect I2C通信にはPlain sessionを使用します。主目的はTLS private keyのnon-exportabilityであり、Host OS侵害後のSE050不正利用防止はこの設計のsecurity boundaryには含めません。
 
 詳細:
 
-- [`docs/openssl-provider.ja.md`](docs/openssl-provider.ja.md): NXP OpenSSL Provider連携
+- [`docs/openssl-provider.ja.md`](docs/openssl-provider.ja.md): Provider URI、Reference Key、autoload、transparent TLS
+- [`docs/local-mtls-test.ja.md`](docs/local-mtls-test.ja.md): P-256/P-384のローカルmTLS統合試験
+- [`docs/se050ctl-guide.ja.md`](docs/se050ctl-guide.ja.md): import/curve/reference-key CLI
 - [`docs/factory-identities.ja.md`](docs/factory-identities.ja.md): NXP factory-provisioned Cloud identity
-- [`docs/local-mtls-test.ja.md`](docs/local-mtls-test.ja.md): ローカルmTLS統合試験
 - [`docs/aws-iot.ja.md`](docs/aws-iot.ja.md): AWS IoT Core接続手順
 - [`docs/azure-iot.ja.md`](docs/azure-iot.ja.md): Azure IoT Hub接続手順
 
@@ -183,16 +244,20 @@ NXP Attestation Root/Intermediate証明書は`staticRead()`でバイナリへ組
 主なコマンド:
 
 ```text
-uid                 UID読出し
-random              乱数生成
-version             Applet version/config確認
-exists/info/list    Secure Object確認
-keygen/pubkey       開発用EC鍵生成・公開鍵読出し
-tls-keygen           TLS client identity鍵生成・既存鍵検証
-tls-key-info          TLS client identity鍵のAttestation付き情報表示
-tls-key-ref           NXP OpenSSL Provider用`nxp:0x...` URI生成
-tls-key-pubkey        TLS identity公開鍵のraw/SPKI DER出力
-derive              P-256 ECDH
+uid                     UID読出し
+random                  乱数生成
+version                 Applet version/config確認
+curve-list              Weierstrass curve instantiation状態読出し
+curve-provision-p384    standard NIST P-384 curveの明示的provisioning
+exists/info/list        Secure Object確認
+keygen/pubkey           開発用EC鍵生成・公開鍵読出し
+tls-keygen              内部生成P-256 TLS identity作成・検証
+tls-key-import          外部P-256/P-384 TLS private key import
+tls-key-info            internal/imported TLS identityのAttestation検証
+tls-key-ref             NXP Provider用`nxp:0x...` URI生成
+tls-key-ref-file        P-256/P-384 Reference Key PEM生成
+tls-key-pubkey          TLS identity公開鍵のraw/SPKI DER出力
+derive                  P-256 ECDH
 attestation-cert    NXP個体証明書のDER出力
 attest-read         ReadObject-with-Attestationの診断取得
 attest-verify       外部CA指定によるライブAttestation診断
@@ -254,9 +319,14 @@ P-256公開鍵は65 bytesの非圧縮point、ECDH shared secretは32 bytesです
 - 基板serial、キッティングprofile/record/CSV
 - オフラインキッティング検証
 - ローカル実機照合
-- TLS identity profile / A/B slot / identity番号管理
-- TLS identity Attestation semantic検証
-- NXP OpenSSL Provider用Object URIとP-256 SPKI DER変換
+- TLS identity profile / A/B slot / identity番号 / P-256・P-384 curve管理
+- internal/imported originを分離したTLS identity Attestation semantic検証
+- external EC private key parse、certificate match、P-256/P-384 managed import
+- P-384 curve state query / standard parameter provisioning
+- P-256/P-384 SPKI DER変換とNXP Reference Key DER/PEM生成
+- private-key-style Reference Key fileのatomic/non-overwrite出力
+- sensitive transport redactionとsecure memory clearing
+- NXP OpenSSL Provider用Object URI
 - NXP factory Cloud identity catalog、certificate/public key readout
 - Exporter用CSV merge helper
 

@@ -27,9 +27,9 @@
 | NXP factory Cloud RSA identity 1 | `0xF0000112` / `0xF0000113` | RSA-2048 key pair + certificate / NXP | variant依存、read-only利用 |
 | test firmware KEX | `0x30000100` | P-256 key pair / dev | Exporter実装・実機確認済み |
 | production firmware KEX | `0x20000100` | P-256 key pair / customer | 生成CLI・汎用変更ガード実装済み、不可逆実機試験待ち |
-| test TLS identity key0 A/B | `0x30000200..0x30000201` | P-256 key pair / dev | identity番号 + A/B slot、実機確認済み |
-| test TLS identity key1 A/B | `0x30000202..0x30000203` | P-256 key pair / dev | 複数identity mapping実機確認済み |
-| production TLS identity | `0x20000200..` | P-256 key pair / customer | identity番号 + A/B slot、生成はTLS専用CLIのみ |
+| test TLS identity key0 A/B | `0x30000200..0x30000201` | P-256/P-384 key pair / dev | internal P-256 / imported P-256・P-384を実機確認済み |
+| test TLS identity key1 A/B | `0x30000202..0x30000203` | P-256/P-384 key pair / dev | identity mappingはcurve非依存 |
+| production TLS identity | `0x20000200..` | P-256/P-384 key pair / customer | internal生成P-256 / external import P-256・P-384のTLS専用経路 |
 
 Firmware KEXはtest/productionとも下位16-bit indexを`0x0100`に揃えます。TLS client identityは`0x0200`をbaseとし、`identity * 2 + slotOffset`でObject IDを割り当てます。test/productionでは同じ下位16-bit indexを使い、Object areaでライフサイクルを分離します。
 
@@ -116,7 +116,9 @@ slotOffset: A=0, B=1
 
 `identity 0`は従来のA/B Object IDと互換です。`identity 1`以降は別サービスや別接続先向けの独立したTLS client identityとして利用できます。
 
-Policyは全identity/slot共通で`SIGN + READ + DELETE`です。秘密鍵はSE050内部生成とし、READは公開鍵取得に使用します。各identityのA/B方式で新しいslotへ鍵・証明書を準備して接続確認後に切り替え、旧slotを削除・再利用できる設計です。
+Policyは全identity/slot共通で`SIGN + READ + DELETE`です。Object IDはcurveをencodeせず、P-256/P-384は`TlsIdentityProfile.curve`で区別します。同じslotに複数curveを同時に保持することはできません。
+
+内部生成経路`tls-keygen`は現在P-256専用です。外部import経路`tls-key-import`はP-256/P-384を扱い、既存slotを上書きしません。A/B方式で新しいslotへ鍵・証明書を準備して接続確認後に切り替え、旧slotを削除・再利用できる設計です。
 
 AWS IoT Core / Azure IoT Hub固有のendpoint、device/Thing ID、CSR登録、certificate登録、MQTT parameterはこのprofileには含めません。
 

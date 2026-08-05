@@ -2,197 +2,227 @@
 
 ## 目的
 
-`se050_nim` / `se050ctl`で生成・検証したTLS client identity鍵を、OpenSSL 3からNXP公式 `se05x-openssl-provider` 経由で使用するための境界を定義する。
+`se050_nim` / `se050ctl`で管理するSE050 TLS client identityを、OpenSSL 3および通常のOpenSSL-backed applicationから使用するための境界をまとめます。
 
-Cloud固有処理はここに含めない。まず既存SE050 ObjectをProviderから参照してECDSA署名できることを確認し、その後CSRとローカルmTLSへ進む。
+現在は2つの参照方法を使い分けます。
+
+1. `nxp:0x...` URI: Providerを明示的に扱うdiagnostic/CLI向け
+2. NXP Reference Key PEM: 普通の`keyFile`/`-key` filenameとして扱うtransparent application向け
+
+P-256とP-384の双方について、Reference Key -> NXP Provider -> SE050 ECDSA署名、およびNim `std/net` TLS 1.2 / TLS 1.3 mTLSを実機確認済みです。
 
 ## 採用Provider
 
-NXP公式:
+NXP公式 `se05x-openssl-provider` を使用します。`se050_nim`自体はNXP Plug & Trust Middlewareに依存せず、ProviderはOpenSSL runtime連携の境界としてのみ使用します。
 
-```text
-https://github.com/NXPPlugNTrust/se05x-openssl-provider
-```
-
-2026-08時点の公式READMEではOpenSSL 3.x対応で、EC key generation、EC sign/verify、ECDH、CSR、TLS 1.2/1.3 client例が公開されている。
-
-既存SE050鍵は次のURI形式で直接参照できる。
-
-```text
-nxp:0x12345678
-```
-
-そのため、`se050_nim`側でNXP reference-key PEM形式を独自生成しない。まずObject ID URI方式を標準経路とする。
-
-## se050ctlとの対応
-
-例:
+Providerのnative/cross buildでは対象architecture用の`libsssProvider.so`を生成してください。OpenSSL 3からProviderをdynamic loadする構成では、Provider自身が`libcrypto.so.3`を解決できる必要があります。確認には次を使えます。
 
 ```sh
-se050ctl tls-key-ref --profile test --identity 0 --slot A
+readelf -d /usr/local/lib/libsssProvider.so | grep NEEDED
+ldd /usr/local/lib/libsssProvider.so
 ```
 
-出力:
-
-```text
-nxp:0x30000200
-```
-
-Object ID配置規則はTLS identity profileが一元管理するため、Cloud/application側でObject IDを再計算しない。
-
-## Providerの取得とnative build
-
-公式READMEの基本手順:
-
-```sh
-git clone --recurse-submodules https://github.com/NXPPlugNTrust/se05x-openssl-provider.git
-cd se05x-openssl-provider
-mkdir build
-cd build
-cmake ../
-cmake -DPTMW_HostCrypto=OPENSSL .
-cmake --build .
-```
-
-生成物はrepositoryの `bin/libsssProvider.so` にもcopyされる。`cmake --install .`を使用する場合は通常shared library directoryへinstallされる。
-
-対象製品rootfs向けcross buildでは、上記にtoolchain file / sysrootを追加する。Provider本体に加えてsubmodule `simw_lib`も対象architecture向けにcompileされるため、host用binaryを流用しない。
+対象buildで`libcrypto.so.3`への依存が欠ける場合は、Provider targetを`crypto`へ明示linkする必要があります。
 
 ## I2C接続
 
-NXP Supportの現行案内ではLinux I2C portは環境変数 `EX_SSS_BOOT_SSS_PORT` で指定できる。
-
-例:
+Linux I2C portは`EX_SSS_BOOT_SSS_PORT`で指定します。
 
 ```sh
 export EX_SSS_BOOT_SSS_PORT=/dev/i2c-0:0x48
 ```
 
-この値は実機のbus/addressに合わせる。
+本プロジェクトではHost OSをtrusted environmentとして扱い、direct-I2CのPlain sessionを使用します。主目的はprivate keyのnon-exportabilityであり、Host OS侵害後のSE050不正利用防止は現在のsecurity boundaryには含めません。
 
-本プロジェクトではHost OSをtrusted environmentとして扱い、TLS秘密鍵のnon-exportabilityを主なsecurity boundaryとする。そのためdirect-I2Cのplain sessionを採用する。Providerが表示する `Communication channel is Plain` / `Not recommended for production use` 警告はこの設計では想定内である。Host OS侵害後のSE050不正利用防止は対象外とし、SCP03 / Access Manager / Host authentication credentialは導入しない。
+## 1. Provider-native Object URI
 
-## Step 5実機確認
-
-### 1. 既存TLS identityを確認
+`tls-key-ref`はSE050へアクセスせず、managed TLS slotのObject IDからProvider URIを生成します。
 
 ```sh
-se050ctl tls-key-info -b 0 --profile test --identity 0 --slot A
+se050ctl tls-key-ref --profile test --identity 0 --slot A
+# nxp:0x30000200
 ```
 
-Attestationまで成功している既存鍵を使う。Providerから新しい鍵を生成しない。
-
-### 2. Provider URIを取得
+これはProviderを明示的に扱うcommandで便利です。
 
 ```sh
-KEY_URI=$(se050ctl tls-key-ref --profile test --identity 0 --slot A)
-echo "$KEY_URI"
-```
-
-期待値:
-
-```text
-nxp:0x30000200
-```
-
-### 3. Provider load確認
-
-Provider install先に応じてpathを変更する。
-
-```sh
-openssl list -providers \
-  -provider /usr/local/lib/libsssProvider.so \
-  -provider default
-```
-
-NXP Providerとdefault providerの双方がloadできることを確認する。
-
-### 4. 既存SE050鍵でECDSA署名
-
-```sh
-printf 'se050 provider test\n' > provider-input.txt
+printf 'provider test\n' > input.txt
 
 openssl pkeyutl \
   --provider /usr/local/lib/libsssProvider.so \
   --provider default \
-  -inkey "$KEY_URI" \
+  -inkey nxp:0x30000200 \
   -sign \
   -rawin \
-  -in provider-input.txt \
-  -out provider-signature.der \
+  -in input.txt \
+  -out signature.der \
   -digest sha256
 ```
 
-ここで成功すれば、`se050_nim`が作った既存Object IDをNXP Providerが解決し、SE050でECDSA署名できたことになる。
+URIにはcurveやorigin情報が含まれないため、managed TLS identityとして使用する前には`tls-key-info`等でlive objectを検証してください。
 
-default providerを先にloadする構成でNXP ECDSA implementationが選ばれない場合は、NXP公式READMEに従いproperty queryを追加する。
+## 2. Reference Key PEM
 
-```text
-?nxp_prov.signature.ecdsa=yes
-```
+通常のapplicationへ透過的に渡す経路はReference Key PEMです。
 
-## Step 5完了条件
+NXP ProviderのEC Reference KeyはSEC1 `EC PRIVATE KEY`構造を使いますが、privateKey OCTET STRINGには実private scalarではなく、SE050 Object IDとProvider markerが格納されます。公開鍵とnamed-curve情報は通常のEC key metadataです。
 
-- NXP Providerを対象architectureでbuildできる
-- `libsssProvider.so`をOpenSSL 3がloadできる
-- `EX_SSS_BOOT_SSS_PORT`で対象SE050へ接続できる
-- `se050ctl tls-key-ref`の `nxp:0x...` URIをProviderが受け付ける
-- Provider経由ECDSA signが既存TLS identity鍵で成功する
-- Provider自身によるkey generationは行わず、Object lifecycleは引き続き`se050_nim`側が管理する
+`se050_nim`は次を生成できます。
 
-次Stepでは、この同じURIを `openssl req -new -key nxp:...` に渡してCSR生成・自己検証を行う。
+- P-256: 32-byte reference field + `prime256v1`
+- P-384: 48-byte reference field + `secp384r1`
 
+Reference Keyには実private key materialを含みません。
 
-## CSR生成と公開鍵一致確認
-
-TLS identity鍵からCSRを生成するときも、reference-key PEMは不要です。
-NXP ProviderのObject ID URIをそのまま`openssl req`へ渡します。
-
-例としてtest / identity 0 / slot Aを使用します。
+### 内部生成P-256
 
 ```sh
-export EX_SSS_BOOT_SSS_PORT=/dev/i2c-0:0x48
-PROVIDER=/usr/local/lib/libsssProvider.so
-KEY_URI=$(se050ctl tls-key-ref --profile test --identity 0 --slot A)
-
-se050ctl tls-key-pubkey \
+se050ctl tls-key-ref-file \
   -b 0 \
   --profile test \
   --identity 0 \
   --slot A \
-  --format spki-der \
-  --out se050-public.der
-
-openssl req -new \
-  --provider "$PROVIDER" \
-  --provider default \
-  -key "$KEY_URI" \
-  -subj "/CN=se050-local-test" \
-  -out device.csr
+  --out device.key
 ```
 
-CSR自身の署名を検証します。
+### 外部import済みP-384
 
 ```sh
-openssl req -in device.csr -noout -verify
+se050ctl tls-key-ref-file \
+  -b 0 \
+  --profile test \
+  --identity 0 \
+  --slot B \
+  --curve p384 \
+  --imported \
+  --out device.key
 ```
 
-次にCSRのSubjectPublicKeyInfoをDERで取り出し、SE050からAttestation検証後に
-exportした公開鍵とbyte-for-byteで比較します。
+export前に対象Objectの存在、type、persistence、Policy、Attestation certificate/signature、origin、live/attested public key一致を検証します。出力fileは0600で作成し、既存pathを上書きしません。
+
+## 3. Provider autoload
+
+Application側からProvider指定を消すため、NXP Providerとdefault Providerを`openssl.cnf`からautoloadします。
+
+```ini
+config_diagnostics = 1
+openssl_conf = openssl_init
+
+[openssl_init]
+providers = provider_sect
+
+[provider_sect]
+nxp_prov = nxp_sect
+default = default_sect
+
+[nxp_sect]
+identity = nxp_prov
+module = /usr/local/lib/libsssProvider.so
+activate = 1
+
+[default_sect]
+activate = 1
+```
+
+試験時は次のように指定できます。
 
 ```sh
-openssl req -in device.csr -pubkey -noout | \
-  openssl pkey -pubin -outform DER -out csr-public.der
-
-cmp se050-public.der csr-public.der
+export OPENSSL_CONF=/path/to/openssl.cnf
+export EX_SSS_BOOT_SSS_PORT=/dev/i2c-0:0x48
 ```
 
-`cmp`が終了コード0なら、CSRへ格納された公開鍵は選択したSE050 TLS identity
-Objectの公開鍵と一致しています。CSR生成時に秘密鍵ファイルは作成されません。
+この状態では、通常のOpenSSL commandへReference Key filenameだけを渡せます。
 
-この確認はCloud非依存です。AWS IoT Core / Azure IoT HubへCSRや証明書を
-登録する前に、SE050 + NXP Provider + OpenSSLの境界だけを独立して検証できます。
+```sh
+openssl pkeyutl \
+  -inkey device.key \
+  -sign \
+  -rawin \
+  -in input.txt \
+  -out signature.der \
+  -digest sha384
+```
 
-## ローカルmTLS統合試験
+## 4. 外部private key import
 
-実際のTLS client authentication確認は `docs/local-mtls-test.ja.md` を参照。
+外部P-256/P-384 private keyを既存PKIからSE050へ移す場合は`tls-key-import`を使用します。
+
+```sh
+se050ctl tls-key-import \
+  -b 0 \
+  --profile test \
+  --identity 0 \
+  --slot B \
+  --curve p384 \
+  --key client.key \
+  --cert client.crt
+```
+
+private keyはunencrypted PEMまたはDERを受け付けます。処理順は次のとおりです。
+
+```text
+OpenSSLでprivate key decode
+-> supported curve / key-pair整合性検証
+-> X.509 certificate public keyとの一致検証
+-> P-384の場合はcurve instantiation確認
+-> managed slotが空であることを確認
+-> sensitive WriteECKey
+-> imported-origin Attestation検証
+-> source/live public key一致確認
+```
+
+既存slotを上書きしません。private key bufferと一時APDU bufferはzeroizeし、sensitive transportのraw frameはdebugでもredactします。
+
+## 5. P-384 curve state
+
+`ReadECCurveList`が返すのは現在instantiateされているWeierstrass curveの状態で、silicon capabilityそのものではありません。
+
+```sh
+se050ctl curve-list -b 0
+```
+
+P-384が`not-set`の場合は、standard secp384r1 parameterを明示的にprovisionできます。
+
+```sh
+se050ctl curve-provision-p384 -b 0 --yes
+```
+
+これはpersistent global SE05x curve stateを変更します。Create後のparameter設定またはfinal verificationが失敗した場合はbest-effort DeleteECCurveでrollbackします。既にinstantiate済みなら変更しません。
+
+## 6. 通常のNim `std/net` application
+
+`tools/std_net_mtls_client.nim`にはSE050 APIもProvider APIもありません。
+
+概念的には通常のNim TLS clientです。
+
+```nim
+let ctx = newContext(
+  verifyMode = CVerifyPeer,
+  certFile = certFile,
+  keyFile = keyFile,
+  caFile = caFile
+)
+
+socket.connect(host, Port(port))
+ctx.wrapConnectedSocket(socket, handshakeAsClient, hostname = serverName)
+```
+
+`keyFile`へReference Key PEMを渡し、Providerは`openssl.cnf`からautoloadします。この経路でP-256/P-384のTLS 1.3およびTLS 1.2 mutual TLSを確認済みです。
+
+## 7. Integration test
+
+主なscript:
+
+```text
+tools/se050_reference_key_provider_test.sh
+tools/se050_reference_key_autoload_test.sh
+tools/se050_external_key_import_test.sh
+tools/se050_external_p384_key_import_test.sh
+tools/se050_std_net_mtls_test.sh
+tools/se050_external_key_std_net_mtls_test.sh
+tools/std_net_mtls_client.nim
+```
+
+`se050_external_key_std_net_mtls_test.sh --curve p256|p384`は空のtest TLS slotだけを対象に、software key生成 -> import -> Reference Key -> ordinary Nim `std/net` TLS 1.3/1.2 -> cleanupまで実行します。開始時に既存Objectがあれば削除せず停止します。
+
+詳細は[`local-mtls-test.ja.md`](local-mtls-test.ja.md)を参照してください。

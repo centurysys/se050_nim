@@ -4,7 +4,7 @@ Some SE050 variants contain NXP-provisioned private keys and matching X.509 cert
 
 These credentials provide a short path to mTLS because the user does not need to generate a new SE050 key, create a CSR, or obtain a new client certificate before the first connection. The private key remains inside the SE050.
 
-Use the managed `tls-keygen` identities instead when the product requires its own PKI, certificate rotation, multiple service identities, or customer-controlled certificate lifecycle.
+Use managed TLS identities instead when the product requires its own PKI, certificate rotation, multiple service identities, or customer-controlled certificate lifecycle. Use `tls-keygen` for a new internally generated P-256 key, or `tls-key-import` to migrate an existing P-256/P-384 private key.
 
 ## Known NXP factory cloud objects
 

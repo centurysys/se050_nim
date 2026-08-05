@@ -27,9 +27,9 @@ This document defines the Object IDs, access policies, and responsibility bounda
 | NXP factory Cloud RSA identity 1 | `0xF0000112` / `0xF0000113` | RSA-2048 key pair + certificate / NXP | variant-dependent, read-only use |
 | test firmware KEX | `0x30000100` | P-256 key pair / dev | exporter implemented and tested |
 | production firmware KEX | `0x20000100` | P-256 key pair / customer | creation CLI and generic mutation guard implemented; irreversible device test pending |
-| test TLS identity key0 A/B | `0x30000200..0x30000201` | P-256 key pair / dev | identity number + A/B slot, device-tested |
-| test TLS identity key1 A/B | `0x30000202..0x30000203` | P-256 key pair / dev | multi-identity mapping device-tested |
-| production TLS identities | `0x20000200..` | P-256 key pair / customer | identity number + A/B slot, creation through TLS-specific CLI only |
+| test TLS identity key0 A/B | `0x30000200..0x30000201` | P-256/P-384 key pair / dev | internal P-256 and imported P-256/P-384 device-tested |
+| test TLS identity key1 A/B | `0x30000202..0x30000203` | P-256/P-384 key pair / dev | identity mapping is curve-independent |
+| production TLS identities | `0x20000200..` | P-256/P-384 key pair / customer | TLS-specific internal-P-256 / external P-256/P-384 paths |
 
 Firmware KEX uses the same lower index `0x0100` for test and production. TLS client identities use `0x0200` as the base and derive Object IDs as `identity * 2 + slotOffset`. Test and production keep matching lower 16-bit indices while the Object area separates their lifecycle.
 
@@ -114,7 +114,9 @@ Examples:
 
 `identity 0` preserves the original A/B Object IDs. `identity 1` and later identities can be assigned to separate services or endpoints without sharing a private key.
 
-The policy is `SIGN + READ + DELETE` for every identity and slot. The private key is generated inside the SE050; READ is used for the public key. Each identity can rotate independently through its A/B pair: prepare a new key and certificate in the inactive slot, verify connectivity, switch the active slot, then delete and reuse the old slot.
+The policy is `SIGN + READ + DELETE` for every identity and slot. The Object ID does not encode the curve; P-256/P-384 are distinguished by `TlsIdentityProfile.curve`, and one slot can hold only one key object at a time.
+
+Internal `tls-keygen` is currently P-256 only. External `tls-key-import` supports P-256/P-384 and never overwrites an existing slot. Each identity can rotate independently through its A/B pair: prepare a new key and certificate in the inactive slot, verify connectivity, switch the active slot, then delete and reuse the old slot.
 
 AWS IoT Core / Azure IoT Hub endpoints, device/Thing IDs, CSR enrollment, certificate registration, and MQTT parameters remain outside this profile.
 

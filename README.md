@@ -6,42 +6,47 @@ The project avoids the NXP Plug & Trust Middleware and talks to the SE050 direct
 
 ## Current status
 
-The main paths verified with SE050 Applet 7.2.x devices include:
+The following paths have been verified on hardware with an SE050 Applet 7.2.x device:
 
-- UID read from object `0x7FFF0206`
-- Applet version/config readout
-- random byte generation
+- UID read from Object `0x7FFF0206`
+- Applet version/configuration readout
+- random generation
 - Secure Object exists/type/size/list/delete helpers
 - development EC key generation and public-key readout
 - P-256 ECDH shared-secret derivation
 - use of the NXP pre-provisioned attestation key and device certificate
-- ReadObject-with-Attestation capture and ECDSA verification
-- X.509 chain validation to the NXP Root and Intermediate CAs
-- creation and reuse of test firmware KEX object `0x30000100`
-- generation, append, and idempotent reuse of a multi-device attested CSV
-- offline cryptographic verification of CSV records
-- live comparison with the board serial, SE050 UID, object type, persistence, and public key
+- ReadObject-with-Attestation acquisition and ECDSA verification
+- X.509 chain validation through the NXP Root/Intermediate certificates
+- create/reuse of the test firmware KEX key at `0x30000100`
+- append/retry-safe multi-device attested CSV generation
+- offline cryptographic CSV verification
+- local comparison of CSV data with board serial, SE050 UID, and live public key
 - P-256 ECDSA/SHA-256 signing
-- TLS client identities managed as `identity N + A/B slot`
-- attested validation of TLS identity origin, policy, and public key
-- direct use of existing SE050 keys through NXP OpenSSL Provider 1.1.5 `nxp:0x...` URIs
-- PKCS#10 CSR generation with the SE050 private key and CSR self-signature verification
-- byte-for-byte comparison of the CSR public key with the SE050 public key
-- TLS 1.2 and TLS 1.3 mutual-TLS client authentication with OpenSSL 3.5.6 and NXP Provider 1.1.5
+- TLS client identity management with `identity N + A/B slot`
+- strict attestation validation of internally generated P-256 TLS identities (`origin = internal`)
+- parsing unencrypted external P-256/P-384 private keys, certificate/public-key matching, and import into empty managed TLS slots
+- strict validation of imported TLS identities (`origin = external`)
+- P-384 curve-instantiation query and transactional provisioning of the standard secp384r1 domain parameters
+- NXP P-256/P-384 Reference Key DER/PEM encoding without exporting private scalars
+- 0600 non-overwriting Reference Key file export after live identity validation
+- redaction of sensitive import/ECDH T=1 frames and clearing of temporary secret buffers
+- NXP Provider-backed ECDSA signing through both P-256 and P-384 Reference Keys
+- NXP/default Provider autoload through `openssl.cnf`
+- TLS 1.2 and TLS 1.3 mutual TLS from an ordinary Nim `std/net` client containing no SE050-specific application code, for both P-256 and P-384
 
-The production creation path for `0x20000100` is implemented, but its irreversible hardware test is still pending.
+The production firmware-KEX path at `0x20000100` is implemented, but its irreversible hardware test is still pending.
 
-The main firmware-envelope key-agreement path is:
+The firmware-envelope key agreement path remains:
 
 ```text
 P-256 ECDH + HKDF-SHA256 + AES-256-GCM
 ```
 
-X25519 key generation and public-key export worked on the tested Applet 7.2.0 path, but `ECDHGenerateSharedSecret` consistently returned `SW=0x6985`. P-256 therefore remains the supported product path.
+X25519 key generation and public-key export succeeded on the tested Applet 7.2.0 path, but `ECDHGenerateSharedSecret` consistently returned `SW=0x6985`. The current product path therefore uses P-256 for firmware KEX.
 
-## TLS client identity
+## TLS client identities
 
-TLS client identities are cloud-neutral P-256 client-signing keys. Each identity has A/B slots so certificates and keys can be rotated independently for multiple services.
+TLS client identities are cloud-neutral X.509/mTLS client-signing keys. Each identity has A/B slots for certificate/key rotation.
 
 ```text
 identity 0: slot A / slot B
@@ -50,7 +55,7 @@ identity 2: slot A / slot B
 ...
 ```
 
-Object IDs follow a fixed mapping:
+Object IDs do not encode the curve:
 
 ```text
 test:       0x30000200 + identity * 2 + slotOffset
@@ -58,58 +63,96 @@ production: 0x20000200 + identity * 2 + slotOffset
 slotOffset: A=0, B=1
 ```
 
-The TLS key policy is `SIGN + READ + DELETE` (`0x10240000`). Private keys are generated inside the SE050 and are never exported to the filesystem or cloud. Existing objects are accepted only after NXP Attestation validates the type, internal origin, policy, and public key; mismatched objects are not automatically deleted or replaced.
+All managed TLS slots use `SIGN + READ + DELETE` policy `0x10240000`. Because the Object ID does not distinguish P-256 from P-384, non-default curve operations carry the curve explicitly.
 
-Typical CLI usage:
+Two provisioning paths are currently supported:
+
+- `tls-keygen`: generate P-256 inside the SE050 and require `origin = internal`
+- `tls-key-import`: validate an external unencrypted P-256/P-384 private key and matching X.509 certificate before importing it into an empty slot, then require `origin = external`
+
+External import never overwrites an existing object. Algorithm/curve/certificate matching is performed before the SE050 write; the resulting live type, persistence, policy, origin, and public key are validated afterward. Private-key file buffers and temporary WriteECKey buffers are cleared, and sensitive T=1 frames are redacted in debug output.
+
+P-384 import requires the standard curve to be instantiated in the SE05x global curve state:
 
 ```sh
-se050ctl tls-keygen \
+se050ctl curve-list -b 0
+se050ctl curve-provision-p384 -b 0 --yes
+```
+
+`curve-provision-p384` changes persistent global curve state rather than a disposable key object, and therefore requires explicit confirmation.
+
+Internal P-256 example:
+
+```sh
+se050ctl tls-keygen -b 0 --profile test --identity 0 --slot A
+```
+
+External P-384 example:
+
+```sh
+se050ctl tls-key-import \
   -b 0 \
   --profile test \
   --identity 0 \
-  --slot A
+  --slot B \
+  --curve p384 \
+  --key client.key \
+  --cert client.crt
 
 se050ctl tls-key-info \
   -b 0 \
   --profile test \
   --identity 0 \
-  --slot A
-
-se050ctl tls-key-ref \
-  --profile test \
-  --identity 0 \
-  --slot A
+  --slot B \
+  --curve p384 \
+  --imported
 ```
 
-`tls-key-ref` returns an NXP Provider URI such as `nxp:0x30000200`.
+The Provider-native Object URI remains available for explicit Provider tooling:
 
-Hardware testing has verified ECDSA signing, PKCS#10 CSR generation and verification, and TLS 1.2 / TLS 1.3 mutual-TLS client authentication through the NXP OpenSSL Provider using an SE050-resident private key. The local mTLS test also verifies that a connection without a client certificate is rejected.
+```sh
+se050ctl tls-key-ref --profile test --identity 0 --slot A
+# nxp:0x30000200
+```
 
-AWS IoT Core and Azure IoT Hub have been checked against their current official X.509/mTLS requirements, and provisioning/connection procedures are documented. This repository has not yet performed a live connection using actual AWS or Azure accounts.
+For **transparent use by ordinary OpenSSL/Nim TLS applications**, export a Reference Key file instead. The application sees only a normal private-key filename.
 
-The Host OS is treated as a trusted environment and direct I2C uses a Plain session. The design goal is TLS private-key non-exportability; preventing SE050 misuse after Host OS compromise is outside this security boundary.
+```sh
+se050ctl tls-key-ref-file \
+  -b 0 \
+  --profile test \
+  --identity 0 \
+  --slot B \
+  --curve p384 \
+  --imported \
+  --out device.key
+```
+
+With the NXP and default Providers autoloaded through `openssl.cnf`, the Nim application remains ordinary `std/net` code:
+
+```nim
+let ctx = newContext(
+  verifyMode = CVerifyPeer,
+  certFile = certFile,
+  keyFile = keyFile,
+  caFile = caFile
+)
+```
+
+P-256 and P-384 have both been verified with TLS 1.3 and TLS 1.2 mutual TLS on Athena hardware.
+
+See the existing AWS IoT Core / Azure IoT Hub documents for cloud-specific provisioning. Service-side algorithm and curve acceptance must be checked against the current cloud service specification before selecting P-384.
+
+The host OS is treated as trusted. Direct I2C uses a Plain session; the main boundary is private-key non-exportability, not prevention of SE050 use after host compromise.
 
 Details:
 
-- [`docs/openssl-provider.md`](docs/openssl-provider.md): NXP OpenSSL Provider integration
+- [`docs/openssl-provider.md`](docs/openssl-provider.md): Provider URI, Reference Keys, autoload, and transparent TLS
+- [`docs/local-mtls-test.md`](docs/local-mtls-test.md): local P-256/P-384 mTLS integration tests
+- [`docs/se050ctl-guide.md`](docs/se050ctl-guide.md): curve/import/reference-key CLI
 - [`docs/factory-identities.md`](docs/factory-identities.md): NXP factory-provisioned cloud identities
-- [`docs/local-mtls-test.md`](docs/local-mtls-test.md): local mTLS integration test
-- [`docs/aws-iot.md`](docs/aws-iot.md): AWS IoT Core provisioning and connection
-- [`docs/azure-iot.md`](docs/azure-iot.md): Azure IoT Hub provisioning and connection
-
-## Built commands
-
-`nimble build` produces two executables:
-
-```text
-bin/se050ctl
-bin/se050-kitting-export
-```
-
-- `se050ctl`: development, diagnostics, and local CSV/device verification
-- `se050-kitting-export`: factory/development generation of attested CSV records
-
-The exporter implements both the deletable `test` profile and the no-delete/no-overwrite `production` profile. Because production creation is irreversible, treat that path as experimental until it has been exercised on a non-shipping evaluation device.
+- [`docs/aws-iot.md`](docs/aws-iot.md): AWS IoT Core provisioning/connection
+- [`docs/azure-iot.md`](docs/azure-iot.md): Azure IoT Hub provisioning/connection
 
 ## NXP factory-provisioned cloud identities
 

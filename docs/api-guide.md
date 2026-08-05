@@ -1,6 +1,6 @@
-# se050_nim API Guide
+# se050_nim API guide
 
-`se050_nim` provides SE050 primitives, attestation verification, and reusable kitting record/CSV verification. Firmware-envelope formats, HKDF/AES-GCM, and firmware updating remain in higher-level projects.
+`se050_nim` provides SE050 primitives, attestation, managed TLS identities, external-key import, OpenSSL Reference Keys, and reusable kitting/CSV verification. Firmware envelope formatting, HKDF/AES-GCM, and firmware update logic remain in higher-level projects.
 
 ## Entry point
 
@@ -8,207 +8,162 @@
 import se050_nim
 ```
 
-The top-level module re-exports:
+Top-level exports:
 
-- transport, APDU/TLV, UID, random, objects, keys, and management;
-- attestation certificate and ReadObject-with-Attestation support;
-- OpenSSL crypto/X.509 verification and the embedded trust store;
-- board identity, kitting profiles, records, and CSV;
-- offline verification, local-device verification, and exporter merge helpers.
-
-## Result handling
-
-Normal failures return `SE[T]` rather than raising exceptions.
-
-```nim
-let r = se.readUidHex()
-if not r.ok:
-  echo r.error.errorMessage()
-  quit 1
+```text
+errors, transport, apdu, tlv
+uid, random, objects, keys, management
+binary_encoding, crypto_verify, x509_verify
+factory_identity, attestation, tls, kitting
 ```
 
-A non-zero `Se050Error.sw` is an APDU status word.
+The `tls` facade exports `profile`, `live_identity`, `attestation_verify`, `external_key`, `openssl`, `reference_key`, and `reference_key_file`.
 
-## Device primitives
+## Results
+
+Runtime failures normally use `SE[T]`. A non-zero `Se050Error.sw` indicates an APDU status-word failure. Some pure host-side encoders/validators use `ValueError` for invalid caller input.
+
+## Transport / device primitives
 
 ```nim
 let se = openSe050(bus = 0, address = 0x48'u8, debug = false)
-let atr = se.requestAtr()
-let uid = se.readUidRaw()
-let random = se.getRandomBytes(32)
+discard se.requestAtr()
 ```
 
-Key APIs include `selectApplet`, `requestAtr`, UID/random/version helpers, object existence/type/size/list helpers, and `deleteSecureObject`.
-
-Raw APIs do not apply the diagnostic CLI's development-range guard. Higher-level tools must enforce Object ID policy.
+Key APIs include applet selection/ATR, UID, random, version info, object exists/type/size/list, and raw delete. Raw library APIs do not enforce the CLI's Object-range mutation guards.
 
 ## EC keys
 
-```nim
-let created = se.generateP256KeyPair(
-  0x30000120'u32,
-  developmentEcKeyPolicy()
-)
-let publicKey = se.readPublicKey(0x30000120'u32)
-let secret = se.deriveSharedSecret(0x30000120'u32, peerPublicKey)
-```
+Managed curve enum values currently include P-256, X25519, and P-384.
 
-| Policy helper | Header | Purpose |
-|---|---:|---|
-| `developmentEcKeyPolicy()` | `0x043C0000` | generic development |
-| `testDeviceKeyPolicy()` | `0x04240000` | deletable production-like test |
-| `deviceEcKeyPolicy()` | `0x04200000` | provisioned device key |
-| `oneTimeDeviceKeyPolicy()` | `0x04200000` | explicit one-time intent |
-| `customEcKeyPolicy()` | caller-defined | advanced use |
-
-P-256 public keys are 65 bytes and shared secrets are 32 bytes.
-
-## Attestation certificate
+Low-level operations include:
 
 ```nim
-let cert = se.readAttestationCertificate()
+se.generateP256KeyPair(objectId, policy)
+se.importP256KeyPair(objectId, privateScalar, publicKey, policy)
+se.importP384KeyPair(objectId, privateScalar, publicKey, policy)
+se.readPublicKey(objectId)
+se.deriveSharedSecret(objectId, peerPublicKey)
 ```
 
-APIs:
+P-256 scalar/public-point lengths are 32/65 bytes; P-384 lengths are 48/97 bytes. The low-level import functions do not enforce managed-slot ownership, certificate matching, curve state, or origin semantics; use the managed TLS import APIs for TLS identities.
 
-- `readAttestationCertificate()`
-- `extractAttestationCertificateDer()`
-- `validateAttestationCertificateDer()`
+## Sensitive memory and transport
 
-The full BinaryFile at `0xF0000013` is read, the leading DER SEQUENCE is returned, a zero-filled tail is accepted, and non-zero trailing data is rejected.
+`secureZero()` clears mutable strings/sequences/fixed arrays using a volatile write loop. ECDH and external-key import use a sensitive transport path that redacts raw T=1 TX/RX frames and clears temporary secret/APDU buffers.
 
-## ReadObject-with-Attestation
+## EC curve management
+
+Read-only state helpers include `readEcCurveList()`, `ecCurveSetState()`, and `isEcCurveInstantiated()`.
+
+P-384 provisioning helpers include Create/Set/Delete APDU builders, `buildNistP384ProvisioningApdus()`, and `provisionNistP384Curve()`. Provisioning uses the fixed standard secp384r1 A/B/G/N/PRIME parameters, is idempotent when already set, and performs best-effort rollback after a confirmed create if later setup/verification fails.
+
+## TLS identity profiles
 
 ```nim
-let attested = se.readObjectWithAttestation(
-  objectId = 0x30000100'u32,
-  freshness = freshness
-)
+let p256 = testTlsIdentityProfile(0'u16, tisSlotA)
+let p384 = testTlsIdentityProfile(0'u16, tisSlotB, ecCurveP384)
 ```
 
-APIs include `buildReadObjectWithAttestationRequest`, `parseReadObjectWithAttestationResponse`, and `readObjectWithAttestation`. `AttestedObjectRead` preserves the signed command, transmitted APDU, raw response, object data, attributes, chip UID, timestamp, and signature.
+The Object ID depends on profile/identity/slot, not curve:
 
-## OpenSSL verification
-
-OpenSSL 3 `libcrypto.so.3` is loaded dynamically at runtime.
-
-Important APIs:
-
-- `sha256()` and `certificateSha256()`
-- `extractCertificateEcPublicKey()`
-- `verifyEcdsaSha256WithCertificate()`
-- `verifyCertificateChain()`
-- DER bundle split/read helpers
-
-OpenSSL headers and a development symlink are not required.
-
-## Embedded NXP trust store
-
-```nim
-let roots = nxpAttestationTrustAnchors()
-let intermediates = nxpAttestationIntermediates()
+```text
+test:       0x30000200 + identity * 2 + slotOffset
+production: 0x20000200 + identity * 2 + slotOffset
 ```
 
-The Root and Intermediate DER files are embedded from `src/se050_nim/certs/` with `staticRead()`.
+P-256 and P-384 are valid managed TLS curves. Policy is `0x10240000` (`SIGN + READ + DELETE`).
 
-## Attestation semantics
+## Internal vs imported identity validation
 
-```nim
-let signature = verifyAttestationSignature(attested, cert)
-let semantics = verifyKittingAttestationSemantics(
-  attested,
-  testKittingProfile()
-)
+- `inspectTlsIdentity()` requires `origin = internal`
+- `inspectImportedTlsIdentity()` requires `origin = external`
+- corresponding attestation-semantic validators preserve the same split
+
+Validation is curve-aware and checks expected key-pair type, private size, public-point length, persistence, Object ID, policy, attestation chain/signature, and live/attested public-key equality.
+
+## External private-key parsing and import
+
+`tls/external_key.nim` uses OpenSSL 3 decoding to finish host-side validation before any SE050 mutation.
+
+Public APIs include:
+
+- `parseEcPrivateKey()` (recognizes P-256/P-384/P-521 and returns public metadata)
+- `parseP256PrivateKey()` / `parseP384PrivateKey()`
+- P-256/P-384 private-key/certificate match validators
+- `importP256TlsIdentity()` / `importP384TlsIdentity()`
+
+Public parse results expose curve/bits/group/public point/SPKI only; private scalars are kept internal to the import workflow and cleared after use.
+
+Managed import order:
+
+```text
+profile validation
+-> private-key decode/curve validation
+-> certificate/public-key match
+-> P-384 curve-state check
+-> target-slot empty check
+-> private-scalar extraction
+-> sensitive WriteECKey
+-> imported-origin attestation validation
+-> source/live public-key equality
 ```
 
-Semantic verification checks the configured Object ID, attestation key ID, algorithm, complete uncompressed P-256 key, chip UID, timestamp, private-key size, key-pair type, internal origin, authentication fields, and exact policy header.
+Existing objects are never overwritten. A newly created object may be best-effort rolled back if post-write validation fails.
 
-Complete certificate-chain and signature verification before trusting semantics.
+## OpenSSL public-key helpers
 
-## Board identity and profiles
+- `p256PublicKeyToSpkiDer()`
+- `p384PublicKeyToSpkiDer()`
+- `ecPublicKeyToSpkiDer()`
+- `opensslProviderKeyUri()`
 
-```nim
-let serial = readBoardSerialNumber()
-let testProfile = testKittingProfile()
-let productionProfile = productionKittingProfile()
-```
+## NXP Reference Keys
 
-The default board serial path is `/proc/device-tree/board/serialno`. Profile helpers resolve names and Object IDs and expose the expected policy and type.
+Pure encoders:
 
-## Kitting records and freshness
+- `encodeP256ReferenceKeyDer()` / `encodeP256ReferenceKeyPem()`
+- `encodeP384ReferenceKeyDer()` / `encodeP384ReferenceKeyPem()`
 
-```nim
-let freshness = deriveKittingFreshness(
-  serialNumber,
-  createdAt,
-  testProfile,
-  nonce
-)
-```
+No real private scalar is included. The SEC1 privateKey field contains the key-width-sized NXP object reference.
 
-Important APIs:
+File APIs:
 
-- `validateKittingTimestamp()`
-- `deriveKittingFreshness()`
-- `createKittingRecord()`
-- attestation container encode/decode/restore helpers
+- `writeP256ReferenceKeyFile()` / `writeP384ReferenceKeyFile()`
+- `writeTlsReferenceKeyFile()` for internal origin
+- `writeImportedTlsReferenceKeyFile()` for external origin
 
-`KittingRecord` stores the board serial, version, profile, UTC timestamp, role, SE050 UID, Object ID, nonce, public key, device certificate, and captured attestation container.
+Files are written only after live validation, with 0600 permissions, atomic publication, and no overwrite.
 
-## CSV
+## OpenSSL host verification
 
-```nim
-let text = encodeKittingCsv(records)
-let records = decodeKittingCsv(text)
-let one = findKittingRecord(records.value, serialNumber, kpTest)
-```
+OpenSSL 3 `libcrypto.so.3` is loaded dynamically. Shared bindings live in `openssl_ffi.nim` and cover SHA-256, ECDSA verification, X.509 parsing/chain validation, public-key extraction/comparison, and `OSSL_DECODER` private-key decoding.
 
-Binary fields use strict Base64. Selection requires exactly one matching serial/profile/key-role record.
+## Attestation and trust store
 
-## Offline verification
+The library reads the NXP device attestation certificate, performs ReadObject-with-Attestation, verifies certificate chains/signatures, and then validates signed semantics such as Object ID/type/origin/policy. Embedded NXP Root/Intermediate certificates are used by the kitting/TLS verification layers.
 
-```nim
-let verified = verifyKittingCsvRecord(
-  csvText = csvText,
-  serialNumber = "11900000015",
-  profileKind = kpTest,
-  trustAnchorsDer = nxpAttestationTrustAnchors(),
-  intermediatesDer = nxpAttestationIntermediates()
-)
-```
+## Kitting
 
-`verifyKittingRecord()` and `verifyKittingCsvRecord()` do not access I2C. They restore metadata-bound freshness, validate the certificate chain, verify the ECDSA signature, and enforce signed object semantics. They can be reused by future PC importers and database registration tools.
-
-## Local-device verification
-
-`verifyLocalKittingIdentity()` compares an offline-verified record with the current board serial, SE050 UID, P-256 object type, persistent indicator, and public key. Live I2C reads remain in the caller, keeping this comparison pure and unit-testable.
-
-## Exporter merge helpers
-
-- `sameKittingRecordKey()`
-- `sameKittingDeviceKey()`
-- `mergeKittingRecord()`
-
-A record with the same serial/profile/role but a different UID, Object ID, or public key is a conflict and is never overwritten.
+Kitting remains based on the P-256 firmware-KEX profile. Reusable layers cover board serial/profile, freshness, attested records, CSV encode/decode, offline verification, local live-device comparison, and safe record merging.
 
 ## Recommended layering
 
 ```text
 se050_nim:
-  SE050 primitives + attestation + reusable kitting verification
+  SE050 primitives + attestation
+  + managed TLS identity / external-key import
+  + OpenSSL Reference Keys
+  + reusable kitting verification
 
 se050ctl:
-  development/diagnostic CLI + local kitting verification
+  diagnostics / explicit provisioning
+  + curve state/provisioning
+  + TLS import/reference-key tooling
 
-se050-kitting-export:
-  current test factory exporter
+NXP OpenSSL Provider:
+  OpenSSL runtime -> SE050 private-key operation boundary
 
-future production kitting:
-  irreversible customer-range key creation
-
-fwkeys / fw-envelope:
-  P-256 ECDH + HKDF + AES-GCM envelope
-
-fw-update:
-  firmware verification, decryption, and A/B update
+ordinary application:
+  normal certificate/key/CA filenames only
 ```

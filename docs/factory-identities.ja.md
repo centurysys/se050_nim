@@ -4,7 +4,7 @@ SE050のvariantによっては、NXPが工場でCloud接続用の秘密鍵とX.5
 
 このcredentialを利用すると、ユーザーがSE050内で新しい鍵を生成してCSRを作成し、CAから証明書を発行してもらう手順を省略できます。秘密鍵はfactory provisioning時からSE050内部にあり、filesystemへexportしません。
 
-この機能は「最短でmTLS/Cloud接続を試したい」用途を主眼とします。自社PKI、certificate rotation、複数service identity、長期的なcertificate lifecycle管理が必要な場合は、`tls-keygen`で作成するmanaged TLS identityを使用してください。
+この機能は「最短でmTLS/Cloud接続を試したい」用途を主眼とします。自社PKI、certificate rotation、複数service identity、長期的なcertificate lifecycle管理が必要な場合は、managed TLS identityを使用してください。新規P-256をSE050内部生成する場合は`tls-keygen`、既存P-256/P-384 private keyを移行する場合は`tls-key-import`を使用できます。
 
 ## 既知のNXP factory Cloud Object
 
@@ -136,11 +136,14 @@ NXP Providerからfactory keyを参照
 ### Managed TLS identity
 
 ```text
-se050ctl tls-keygen
+新規key:
+  se050ctl tls-keygen            -> SE050内部生成P-256
+
+既存key移行:
+  se050ctl tls-key-import        -> external P-256/P-384をSE050へimport
+
    ↓
-SE050内部でP-256鍵生成
-   ↓
-CSR
+Reference Key / CSR
    ↓
 自社CA / Cloud CA
    ↓

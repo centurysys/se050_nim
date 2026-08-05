@@ -9,8 +9,8 @@
 - UID、乱数、Applet version/config
 - Secure Objectのexists/info/list
 - dev rangeのEC鍵生成と削除
-- identity番号 + A/B slotで管理するTLS client identity鍵生成・検証（test/production）
-- 公開鍵export、P-256 ECDH derive
+- identity番号 + A/B slotで管理するTLS client identity（内部生成P-256、外部import P-256/P-384）
+- EC curve state確認/P-384 provisioning、TLS公開鍵/Reference Key export、P-256 ECDH derive
 - NXP個体証明書のDER export
 - ReadObject-with-Attestationのraw capture
 - 外部CA指定によるライブAttestation診断
@@ -131,9 +131,27 @@ se050ctl factory-pubkey \
 
 詳細は[`factory-identities.ja.md`](factory-identities.ja.md)を参照してください。
 
+## EC curve state
+
+SE05xのWeierstrass curve instantiation状態をread-onlyで確認できます。
+
+```sh
+se050ctl curve-list -b 0
+```
+
+表示される`set` / `not-set`は現在のSE05x global curve stateであり、silicon capabilityそのものではありません。
+
+P-384が`not-set`で、対象製品でP-384を使用する場合はstandard secp384r1 parameterを明示的にprovisionできます。
+
+```sh
+se050ctl curve-provision-p384 -b 0 --yes
+```
+
+`--yes`は必須です。このcommandはdisposable key objectではなくpersistent global curve stateを変更します。既にP-384がsetならno-opです。Create後のparameter設定またはfinal state確認に失敗した場合はbest-effort rollbackを行います。
+
 ## TLS client identity鍵
 
-TLS client identityは任意Object IDを指定せず、固定profile / identity / slotだけを操作します。
+TLS client identityは任意Object IDを指定せず、固定`profile / identity / slot / curve`で操作します。Object IDはcurveをencodeしません。
 
 ```text
 test:       0x30000200 + identity * 2 + slotOffset
@@ -141,88 +159,110 @@ production: 0x20000200 + identity * 2 + slotOffset
 slotOffset: A=0, B=1
 ```
 
-例:
-
-```text
-identity 0 A  0x30000200
-identity 0 B  0x30000201
-identity 1 A  0x30000202
-identity 1 B  0x30000203
-```
-
 Policyは全slot共通で`SIGN + READ + DELETE` (`0x10240000`)です。既存Objectは自動削除・上書きしません。
 
-### `tls-key-ref`
+現在のmanaged curveはP-256/P-384です。ただし**内部生成の`tls-keygen`はP-256専用**で、P-384はexternal import経路で使用します。
 
-NXP公式 `se05x-openssl-provider` が既存SE050鍵を参照するためのURIを表示します。SE050へアクセスしないため、`-b`は不要です。
+### `tls-keygen`
 
-```sh
-se050ctl tls-key-ref --profile test --identity 0 --slot A
-# nxp:0x30000200
-
-se050ctl tls-key-ref --profile production --identity 1 --slot B
-# nxp:0x20000203
-```
-
-この出力はOpenSSL 3の `-key` / `-inkey` へそのまま渡せます。
+SE050内部でP-256 key pairを生成、または既存P-256 identityをstrict validationします。
 
 ```sh
-KEY_URI=$(se050ctl tls-key-ref --profile test --identity 0 --slot A)
-openssl pkeyutl --provider /usr/local/lib/libsssProvider.so --provider default \
-  -inkey "$KEY_URI" -sign -rawin -in input.txt -out signature.der -digest sha256
+se050ctl tls-keygen -b 0 --profile test --identity 0 --slot A
 ```
 
+検証条件にはP-256 key-pair type、persistent、NXP Attestation chain/signature、`origin = internal`、Policy `0x10240000`、live/attested public key一致が含まれます。既存Objectが不整合でも置換しません。
+
+### `tls-key-import`
+
+外部のunencrypted EC private keyを空のmanaged slotへimportします。
+
+```sh
+se050ctl tls-key-import \
+  -b 0 \
+  --profile test \
+  --identity 0 \
+  --slot B \
+  --curve p384 \
+  --key client.key \
+  --cert client.crt
+```
+
+`--curve`は`p256`または`p384`、defaultは`p256`です。private keyはunencrypted PEM/DER、certificateはPEM/DERを受け付けます。
+
+SE050書込み前にprivate keyのalgorithm/curve/key-pair整合性とcertificate public key一致をOpenSSL 3で検証します。P-384ではcurveがinstantiate済みであることも確認します。対象slotが既に存在する場合は拒否します。
+
+書込み後は`origin = external`、Object type/size、persistent、Policy、Attestation、live/source public key一致を確認します。import用private materialはsensitive transportで送信し、一時bufferをzeroizeします。
+
+### `tls-key-info`
+
+内部生成P-256:
+
+```sh
+se050ctl tls-key-info -b 0 --profile test --identity 0 --slot A
+```
+
+import済みP-384:
+
+```sh
+se050ctl tls-key-info \
+  -b 0 \
+  --profile test --identity 0 --slot B \
+  --curve p384 --imported
+```
+
+`--imported`なしでは`origin = internal`を要求し、`--imported`では`origin = external`を要求します。originを自動判定してvalidationを緩めることはしません。
 
 ### `tls-key-pubkey`
 
-TLS identityをAttestation検証した後、公開鍵だけをファイルへ出力します。
-CSR内公開鍵との比較には`spki-der`を使用します。
+Attestation検証済みTLS identityの公開鍵をrawまたはSPKI DERで出力します。
 
 ```sh
 se050ctl tls-key-pubkey \
   -b 0 \
-  --profile test \
-  --identity 0 \
-  --slot A \
+  --profile test --identity 0 --slot B \
+  --curve p384 --imported \
   --format spki-der \
   --out se050-public.der
 ```
 
-`--format raw`ではSE050 ReadObjectの65-byte `0x04 || X || Y`をそのまま出力します。
-`spki-der`ではOpenSSL CSRの公開鍵と直接比較できるX.509 SubjectPublicKeyInfo DERを出力します。
+raw pointはP-256が65 bytes、P-384が97 bytesです。SPKI DERはP-256/P-384双方に対応します。
 
-### `tls-keygen`
+### `tls-key-ref`
 
-```sh
-se050ctl tls-keygen -b 0 --profile test --identity 0 --slot A
-se050ctl tls-keygen -b 0 --profile production --identity 0 --slot A
-se050ctl tls-keygen -b 0 --profile production --identity 1 --slot B
-```
-
-対象slotが空ならSE050内部でP-256鍵を生成します。既存の場合は再生成せず、NXP Attestationを使って次を検証したうえで再利用します。
-
-- live Object typeがP-256 key pair
-- live ReadTypeでpersistent
-- NXP個体証明書chain
-- Attestation署名
-- signed Object ID/type
-- `origin = internal`
-- signed Policy `0x10240000`
-- live public keyとattested public keyの一致
-
-生成直後の検証が失敗した場合も自動削除は行いません。既存Objectの検証に失敗した場合も置換しません。
-
-### `tls-key-info`
+NXP Provider-native Object URIをstdoutへ出します。SE050へアクセスしないため`-b`は不要です。
 
 ```sh
-se050ctl tls-key-info -b 0 --profile test --identity 0 --slot A
-se050ctl tls-key-info -b 0 --profile production --identity 0 --slot A
-se050ctl tls-key-info -b 0 --profile production --identity 1 --slot B
+se050ctl tls-key-ref --profile test --identity 0 --slot A
+# nxp:0x30000200
 ```
 
-鍵を変更せず、`tls-keygen`と同じtrust/semantic検証を行ってprofile、identity、slot、Object ID、公開鍵、origin、Policyを表示します。`--identity`のdefaultは`0`です。
+Providerを明示的に操作するdiagnosticには便利ですが、通常applicationへのtransparent key-file連携には次の`tls-key-ref-file`を使用します。
 
-汎用`keygen`/`delete`は従来どおりcustomer rangeを拒否します。Production TLS slotへ書き込める経路はTLS専用commandに限定します。
+### `tls-key-ref-file`
+
+Attestation検証済みTLS identityからNXP Reference Key PEMを作成します。
+
+内部生成P-256:
+
+```sh
+se050ctl tls-key-ref-file \
+  -b 0 --profile test --identity 0 --slot A \
+  --out device.key
+```
+
+import済みP-384:
+
+```sh
+se050ctl tls-key-ref-file \
+  -b 0 --profile test --identity 0 --slot B \
+  --curve p384 --imported \
+  --out device.key
+```
+
+Reference Keyには実private scalarを含みません。出力はprivate-key-styleの0600でatomicにinstallし、既存pathを上書きしません。
+
+NXP/default Providerを`openssl.cnf`からautoloadすると、通常のOpenSSL/Nim applicationはこのfileを普通の`keyFile`として扱えます。
 
 ## 開発用EC鍵
 

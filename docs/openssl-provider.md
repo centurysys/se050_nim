@@ -2,195 +2,191 @@
 
 ## Purpose
 
-Define the boundary for using TLS client identity keys provisioned and validated by `se050_nim` / `se050ctl` from OpenSSL 3 through NXP's official `se05x-openssl-provider`.
+This document defines the boundary between `se050_nim` / `se050ctl`, OpenSSL 3, the NXP `se05x-openssl-provider`, and ordinary OpenSSL-backed applications.
 
-Cloud-specific enrollment is intentionally excluded. First verify that the provider can reference an existing SE050 object and perform ECDSA signing; CSR and local mTLS follow in later steps.
+Two key-reference forms are intentionally supported:
 
-## Provider
+1. `nxp:0x...` URI for explicit Provider diagnostics/tooling
+2. NXP Reference Key PEM for transparent use through normal `keyFile` / `-key` filename APIs
 
-Official NXP repository:
+Both P-256 and P-384 have been hardware-tested through Reference Key decoding, Provider-backed SE050 ECDSA signing, and ordinary Nim `std/net` TLS 1.2/TLS 1.3 mutual TLS.
 
-```text
-https://github.com/NXPPlugNTrust/se05x-openssl-provider
-```
+## Provider build/runtime
 
-The current provider supports OpenSSL 3.x and documents EC key generation, EC sign/verify, ECDH, CSR, and TLS 1.2/1.3 client use.
+Use NXP's official `se05x-openssl-provider`. `se050_nim` itself does not depend on Plug & Trust middleware; the Provider is only the OpenSSL runtime boundary.
 
-Existing SE050 keys can be referenced directly using:
-
-```text
-nxp:0x12345678
-```
-
-Therefore `se050_nim` does not generate NXP reference-key PEM files itself. The Object-ID URI is the initial standard path.
-
-## se050ctl mapping
-
-Example:
+Build `libsssProvider.so` for the target architecture. When OpenSSL dynamically loads the Provider, the Provider itself must resolve `libcrypto.so.3`.
 
 ```sh
-se050ctl tls-key-ref --profile test --identity 0 --slot A
+readelf -d /usr/local/lib/libsssProvider.so | grep NEEDED
+ldd /usr/local/lib/libsssProvider.so
 ```
 
-Output:
-
-```text
-nxp:0x30000200
-```
-
-Applications should not duplicate the Object-ID calculation; the TLS identity profile remains the source of truth.
-
-## Native provider build
-
-The upstream README uses:
-
-```sh
-git clone --recurse-submodules https://github.com/NXPPlugNTrust/se05x-openssl-provider.git
-cd se05x-openssl-provider
-mkdir build
-cd build
-cmake ../
-cmake -DPTMW_HostCrypto=OPENSSL .
-cmake --build .
-```
-
-The build also copies `libsssProvider.so` into the repository `bin` directory. `cmake --install .` installs the shared library using the configured install prefix.
-
-For product-rootfs cross builds, add the appropriate CMake toolchain file and sysroot. Both the provider and its `simw_lib` submodule must be built for the target architecture.
+If the target build lacks its `libcrypto.so.3` dependency, link the Provider target explicitly against `crypto`.
 
 ## I2C connection
 
-Current NXP support guidance allows the Linux I2C port to be selected with `EX_SSS_BOOT_SSS_PORT`.
-
-Example:
-
 ```sh
 export EX_SSS_BOOT_SSS_PORT=/dev/i2c-0:0x48
 ```
 
-Adjust the bus/address for the target hardware.
+The current threat model treats the host OS as trusted and uses a Plain direct-I2C session. The main boundary is private-key non-exportability, not prevention of SE050 use after host compromise.
 
-This project treats the Host OS as a trusted environment and uses TLS private-key non-exportability as the primary security boundary. Therefore the direct-I2C plain session is intentional. Provider warnings such as `Communication channel is Plain` / `Not recommended for production use` are expected for this design. Preventing SE050 misuse after Host OS compromise is out of scope, so SCP03, Access Manager, and host-authentication credentials are not introduced.
-
-## Step 5 hardware check
-
-### 1. Validate an existing TLS identity
+## 1. Provider-native Object URI
 
 ```sh
-se050ctl tls-key-info -b 0 --profile test --identity 0 --slot A
+se050ctl tls-key-ref --profile test --identity 0 --slot A
+# nxp:0x30000200
 ```
 
-Use a key whose attestation validation already succeeds. Do not generate a new key through the provider.
-
-### 2. Resolve the provider URI
+The URI is useful when a command intentionally addresses the NXP Provider.
 
 ```sh
-KEY_URI=$(se050ctl tls-key-ref --profile test --identity 0 --slot A)
-echo "$KEY_URI"
-```
-
-Expected:
-
-```text
-nxp:0x30000200
-```
-
-### 3. Load the provider
-
-Adjust the provider path as installed on the target.
-
-```sh
-openssl list -providers \
-  -provider /usr/local/lib/libsssProvider.so \
-  -provider default
-```
-
-Both the NXP and default providers must load.
-
-### 4. ECDSA sign with the existing SE050 key
-
-```sh
-printf 'se050 provider test\n' > provider-input.txt
-
 openssl pkeyutl \
   --provider /usr/local/lib/libsssProvider.so \
   --provider default \
-  -inkey "$KEY_URI" \
-  -sign \
-  -rawin \
-  -in provider-input.txt \
-  -out provider-signature.der \
+  -inkey nxp:0x30000200 \
+  -sign -rawin \
+  -in input.txt \
+  -out signature.der \
   -digest sha256
 ```
 
-Success proves that the NXP provider resolves the existing Object ID provisioned by `se050_nim` and performs ECDSA signing in the SE050.
+The URI does not encode curve or provisioning origin, so validate the managed TLS object separately before relying on it.
 
-If the default provider is loaded first and NXP ECDSA is not selected, use the upstream property query:
+## 2. Reference Key PEM
+
+Reference Key PEM is the standard path for transparent applications.
+
+The NXP EC Reference Key uses a SEC1 `EC PRIVATE KEY` structure. Its privateKey OCTET STRING contains an SE050 Object reference rather than the real scalar; the public point and named-curve metadata remain ordinary EC key data.
+
+`se050_nim` supports:
+
+- P-256: 32-byte reference field + `prime256v1`
+- P-384: 48-byte reference field + `secp384r1`
+
+No real private scalar is stored in the Reference Key.
+
+Internally generated P-256:
+
+```sh
+se050ctl tls-key-ref-file \
+  -b 0 --profile test --identity 0 --slot A \
+  --out device.key
+```
+
+Imported P-384:
+
+```sh
+se050ctl tls-key-ref-file \
+  -b 0 --profile test --identity 0 --slot B \
+  --curve p384 --imported \
+  --out device.key
+```
+
+Export first validates the live object type, persistence, policy, attestation certificate/signature, origin, and public-key equality. The output is installed with mode 0600 and existing paths are never overwritten.
+
+## 3. Provider autoload
+
+```ini
+config_diagnostics = 1
+openssl_conf = openssl_init
+
+[openssl_init]
+providers = provider_sect
+
+[provider_sect]
+nxp_prov = nxp_sect
+default = default_sect
+
+[nxp_sect]
+identity = nxp_prov
+module = /usr/local/lib/libsssProvider.so
+activate = 1
+
+[default_sect]
+activate = 1
+```
+
+```sh
+export OPENSSL_CONF=/path/to/openssl.cnf
+export EX_SSS_BOOT_SSS_PORT=/dev/i2c-0:0x48
+```
+
+The OpenSSL command can then consume the Reference Key like an ordinary filename.
+
+```sh
+openssl pkeyutl \
+  -inkey device.key \
+  -sign -rawin \
+  -in input.txt \
+  -out signature.der \
+  -digest sha384
+```
+
+## 4. External private-key import
+
+```sh
+se050ctl tls-key-import \
+  -b 0 \
+  --profile test --identity 0 --slot B \
+  --curve p384 \
+  --key client.key \
+  --cert client.crt
+```
+
+Unencrypted PEM and DER EC private keys are accepted. The sequence is:
 
 ```text
-?nxp_prov.signature.ecdsa=yes
+decode and validate the private key
+-> verify matching X.509 certificate public key
+-> for P-384, require the curve to be instantiated
+-> require an empty managed slot
+-> sensitive WriteECKey
+-> imported-origin attestation validation
+-> source/live public-key equality
 ```
 
-## Step 5 completion criteria
+Existing slots are never overwritten. Private-key and temporary APDU buffers are cleared, and raw sensitive transport frames are redacted even in debug mode.
 
-- Build the NXP provider for the target architecture
-- OpenSSL 3 can load `libsssProvider.so`
-- `EX_SSS_BOOT_SSS_PORT` reaches the target SE050
-- The provider accepts the `nxp:0x...` URI from `se050ctl tls-key-ref`
-- ECDSA signing succeeds through the provider using an existing TLS identity key
-- Key generation remains owned by `se050_nim`, not the provider
+## 5. P-384 curve state
 
-The next step uses the same URI with `openssl req -new -key nxp:...` to generate and verify a CSR.
-
-
-## CSR generation and public-key matching
-
-A reference-key PEM is not required to create a CSR from a TLS identity key.
-Pass the NXP Provider Object-ID URI directly to `openssl req`.
-
-The following example uses test / identity 0 / slot A.
+`ReadECCurveList` reports current Weierstrass curve instantiation, not silicon capability.
 
 ```sh
-export EX_SSS_BOOT_SSS_PORT=/dev/i2c-0:0x48
-PROVIDER=/usr/local/lib/libsssProvider.so
-KEY_URI=$(se050ctl tls-key-ref --profile test --identity 0 --slot A)
-
-se050ctl tls-key-pubkey \
-  -b 0 \
-  --profile test \
-  --identity 0 \
-  --slot A \
-  --format spki-der \
-  --out se050-public.der
-
-openssl req -new \
-  --provider "$PROVIDER" \
-  --provider default \
-  -key "$KEY_URI" \
-  -subj "/CN=se050-local-test" \
-  -out device.csr
+se050ctl curve-list -b 0
+se050ctl curve-provision-p384 -b 0 --yes
 ```
 
-Verify the CSR signature itself:
+P-384 provisioning writes the fixed standard secp384r1 domain parameters into persistent global SE05x curve state. It is idempotent when already instantiated and performs best-effort rollback after a confirmed create if later setup/verification fails.
 
-```sh
-openssl req -in device.csr -noout -verify
+## 6. Ordinary Nim `std/net`
+
+`tools/std_net_mtls_client.nim` contains no SE050 or Provider-specific API calls. It simply supplies certificate, key, and CA filenames to `newContext()`.
+
+```nim
+let ctx = newContext(
+  verifyMode = CVerifyPeer,
+  certFile = certFile,
+  keyFile = keyFile,
+  caFile = caFile
+)
 ```
 
-Then extract the CSR SubjectPublicKeyInfo in DER and compare it byte-for-byte
-with the attestation-validated SE050 public key:
+With the Provider autoloaded from `openssl.cnf` and a Reference Key used as `keyFile`, P-256 and P-384 both pass TLS 1.3 and TLS 1.2 mutual TLS.
 
-```sh
-openssl req -in device.csr -pubkey -noout | \
-  openssl pkey -pubin -outform DER -out csr-public.der
+## 7. Integration tests
 
-cmp se050-public.der csr-public.der
+```text
+tools/se050_reference_key_provider_test.sh
+tools/se050_reference_key_autoload_test.sh
+tools/se050_external_key_import_test.sh
+tools/se050_external_p384_key_import_test.sh
+tools/se050_std_net_mtls_test.sh
+tools/se050_external_key_std_net_mtls_test.sh
+tools/std_net_mtls_client.nim
 ```
 
-A zero exit status from `cmp` proves that the CSR contains the public key of
-the selected SE050 TLS identity object. No private-key file is created during
-this flow.
+`se050_external_key_std_net_mtls_test.sh --curve p256|p384` performs disposable software-key creation, safe import into a proven-empty test slot, Reference Key export, ordinary Nim `std/net` TLS 1.3/TLS 1.2, and safe cleanup.
 
-## Local mutual-TLS integration test
-
-See `docs/local-mtls-test.md` for real TLS client-authentication validation.
+See [`local-mtls-test.md`](local-mtls-test.md).
