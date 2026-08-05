@@ -11,6 +11,7 @@ import ./errors
 import ./transport
 import ./apdu
 import ./tlv
+from ./keys import Se050CurveNistP384
 
 # =============================================================================
 # Constants
@@ -73,6 +74,65 @@ const
   ConfigFipsModeDisabled* = 0x1000'u16
   ConfigI2cm* = 0x2000'u16
 
+  # NIST P-384 / secp384r1 domain parameters, encoded exactly as SE05x
+  # SetECCurveParam expects them:
+  #
+  #   A/B/N/PRIME: unsigned big-endian 48-byte integers
+  #   G:           uncompressed point 0x04 || X || Y (97 bytes)
+  #
+  # No leading ASN.1 sign-padding byte is included.
+  NistP384A: array[48, uint8] = [
+    0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8,
+    0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8,
+    0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8,
+    0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFE'u8,
+    0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0x00'u8, 0x00'u8, 0x00'u8, 0x00'u8,
+    0x00'u8, 0x00'u8, 0x00'u8, 0x00'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFC'u8
+  ]
+
+  NistP384B: array[48, uint8] = [
+    0xB3'u8, 0x31'u8, 0x2F'u8, 0xA7'u8, 0xE2'u8, 0x3E'u8, 0xE7'u8, 0xE4'u8,
+    0x98'u8, 0x8E'u8, 0x05'u8, 0x6B'u8, 0xE3'u8, 0xF8'u8, 0x2D'u8, 0x19'u8,
+    0x18'u8, 0x1D'u8, 0x9C'u8, 0x6E'u8, 0xFE'u8, 0x81'u8, 0x41'u8, 0x12'u8,
+    0x03'u8, 0x14'u8, 0x08'u8, 0x8F'u8, 0x50'u8, 0x13'u8, 0x87'u8, 0x5A'u8,
+    0xC6'u8, 0x56'u8, 0x39'u8, 0x8D'u8, 0x8A'u8, 0x2E'u8, 0xD1'u8, 0x9D'u8,
+    0x2A'u8, 0x85'u8, 0xC8'u8, 0xED'u8, 0xD3'u8, 0xEC'u8, 0x2A'u8, 0xEF'u8
+  ]
+
+  NistP384G: array[97, uint8] = [
+    0x04'u8,
+    0xAA'u8, 0x87'u8, 0xCA'u8, 0x22'u8, 0xBE'u8, 0x8B'u8, 0x05'u8, 0x37'u8,
+    0x8E'u8, 0xB1'u8, 0xC7'u8, 0x1E'u8, 0xF3'u8, 0x20'u8, 0xAD'u8, 0x74'u8,
+    0x6E'u8, 0x1D'u8, 0x3B'u8, 0x62'u8, 0x8B'u8, 0xA7'u8, 0x9B'u8, 0x98'u8,
+    0x59'u8, 0xF7'u8, 0x41'u8, 0xE0'u8, 0x82'u8, 0x54'u8, 0x2A'u8, 0x38'u8,
+    0x55'u8, 0x02'u8, 0xF2'u8, 0x5D'u8, 0xBF'u8, 0x55'u8, 0x29'u8, 0x6C'u8,
+    0x3A'u8, 0x54'u8, 0x5E'u8, 0x38'u8, 0x72'u8, 0x76'u8, 0x0A'u8, 0xB7'u8,
+    0x36'u8, 0x17'u8, 0xDE'u8, 0x4A'u8, 0x96'u8, 0x26'u8, 0x2C'u8, 0x6F'u8,
+    0x5D'u8, 0x9E'u8, 0x98'u8, 0xBF'u8, 0x92'u8, 0x92'u8, 0xDC'u8, 0x29'u8,
+    0xF8'u8, 0xF4'u8, 0x1D'u8, 0xBD'u8, 0x28'u8, 0x9A'u8, 0x14'u8, 0x7C'u8,
+    0xE9'u8, 0xDA'u8, 0x31'u8, 0x13'u8, 0xB5'u8, 0xF0'u8, 0xB8'u8, 0xC0'u8,
+    0x0A'u8, 0x60'u8, 0xB1'u8, 0xCE'u8, 0x1D'u8, 0x7E'u8, 0x81'u8, 0x9D'u8,
+    0x7A'u8, 0x43'u8, 0x1D'u8, 0x7C'u8, 0x90'u8, 0xEA'u8, 0x0E'u8, 0x5F'u8
+  ]
+
+  NistP384N: array[48, uint8] = [
+    0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8,
+    0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8,
+    0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8,
+    0xC7'u8, 0x63'u8, 0x4D'u8, 0x81'u8, 0xF4'u8, 0x37'u8, 0x2D'u8, 0xDF'u8,
+    0x58'u8, 0x1A'u8, 0x0D'u8, 0xB2'u8, 0x48'u8, 0xB0'u8, 0xA7'u8, 0x7A'u8,
+    0xEC'u8, 0xEC'u8, 0x19'u8, 0x6A'u8, 0xCC'u8, 0xC5'u8, 0x29'u8, 0x73'u8
+  ]
+
+  NistP384Prime: array[48, uint8] = [
+    0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8,
+    0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8,
+    0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8,
+    0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFE'u8,
+    0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0x00'u8, 0x00'u8, 0x00'u8, 0x00'u8,
+    0x00'u8, 0x00'u8, 0x00'u8, 0x00'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8
+  ]
+
 # =============================================================================
 # Types
 # =============================================================================
@@ -114,6 +174,11 @@ type
     ecCurveParamG,
     ecCurveParamN,
     ecCurveParamPrime
+
+  EcCurveProvisionResult* = enum
+    ## Idempotent result from a standard-curve provisioning operation.
+    ecCurveAlreadyInstantiated,
+    ecCurveProvisioned
 
 # =============================================================================
 # Internal helpers
@@ -316,6 +381,98 @@ proc buildDeleteEcCurveApdu*(curveId: uint8): SE[seq[uint8]] =
     CurveMgmtP2Delete,
     payload,
     "DeleteECCurve"
+  )
+
+proc nistP384CurveParamValue(param: EcCurveParam): seq[uint8] =
+  result = case param
+  of ecCurveParamA: @NistP384A
+  of ecCurveParamB: @NistP384B
+  of ecCurveParamG: @NistP384G
+  of ecCurveParamN: @NistP384N
+  of ecCurveParamPrime: @NistP384Prime
+
+proc buildNistP384ProvisioningApdus*(): SE[seq[seq[uint8]]] =
+  ## Builds the complete standard P-384 provisioning sequence without touching
+  ## the secure element.
+  ##
+  ## Command order is fixed so callers cannot accidentally omit or substitute
+  ## one of the five standard domain parameters:
+  ##
+  ##   Create -> A -> B -> G -> N -> PRIME
+  let create = buildCreateEcCurveApdu(Se050CurveNistP384)
+  if not create.ok:
+    return fail[seq[seq[uint8]]](
+      create.error.kind,
+      create.error.message,
+      create.error.sw
+    )
+
+  var commands = @[create.value]
+  for param in [
+      ecCurveParamA,
+      ecCurveParamB,
+      ecCurveParamG,
+      ecCurveParamN,
+      ecCurveParamPrime
+  ]:
+    let built = buildSetEcCurveParamApdu(
+      Se050CurveNistP384,
+      param,
+      nistP384CurveParamValue(param)
+    )
+    if not built.ok:
+      return fail[seq[seq[uint8]]](
+        built.error.kind,
+        built.error.message,
+        built.error.sw
+      )
+    commands.add(built.value)
+
+  result = ok(commands)
+
+proc sendCurveManagementCommand(
+    se: Se050Transport,
+    apdu: openArray[uint8],
+    context: string
+): SE[void] =
+  let response = se.transceiveApdu(apdu)
+  if not response.ok:
+    return fail[void](
+      response.error.kind,
+      context & ": " & response.error.message,
+      response.error.sw
+    )
+
+  let status = checkStatus(response.value, context)
+  if not status.ok:
+    return fail[void](
+      status.error.kind,
+      status.error.message,
+      status.error.sw
+    )
+
+  result = ok()
+
+proc rollbackCurveAfterProvisionFailure[T](
+    se: Se050Transport,
+    deleteApdu: openArray[uint8],
+    cause: Se050Error
+): SE[T] =
+  ## Best-effort rollback after this call has received a successful
+  ## CreateECCurve response and therefore owns the partial curve state.
+  let rolledBack = sendCurveManagementCommand(
+    se,
+    deleteApdu,
+    "DeleteECCurve rollback"
+  )
+
+  if rolledBack.ok:
+    return fail[T](cause.kind, cause.message, cause.sw)
+
+  result = fail[T](
+    cause.kind,
+    cause.message & "; rollback failed: " & rolledBack.error.errorMessage(),
+    cause.sw
   )
 
 proc ecCurveName*(curveId: uint8): string =
@@ -576,6 +733,129 @@ proc readEcCurveList*(
     )
 
   result = parseReadEcCurveListResponse(response.value)
+
+proc provisionNistP384Curve*(
+    se: Se050Transport,
+    selectFirst: bool = true
+): SE[EcCurveProvisionResult] =
+  ## Idempotently provisions the standard NIST P-384 curve parameters.
+  ##
+  ## Safety properties:
+  ## - If ReadECCurveList already reports P-384 as set, no write command is sent.
+  ## - All provisioning/delete APDUs are built before the first mutation.
+  ## - Once CreateECCurve has returned success, any later failure triggers a
+  ##   best-effort DeleteECCurve rollback.
+  ## - A transport failure while sending CreateECCurve itself is NOT followed by
+  ##   DeleteECCurve because ownership is ambiguous without a successful create
+  ##   response.
+  ## - Success is returned only after ReadECCurveList reports P-384 as set.
+  let commands = buildNistP384ProvisioningApdus()
+  if not commands.ok:
+    return fail[EcCurveProvisionResult](
+      commands.error.kind,
+      commands.error.message,
+      commands.error.sw
+    )
+
+  let deleteApdu = buildDeleteEcCurveApdu(Se050CurveNistP384)
+  if not deleteApdu.ok:
+    return fail[EcCurveProvisionResult](
+      deleteApdu.error.kind,
+      deleteApdu.error.message,
+      deleteApdu.error.sw
+    )
+
+  if selectFirst:
+    let selected = se.selectApplet()
+    if not selected.ok:
+      return fail[EcCurveProvisionResult](
+        selected.error.kind,
+        selected.error.message,
+        selected.error.sw
+      )
+
+  let before = se.readEcCurveList(selectFirst = false)
+  if not before.ok:
+    return fail[EcCurveProvisionResult](
+      before.error.kind,
+      before.error.message,
+      before.error.sw
+    )
+
+  let beforeState = before.value.ecCurveSetState(Se050CurveNistP384)
+  if not beforeState.ok:
+    return fail[EcCurveProvisionResult](
+      beforeState.error.kind,
+      beforeState.error.message,
+      beforeState.error.sw
+    )
+
+  if beforeState.value == ecCurveSet:
+    return ok(ecCurveAlreadyInstantiated)
+
+  # Create is handled separately. Until this command returns success, this
+  # process cannot safely claim ownership of any partial curve state.
+  let created = sendCurveManagementCommand(
+    se,
+    commands.value[0],
+    "CreateECCurve NIST P-384"
+  )
+  if not created.ok:
+    return fail[EcCurveProvisionResult](
+      created.error.kind,
+      created.error.message,
+      created.error.sw
+    )
+
+  let params = [
+    ecCurveParamA,
+    ecCurveParamB,
+    ecCurveParamG,
+    ecCurveParamN,
+    ecCurveParamPrime
+  ]
+
+  for i, param in params:
+    let configured = sendCurveManagementCommand(
+      se,
+      commands.value[i + 1],
+      "SetECCurveParam NIST P-384 " & param.ecCurveParamName()
+    )
+    if not configured.ok:
+      return rollbackCurveAfterProvisionFailure[EcCurveProvisionResult](
+        se,
+        deleteApdu.value,
+        configured.error
+      )
+
+  let after = se.readEcCurveList(selectFirst = false)
+  if not after.ok:
+    return rollbackCurveAfterProvisionFailure[EcCurveProvisionResult](
+      se,
+      deleteApdu.value,
+      after.error
+    )
+
+  let afterState = after.value.ecCurveSetState(Se050CurveNistP384)
+  if not afterState.ok:
+    return rollbackCurveAfterProvisionFailure[EcCurveProvisionResult](
+      se,
+      deleteApdu.value,
+      afterState.error
+    )
+
+  if afterState.value != ecCurveSet:
+    return rollbackCurveAfterProvisionFailure[EcCurveProvisionResult](
+      se,
+      deleteApdu.value,
+      Se050Error(
+        kind: seInvalidResponse,
+        message: "NIST P-384 provisioning completed but ReadECCurveList still reports not-set",
+        sw: 0
+      )
+    )
+
+  result = ok(ecCurveProvisioned)
 
 proc getVersionInfo*(
     se: Se050Transport,
