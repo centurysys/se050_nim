@@ -1,3 +1,4 @@
+import std/base64
 import std/strutils
 import std/unittest
 
@@ -9,6 +10,12 @@ proc bytesFromHex(text: string): seq[uint8] =
   while offset < text.len:
     result.add(uint8(parseHexInt(text[offset .. offset + 1])))
     offset += 2
+
+proc bytesFromBase64(text: string): seq[uint8] =
+  let decoded = decode(text)
+  result = newSeq[uint8](decoded.len)
+  for i, value in decoded:
+    result[i] = uint8(ord(value))
 
 const
   P256Pkcs8Pem = """-----BEGIN PRIVATE KEY-----
@@ -54,6 +61,12 @@ PxRRm9eWjBplQbgw6ztMqEJ9zQKv8Ml5j6lgQhR6LFA0KikAVptvXuDmtJg3ed4K
   P256SpkiDerHex =
     "3059301306072a8648ce3d020106082a8648ce3d030107034200" &
     P256PublicKeyHex
+
+  MatchingCertificateDerBase64 =
+    "MIIBijCCATGgAwIBAgIUZmvOJWdaKMkR8D+/WgtZmgaoMCswCgYIKoZIzj0EAwIwGzEZMBcGA1UEAwwQbWF0Y2hpbmcuZXhhbXBsZTAeFw0yNjA4MDUwNDU4MzJaFw0zNjA4MDIwNDU4MzJaMBsxGTAXBgNVBAMMEG1hdGNoaW5nLmV4YW1wbGUwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASJ2d96kCiFAs5uEPwc0nJnPmp6I701KMJUonnqRKesw5cG/EqJ9AZll/LjLQWrP9jjGJJcJVsm0+67fuNTrqD5o1MwUTAdBgNVHQ4EFgQU1xZJjNfpuwgHKuNSfELaf3BbUt4wHwYDVR0jBBgwFoAU1xZJjNfpuwgHKuNSfELaf3BbUt4wDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNHADBEAiB65Cbj6KKrerIB0RvHP7JdYketWYZGmk3quqoAPI0cCwIgVpT404CCvpqkzQBygL1ZE+Ulct/sRzpSJDELpvAj2HI="
+
+  OtherP256CertificateDerBase64 =
+    "MIIBhTCCASugAwIBAgIURftoL3F8tzeGu9Gf75byVH3ZBe8wCgYIKoZIzj0EAwIwGDEWMBQGA1UEAwwNb3RoZXIuZXhhbXBsZTAeFw0yNjA4MDUwNDU4MzJaFw0zNjA4MDIwNDU4MzJaMBgxFjAUBgNVBAMMDW90aGVyLmV4YW1wbGUwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAATx09KA8oElZNdQp0HLwkC8t2e6i+lE7PmymdJoer0czzmC10YSC0GRmXeKV+0BgQgdp7In0QEUCp1LbI43kwW1o1MwUTAdBgNVHQ4EFgQUVCB/WyOCliPklOSjCQH4yFMQaGcwHwYDVR0jBBgwFoAUVCB/WyOCliPklOSjCQH4yFMQaGcwDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBFAiBpBniUCH7da/kSMO92rt26Z1avCma3z46jZ+WvzKrkSgIhAKYVXMqOjICBbshd8xQuk1xH72OrAtdIUWeZEm0AJsKb"
 
 suite "external TLS P-256 private-key parsing":
   test "parses PKCS#8 PEM and returns only public metadata":
@@ -119,3 +132,36 @@ suite "external TLS P-256 private-key parsing":
     check not parsed.ok
     if not parsed.ok:
       check parsed.error.kind == seInvalidArgument
+  test "matches a certificate containing the private key public key":
+    let matched = validateP256PrivateKeyCertificateMatch(
+      P256Pkcs8Pem,
+      bytesFromBase64(MatchingCertificateDerBase64)
+    )
+
+    check matched.ok
+    if matched.ok:
+      check matched.value.bits == 256
+      check @(matched.value.publicKey) == bytesFromHex(P256PublicKeyHex)
+      check matched.value.publicKeySpkiDer == bytesFromHex(P256SpkiDerHex)
+
+  test "rejects a certificate for a different P-256 key":
+    let matched = validateP256PrivateKeyCertificateMatch(
+      P256Pkcs8Pem,
+      bytesFromBase64(OtherP256CertificateDerBase64)
+    )
+
+    check not matched.ok
+    if not matched.ok:
+      check matched.error.kind == seInvalidArgument
+      check matched.error.message.contains("does not match")
+
+  test "rejects a malformed certificate before any SE050 operation":
+    let matched = validateP256PrivateKeyCertificateMatch(
+      P256Pkcs8Pem,
+      bytesFromHex("30030101ff")
+    )
+
+    check not matched.ok
+    if not matched.ok:
+      check matched.error.kind in {seCryptoError, seInvalidResponse}
+

@@ -30,6 +30,10 @@ type
     publicKey*: array[65, uint8]
     publicKeySpkiDer*: seq[uint8]
 
+  ValidatedP256PrivateKey = object
+    handle: pointer
+    curveName: string
+
 const
   P256Bits = 256
   P256UncompressedPublicKeyLength = 65
@@ -246,10 +250,62 @@ proc encodePublicKeySpkiDer(publicKey: pointer): SE[seq[uint8]] =
 
   result = ok(encoded)
 
+proc loadValidatedP256PrivateKey(
+    encodedKey: openArray[uint8]
+): SE[ValidatedP256PrivateKey] =
+  let decoded = decodePrivateKey(encodedKey)
+  if not decoded.ok:
+    return fail[ValidatedP256PrivateKey](
+      decoded.error.kind,
+      decoded.error.message,
+      decoded.error.sw
+    )
+
+  let validation = validateP256PrivateKey(decoded.value)
+  if not validation.ok:
+    evpPublicKeyFree(decoded.value)
+    return fail[ValidatedP256PrivateKey](
+      validation.error.kind,
+      validation.error.message,
+      validation.error.sw
+    )
+
+  result = ok(ValidatedP256PrivateKey(
+    handle: decoded.value,
+    curveName: validation.value
+  ))
+
+proc extractP256PrivateKeyInfo(
+    publicKeyHandle: pointer,
+    curveName: string
+): SE[P256PrivateKeyInfo] =
+  let publicKey = readP256PublicKey(publicKeyHandle)
+  if not publicKey.ok:
+    return fail[P256PrivateKeyInfo](
+      publicKey.error.kind,
+      publicKey.error.message,
+      publicKey.error.sw
+    )
+
+  let spki = encodePublicKeySpkiDer(publicKeyHandle)
+  if not spki.ok:
+    return fail[P256PrivateKeyInfo](
+      spki.error.kind,
+      spki.error.message,
+      spki.error.sw
+    )
+
+  result = ok(P256PrivateKeyInfo(
+    bits: P256Bits,
+    curveName: curveName,
+    publicKey: publicKey.value,
+    publicKeySpkiDer: spki.value
+  ))
+
 proc parseP256PrivateKeyBytes(
     encodedKey: openArray[uint8]
 ): SE[P256PrivateKeyInfo] =
-  let decoded = decodePrivateKey(encodedKey)
+  let decoded = loadValidatedP256PrivateKey(encodedKey)
   if not decoded.ok:
     return fail[P256PrivateKeyInfo](
       decoded.error.kind,
@@ -257,45 +313,87 @@ proc parseP256PrivateKeyBytes(
       decoded.error.sw
     )
 
-  let publicKeyHandle = decoded.value
   defer:
-    evpPublicKeyFree(publicKeyHandle)
+    evpPublicKeyFree(decoded.value.handle)
 
   try:
-    let validation = validateP256PrivateKey(publicKeyHandle)
-    if not validation.ok:
-      return fail[P256PrivateKeyInfo](
-        validation.error.kind,
-        validation.error.message,
-        validation.error.sw
-      )
-
-    let publicKey = readP256PublicKey(publicKeyHandle)
-    if not publicKey.ok:
-      return fail[P256PrivateKeyInfo](
-        publicKey.error.kind,
-        publicKey.error.message,
-        publicKey.error.sw
-      )
-
-    let spki = encodePublicKeySpkiDer(publicKeyHandle)
-    if not spki.ok:
-      return fail[P256PrivateKeyInfo](
-        spki.error.kind,
-        spki.error.message,
-        spki.error.sw
-      )
-
-    result = ok(P256PrivateKeyInfo(
-      bits: P256Bits,
-      curveName: validation.value,
-      publicKey: publicKey.value,
-      publicKeySpkiDer: spki.value
-    ))
+    result = extractP256PrivateKeyInfo(
+      decoded.value.handle,
+      decoded.value.curveName
+    )
   except CatchableError as e:
     result = fail[P256PrivateKeyInfo](
       seCryptoError,
       "OpenSSL private-key handling failed: " & e.msg
+    )
+
+proc validateP256PrivateKeyCertificateMatchBytes(
+    encodedKey: openArray[uint8],
+    certificateDer: openArray[uint8]
+): SE[P256PrivateKeyInfo] =
+  let decoded = loadValidatedP256PrivateKey(encodedKey)
+  if not decoded.ok:
+    return fail[P256PrivateKeyInfo](
+      decoded.error.kind,
+      decoded.error.message,
+      decoded.error.sw
+    )
+
+  defer:
+    evpPublicKeyFree(decoded.value.handle)
+
+  let certificate = loadX509Certificate(certificateDer)
+  if not certificate.ok:
+    return fail[P256PrivateKeyInfo](
+      certificate.error.kind,
+      certificate.error.message,
+      certificate.error.sw
+    )
+
+  defer:
+    x509Free(certificate.value)
+
+  try:
+    let certificatePublicKey = x509GetPublicKey(certificate.value)
+    if certificatePublicKey == nil:
+      return fail[P256PrivateKeyInfo](
+        seCryptoError,
+        opensslErrorMessage("OpenSSL failed to extract the certificate public key")
+      )
+
+    defer:
+      evpPublicKeyFree(certificatePublicKey)
+
+    opensslErrorClear()
+    let comparison = evpPublicKeyEq(decoded.value.handle, certificatePublicKey)
+    case comparison
+    of 1:
+      result = extractP256PrivateKeyInfo(
+        decoded.value.handle,
+        decoded.value.curveName
+      )
+    of 0, -1:
+      result = fail[P256PrivateKeyInfo](
+        seInvalidArgument,
+        "certificate public key does not match the external TLS P-256 private key"
+      )
+    of -2:
+      result = fail[P256PrivateKeyInfo](
+        seCryptoError,
+        "OpenSSL does not support comparing the external private key and " &
+          "certificate public key"
+      )
+    else:
+      result = fail[P256PrivateKeyInfo](
+        seCryptoError,
+        opensslErrorMessage(
+          "OpenSSL failed to compare the external private key and certificate public key"
+        )
+      )
+  except CatchableError as e:
+    result = fail[P256PrivateKeyInfo](
+      seCryptoError,
+      "OpenSSL private-key/certificate matching failed: " & e.msg
     )
 
 # =============================================================================
@@ -323,3 +421,31 @@ proc parseP256PrivateKey*(encodedKey: string): SE[P256PrivateKeyInfo] =
   result = parseP256PrivateKeyBytes(
     encodedKey.toOpenArrayByte(0, encodedKey.high)
   )
+
+proc validateP256PrivateKeyCertificateMatch*(
+    encodedKey: openArray[uint8],
+    certificateDer: openArray[uint8]
+): SE[P256PrivateKeyInfo] =
+  ## Parses and validates a P-256 private key and verifies that its key pair
+  ## matches the SubjectPublicKeyInfo contained in the DER certificate.
+  ##
+  ## The comparison uses OpenSSL EVP_PKEY semantics rather than bytewise SPKI
+  ## comparison. No SE050 operation is performed by this API.
+  result = validateP256PrivateKeyCertificateMatchBytes(encodedKey, certificateDer)
+
+proc validateP256PrivateKeyCertificateMatch*(
+    encodedKey: string,
+    certificateDer: openArray[uint8]
+): SE[P256PrivateKeyInfo] =
+  ## String overload suitable for binary-safe `readFile()` private-key input.
+  if encodedKey.len == 0:
+    return fail[P256PrivateKeyInfo](
+      seInvalidArgument,
+      "external private key must not be empty"
+    )
+
+  result = validateP256PrivateKeyCertificateMatchBytes(
+    encodedKey.toOpenArrayByte(0, encodedKey.high),
+    certificateDer
+  )
+

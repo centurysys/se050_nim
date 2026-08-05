@@ -61,6 +61,12 @@ proc evpPublicKeyGetBits*(publicKey: pointer): cint {.
   dynlib: LibCrypto
 .}
 
+proc evpPublicKeyEq*(first, second: pointer): cint {.
+  cdecl,
+  importc: "EVP_PKEY_eq",
+  dynlib: LibCrypto
+.}
+
 proc evpPublicKeyGetUtf8StringParam*(
     publicKey: pointer,
     key: cstring,
