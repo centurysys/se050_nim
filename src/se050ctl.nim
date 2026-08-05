@@ -14,6 +14,7 @@ import std/strutils
 
 import argparse
 import se050_nim
+import se050_nim/secure_memory
 
 # =============================================================================
 # SE050 object namespace policy used by this CLI
@@ -556,6 +557,109 @@ proc rawStringToBytes(data: string): seq[uint8] =
   for i, ch in data:
     result[i] = uint8(ord(ch))
 
+proc readTlsImportPrivateKeyFile(path: string): SE[string] =
+  ## Reads an external private-key file without invoking the openssl CLI.
+  ##
+  ## The returned string may contain PEM or DER bytes. The caller owns the
+  ## returned mutable buffer and must clear it with secureZero() after use.
+  let normalized = path.strip()
+  if normalized.len == 0:
+    return fail[string](
+      seInvalidArgument,
+      "TLS private-key input path is empty"
+    )
+
+  try:
+    let data = readFile(normalized)
+    if data.len == 0:
+      return fail[string](
+        seInvalidArgument,
+        &"TLS private-key file is empty: {normalized}"
+      )
+    result = ok(data)
+  except CatchableError as e:
+    result = fail[string](
+      seInvalidArgument,
+      &"cannot read TLS private-key file {normalized}: {e.msg}"
+    )
+
+proc readTlsImportCertificateFile(path: string): SE[seq[uint8]] =
+  ## Reads one matching X.509 certificate as DER or conventional PEM.
+  ##
+  ## Certificate parsing itself remains in the OpenSSL-backed import library;
+  ## this helper only removes PEM framing and Base64 encoding when present.
+  const
+    PemBegin = "-----BEGIN CERTIFICATE-----"
+    PemEnd = "-----END CERTIFICATE-----"
+
+  let normalized = path.strip()
+  if normalized.len == 0:
+    return fail[seq[uint8]](
+      seInvalidArgument,
+      "TLS certificate input path is empty"
+    )
+
+  var raw: string
+  try:
+    raw = readFile(normalized)
+  except CatchableError as e:
+    return fail[seq[uint8]](
+      seInvalidArgument,
+      &"cannot read TLS certificate file {normalized}: {e.msg}"
+    )
+
+  if raw.len == 0:
+    return fail[seq[uint8]](
+      seInvalidArgument,
+      &"TLS certificate file is empty: {normalized}"
+    )
+
+  let trimmed = raw.strip()
+  if trimmed.startsWith(PemBegin):
+    if not trimmed.endsWith(PemEnd):
+      return fail[seq[uint8]](
+        seInvalidArgument,
+        &"TLS certificate PEM has invalid framing: {normalized}"
+      )
+
+    let bodyStart = PemBegin.len
+    let bodyEnd = trimmed.len - PemEnd.len
+    if bodyEnd <= bodyStart:
+      return fail[seq[uint8]](
+        seInvalidArgument,
+        &"TLS certificate PEM body is empty: {normalized}"
+      )
+
+    var compact = ""
+    for ch in trimmed[bodyStart ..< bodyEnd]:
+      if ch in {' ', '\t', '\r', '\n'}:
+        continue
+      compact.add(ch)
+
+    if compact.len == 0:
+      return fail[seq[uint8]](
+        seInvalidArgument,
+        &"TLS certificate PEM body is empty: {normalized}"
+      )
+
+    let decoded = decodeBase64(compact)
+    if not decoded.ok:
+      return fail[seq[uint8]](
+        decoded.error.kind,
+        &"invalid TLS certificate PEM {normalized}: {decoded.error.message}",
+        decoded.error.sw
+      )
+
+    return decoded
+
+  if trimmed.startsWith("-----BEGIN"):
+    return fail[seq[uint8]](
+      seInvalidArgument,
+      &"unsupported PEM object in TLS certificate file: {normalized}"
+    )
+
+  result = ok(rawStringToBytes(raw))
+
 proc writeRawBytes(path: string, data: openArray[uint8], context: string): bool =
   try:
     writeFile(path, bytesToRawString(data))
@@ -971,6 +1075,52 @@ proc runTlsKeyPubkey(
   echo &"slot: {profile.slot.slotName()}"
   echo &"format: {formatName}"
   echo &"length: {output.len}"
+  result = 0
+
+proc runTlsKeyImport(
+    busText: string,
+    addressText: string,
+    debug: bool,
+    profileText: string,
+    identityText: string,
+    slotText: string,
+    privateKeyPath: string,
+    certificatePath: string
+): int =
+  ## Imports one externally generated P-256 TLS identity into an empty slot.
+  ##
+  ## All host-side key/certificate checks are completed by the library before
+  ## it selects the SE050 applet or checks the target object. The source key
+  ## file buffer is explicitly cleared before this command returns.
+  let profile = parseTlsIdentityProfile(profileText, identityText, slotText)
+
+  var loadedKey = readTlsImportPrivateKeyFile(privateKeyPath)
+  if not loadedKey.ok:
+    printSe050Error("TLS private-key load failed", loadedKey.error)
+    return 2
+
+  var encodedKey = move(loadedKey.value)
+  defer:
+    secureZero(encodedKey)
+
+  let certificate = readTlsImportCertificateFile(certificatePath)
+  if not certificate.ok:
+    printSe050Error("TLS certificate load failed", certificate.error)
+    return 2
+
+  let se = openAndRequestAtr(busText, addressText, debug)
+  let imported = se.importP256TlsIdentity(
+    profile = profile,
+    encodedKey = encodedKey,
+    certificateDer = certificate.value
+  )
+  if not imported.ok:
+    printSe050Error("TLS key import failed", imported.error)
+    return 1
+
+  printTlsIdentityInfo(imported.value, none(bool))
+  echo "  provisioning: externally imported P-256 private key"
+  echo "  certificate/key match: verified before SE050 write"
   result = 0
 
 proc runTlsKeygen(
@@ -1969,6 +2119,28 @@ proc main(): int =
           opts.slot,
           opts.format,
           opts.out
+        ))
+
+    command("tls-key-import"):
+      help("Import an external P-256 private key into one empty SE050 TLS identity slot.")
+      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
+      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("--profile", required = true, help = "TLS identity profile: test or production")
+      option("--identity", default = some("0"), help = "TLS identity number, default: 0")
+      option("--slot", required = true, help = "TLS identity slot: A or B")
+      option("--key", required = true, help = "External unencrypted P-256 private key file in PEM or DER")
+      option("--cert", required = true, help = "Matching X.509 certificate file in PEM or DER")
+      flag("-d", "--debug", help = "Print non-sensitive T=1 over I2C frames; key-import frames are redacted")
+      run:
+        quit(runTlsKeyImport(
+          opts.bus,
+          opts.address,
+          opts.debug,
+          opts.profile,
+          opts.identity,
+          opts.slot,
+          opts.key,
+          opts.cert
         ))
 
     command("tls-keygen"):
