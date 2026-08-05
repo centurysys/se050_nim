@@ -412,10 +412,23 @@ proc parseCurveKind(s: string): EcCurveKind =
   else:
     raise newException(ValueError, &"unsupported curve for se050ctl keygen: {s}")
 
+proc parseTlsIdentityCurve(value: string): EcCurveKind =
+  case value.strip().toLowerAscii()
+  of "p256", "prime256v1", "nist-p256", "nist_p256", "secp256r1":
+    result = ecCurveP256
+  of "p384", "nist-p384", "nist_p384", "secp384r1":
+    result = ecCurveP384
+  else:
+    raise newException(
+      ValueError,
+      &"TLS identity curve must be p256 or p384: {value}"
+    )
+
 proc parseTlsIdentityProfile(
     profileText: string,
     identityText: string,
-    slotText: string
+    slotText: string,
+    curve: EcCurveKind = ecCurveP256
 ): TlsIdentityProfile =
   let kind =
     case profileText.strip().toLowerAscii()
@@ -448,7 +461,7 @@ proc parseTlsIdentityProfile(
         &"TLS identity slot must be A or B: {slotText}"
       )
 
-  result = tlsIdentityProfile(kind, uint16(identity32), slot)
+  result = tlsIdentityProfile(kind, uint16(identity32), slot, curve)
   if not result.isValid():
     raise newException(ValueError, "resolved TLS identity profile is invalid")
 
@@ -1098,15 +1111,24 @@ proc runTlsKeyImport(
     profileText: string,
     identityText: string,
     slotText: string,
+    curveText: string,
     privateKeyPath: string,
     certificatePath: string
 ): int =
-  ## Imports one externally generated P-256 TLS identity into an empty slot.
+  ## Imports one externally generated P-256 or P-384 TLS identity into an empty
+  ## managed slot.
   ##
   ## All host-side key/certificate checks are completed by the library before
-  ## it selects the SE050 applet or checks the target object. The source key
-  ## file buffer is explicitly cleared before this command returns.
-  let profile = parseTlsIdentityProfile(profileText, identityText, slotText)
+  ## it mutates the SE050. P-384 additionally requires the standard curve to
+  ## have been explicitly instantiated beforehand. The source key file buffer
+  ## is explicitly cleared before this command returns.
+  let curve = parseTlsIdentityCurve(curveText)
+  let profile = parseTlsIdentityProfile(
+    profileText,
+    identityText,
+    slotText,
+    curve
+  )
 
   var loadedKey = readTlsImportPrivateKeyFile(privateKeyPath)
   if not loadedKey.ok:
@@ -1123,18 +1145,34 @@ proc runTlsKeyImport(
     return 2
 
   let se = openAndRequestAtr(busText, addressText, debug)
-  let imported = se.importP256TlsIdentity(
-    profile = profile,
-    encodedKey = encodedKey,
-    certificateDer = certificate.value
-  )
+  let imported =
+    case curve
+    of ecCurveP256:
+      se.importP256TlsIdentity(
+        profile = profile,
+        encodedKey = encodedKey,
+        certificateDer = certificate.value
+      )
+    of ecCurveP384:
+      se.importP384TlsIdentity(
+        profile = profile,
+        encodedKey = encodedKey,
+        certificateDer = certificate.value
+      )
+    else:
+      fail[TlsIdentityLiveInfo](
+        seInvalidArgument,
+        "unsupported managed TLS import curve"
+      )
+
   if not imported.ok:
     printSe050Error("TLS key import failed", imported.error)
     return 1
 
   printTlsIdentityInfo(imported.value, none(bool))
-  echo "  provisioning: externally imported P-256 private key"
+  echo &"  provisioning: externally imported {curveName(curve)} private key"
   echo "  certificate/key match: verified before SE050 write"
+  echo "  source/live public key match: verified after SE050 write"
   result = 0
 
 proc runTlsKeygen(
@@ -1191,9 +1229,16 @@ proc runTlsKeyInfo(
     profileText: string,
     identityText: string,
     slotText: string,
+    curveText: string,
     imported: bool
 ): int =
-  let profile = parseTlsIdentityProfile(profileText, identityText, slotText)
+  let curve = parseTlsIdentityCurve(curveText)
+  let profile = parseTlsIdentityProfile(
+    profileText,
+    identityText,
+    slotText,
+    curve
+  )
   let se = openAndRequestAtr(busText, addressText, debug)
 
   let exists = se.objectExists(
@@ -2285,13 +2330,14 @@ proc main(): int =
         ))
 
     command("tls-key-import"):
-      help("Import an external P-256 private key into one empty SE050 TLS identity slot.")
+      help("Import an external P-256 or P-384 private key into one empty SE050 TLS identity slot.")
       option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
       option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
       option("--profile", required = true, help = "TLS identity profile: test or production")
       option("--identity", default = some("0"), help = "TLS identity number, default: 0")
       option("--slot", required = true, help = "TLS identity slot: A or B")
-      option("--key", required = true, help = "External unencrypted P-256 private key file in PEM or DER")
+      option("--curve", default = some("p256"), help = "External key curve: p256 or p384, default: p256")
+      option("--key", required = true, help = "External unencrypted EC private key file in PEM or DER")
       option("--cert", required = true, help = "Matching X.509 certificate file in PEM or DER")
       flag("-d", "--debug", help = "Print non-sensitive T=1 over I2C frames; key-import frames are redacted")
       run:
@@ -2302,6 +2348,7 @@ proc main(): int =
           opts.profile,
           opts.identity,
           opts.slot,
+          opts.curve,
           opts.key,
           opts.cert
         ))
@@ -2331,6 +2378,7 @@ proc main(): int =
       option("--profile", required = true, help = "TLS identity profile: test or production")
       option("--identity", default = some("0"), help = "TLS identity number, default: 0")
       option("--slot", required = true, help = "TLS identity slot: A or B")
+      option("--curve", default = some("p256"), help = "TLS identity curve: p256 or p384, default: p256")
       flag("--imported", help = "Require an externally imported TLS key instead of the default internally generated key")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
@@ -2341,6 +2389,7 @@ proc main(): int =
           opts.profile,
           opts.identity,
           opts.slot,
+          opts.curve,
           opts.imported
         ))
 
