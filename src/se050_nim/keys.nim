@@ -13,6 +13,7 @@ import ./transport
 import ./apdu
 import ./tlv
 import ./objects
+import ./secure_memory
 
 # =============================================================================
 # Constants
@@ -23,6 +24,7 @@ const
   Tag1 = 0x41'u8
   Tag2 = 0x42'u8
   Tag3 = 0x43'u8
+  Tag4 = 0x44'u8
   Tag7 = 0x47'u8
 
   # SE05x WriteECKey APDU for generating an EC key pair inside SE050.
@@ -132,7 +134,11 @@ const
   # empty reads before the SE050 emits WTX or the final response. Keep the
   # extended wait local to key generation so quick commands keep failing fast.
   KeyGenerationMaxReadRetries = 200
+  KeyImportMaxReadRetries = 200
   CryptoOperationMaxReadRetries = 200
+
+  Se050P256PrivateKeyLength* = 32
+  Se050P256UncompressedPublicKeyLength* = 65
 
 # =============================================================================
 # Types
@@ -380,6 +386,66 @@ proc buildGenerateEcKeyPairApdu(
     result.value.add(b)
   result.ok = true
 
+proc buildImportP256KeyPairApdu*(
+    objectId: uint32,
+    privateKey: openArray[uint8],
+    publicKey: openArray[uint8],
+    policy: EcKeyPolicy
+): SE[seq[uint8]] =
+  ## Builds a WriteECKey APDU that imports an externally generated P-256 key pair.
+  ##
+  ## AN12413 requires TAG_3 (private key) and TAG_4 (public key) to either both
+  ## be present or both be absent for P1_KEY_PAIR. P-256 private keys are exactly
+  ## 32 bytes and Weierstrass public keys use 65-byte uncompressed 0x04 || X || Y
+  ## encoding.
+  ##
+  ## The returned APDU contains the private scalar. Callers must treat it as
+  ## sensitive memory and clear it after use.
+  if privateKey.len != Se050P256PrivateKeyLength:
+    return fail[seq[uint8]](
+      seInvalidArgument,
+      "P-256 private key must be exactly 32 bytes"
+    )
+
+  if publicKey.len != Se050P256UncompressedPublicKeyLength:
+    return fail[seq[uint8]](
+      seInvalidArgument,
+      "P-256 public key must be exactly 65 bytes"
+    )
+
+  if publicKey[0] != 0x04'u8:
+    return fail[seq[uint8]](
+      seInvalidArgument,
+      "P-256 public key must use uncompressed 0x04 || X || Y encoding"
+    )
+
+  var payload: seq[uint8] = @[]
+  defer:
+    secureZero(payload)
+
+  payload.appendTlvBytes(TagPolicy, encodeEcKeyPolicy(policy))
+  payload.appendTlvU32(Tag1, objectId)
+  payload.appendTlvU8(Tag2, Se050CurveNistP256)
+  payload.appendTlvBytes(Tag3, privateKey)
+  payload.appendTlvBytes(Tag4, publicKey)
+
+  if payload.len > 255:
+    return fail[seq[uint8]](
+      seApduTooLarge,
+      "WriteECKey P-256 import payload is too large for a short APDU"
+    )
+
+  result.value = @[
+    WriteEcKeyCla,
+    WriteEcKeyIns,
+    WriteEcKeyP1KeyPairEc,
+    WriteEcKeyP2Default,
+    uint8(payload.len)
+  ]
+  for b in payload:
+    result.value.add(b)
+  result.ok = true
+
 proc buildEcdsaSignApdu*(
     objectId: uint32,
     digest: openArray[uint8]
@@ -575,6 +641,84 @@ proc generateP256KeyPair*(
     selectFirst = selectFirst
   )
 
+
+proc importP256KeyPair*(
+    se: Se050Transport,
+    objectId: uint32,
+    privateKey: openArray[uint8],
+    publicKey: openArray[uint8],
+    policy: EcKeyPolicy,
+    selectFirst: bool = true
+): SE[void] =
+  ## Imports an externally generated NIST P-256 key pair into SE050.
+  ##
+  ## This is a raw low-level primitive. It deliberately does not check managed
+  ## TLS object ranges, existing-object ownership, certificate matching, or
+  ## attestation semantics. Higher layers must perform those checks before
+  ## calling this function.
+  ##
+  ## The WriteECKey command contains the private scalar, so the complete
+  ## transaction uses the sensitive transport path and the temporary APDU copy
+  ## is cleared before returning.
+  if selectFirst:
+    let selected = se.selectApplet()
+    if not selected.ok:
+      return fail[void](
+        selected.error.kind,
+        selected.error.message,
+        selected.error.sw
+      )
+
+  var apdu = buildImportP256KeyPairApdu(
+    objectId = objectId,
+    privateKey = privateKey,
+    publicKey = publicKey,
+    policy = policy
+  )
+  if not apdu.ok:
+    return fail[void](
+      apdu.error.kind,
+      apdu.error.message,
+      apdu.error.sw
+    )
+
+  defer:
+    secureZero(apdu.value)
+
+  let oldMaxRetries = se.maxRetries
+  if se.maxRetries < KeyImportMaxReadRetries:
+    se.maxRetries = KeyImportMaxReadRetries
+
+  let response = se.transceiveSensitiveApdu(apdu.value)
+  se.maxRetries = oldMaxRetries
+
+  if not response.ok:
+    return fail[void](
+      response.error.kind,
+      response.error.message,
+      response.error.sw
+    )
+
+  result = checkStatus(response.value, "WriteECKey")
+
+proc importP256KeyPair*(
+    se: Se050Transport,
+    objectId: uint32,
+    privateKey: openArray[uint8],
+    publicKey: openArray[uint8],
+    selectFirst: bool = true
+): SE[void] =
+  ## Imports a P-256 key pair using the historical development EC-key policy.
+  ##
+  ## Product TLS provisioning should pass the managed TLS profile policy
+  ## explicitly rather than using this convenience overload.
+  result = se.importP256KeyPair(
+    objectId = objectId,
+    privateKey = privateKey,
+    publicKey = publicKey,
+    policy = developmentEcKeyPolicy(),
+    selectFirst = selectFirst
+  )
 
 proc readPublicKey*(
     se: Se050Transport,
