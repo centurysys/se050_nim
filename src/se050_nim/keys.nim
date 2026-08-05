@@ -661,7 +661,9 @@ proc deriveSharedSecret*(
   if se.maxRetries < CryptoOperationMaxReadRetries:
     se.maxRetries = CryptoOperationMaxReadRetries
 
-  let response = se.transceiveApdu(apdu.value)
+  # The response contains the derived shared secret, so suppress raw T=1
+  # frame logging and clear temporary transport copies.
+  let response = se.transceiveSensitiveApdu(apdu.value)
   se.maxRetries = oldMaxRetries
 
   if not response.ok:
