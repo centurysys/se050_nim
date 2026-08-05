@@ -2,10 +2,12 @@
 set -euo pipefail
 
 SE050CTL="se050ctl"
+PROVIDER="/usr/local/lib/libsssProvider.so"
 IDENTITY="0"
 SLOT="B"
 BUS="0"
 ADDRESS="0x48"
+SSS_PORT="${EX_SSS_BOOT_SSS_PORT:-/dev/i2c-0:0x48}"
 
 usage() {
   cat <<USAGE
@@ -19,6 +21,9 @@ generated P-384 private key:
     -> sensitive WriteECKey logging redaction
     -> ReadType / imported-origin attestation validation
     -> source/live public-key match enforced by the import workflow
+    -> P-384 NXP reference-key export
+    -> NXP Provider ECDSA/SHA-384 signature
+    -> independent verification with the original software public key
     -> test object deletion
 
 The target P-384 curve must already be instantiated. This script never creates
@@ -30,10 +35,12 @@ replaced.
 
 Options:
   --se050ctl PATH       se050ctl executable (default: se050ctl)
+  --provider PATH       NXP OpenSSL Provider (default: /usr/local/lib/libsssProvider.so)
   --identity N          test TLS identity number (default: 0)
   --slot A|B            empty test TLS identity slot (default: B)
   --bus N               I2C bus (default: 0)
   --address HEX         SE050 I2C address (default: 0x48)
+  --sss-port VALUE      EX_SSS_BOOT_SSS_PORT value (default: /dev/i2c-0:0x48)
   -h, --help            show this help
 USAGE
 }
@@ -41,10 +48,12 @@ USAGE
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --se050ctl) SE050CTL="$2"; shift 2 ;;
+    --provider) PROVIDER="$2"; shift 2 ;;
     --identity) IDENTITY="$2"; shift 2 ;;
     --slot) SLOT="$2"; shift 2 ;;
     --bus) BUS="$2"; shift 2 ;;
     --address) ADDRESS="$2"; shift 2 ;;
+    --sss-port) SSS_PORT="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -63,6 +72,16 @@ fi
 
 if (( 10#$IDENTITY > 32511 )); then
   echo "--identity is outside the supported TLS identity range: 0..32511" >&2
+  exit 2
+fi
+
+if [[ ! -r "$PROVIDER" ]]; then
+  echo "provider is not readable: $PROVIDER" >&2
+  exit 1
+fi
+
+if [[ "$PROVIDER" == *$'\n'* || "$PROVIDER" == *$'\r'* ]]; then
+  echo "provider path must not contain a newline" >&2
   exit 2
 fi
 
@@ -93,14 +112,25 @@ WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/se050-external-p384-import.XXXXXX")"
 echo "workdir: $WORKDIR"
 echo "test object: $OBJECT_ID (identity $IDENTITY slot $SLOT)"
 
+export EX_SSS_BOOT_SSS_PORT="$SSS_PORT"
+
 SOURCE_KEY="$WORKDIR/source-p384.key"
 SOURCE_CERT="$WORKDIR/source-p384.crt"
+SOURCE_PUBLIC_DER="$WORKDIR/source-p384-public.der"
+SOURCE_PUBLIC_PEM="$WORKDIR/source-p384-public.pem"
+REFERENCE_KEY="$WORKDIR/reference-p384.key"
+REFERENCE_PUBLIC_DER="$WORKDIR/reference-p384-public.der"
+INPUT="$WORKDIR/input.txt"
+SIGNATURE="$WORKDIR/signature.der"
+OPENSSL_CNF="$WORKDIR/openssl.cnf"
 
 CURVE_LOG="$WORKDIR/curve-list.log"
 PREFLIGHT_LOG="$WORKDIR/preflight.log"
 IMPORT_LOG="$WORKDIR/import.log"
 INTERNAL_INFO_LOG="$WORKDIR/internal-info.log"
 IMPORTED_INFO_LOG="$WORKDIR/imported-info.log"
+SIGN_LOG="$WORKDIR/provider-sign.log"
+VERIFY_LOG="$WORKDIR/software-verify.log"
 CLEANUP_LOG="$WORKDIR/cleanup.log"
 
 OWN_EMPTY_SLOT=0
@@ -229,6 +259,19 @@ OPENSSL_CONF=/dev/null openssl req \
   -out "$SOURCE_CERT" \
   >/dev/null 2>&1
 
+OPENSSL_CONF=/dev/null openssl pkey \
+  -in "$SOURCE_KEY" \
+  -pubout \
+  -outform DER \
+  -out "$SOURCE_PUBLIC_DER" \
+  >/dev/null 2>&1
+
+OPENSSL_CONF=/dev/null openssl pkey \
+  -in "$SOURCE_KEY" \
+  -pubout \
+  -out "$SOURCE_PUBLIC_PEM" \
+  >/dev/null 2>&1
+
 "$SE050CTL" tls-key-import \
   -b "$BUS" \
   -a "$ADDRESS" \
@@ -315,4 +358,103 @@ if ! grep -Fq 'origin: external' "$IMPORTED_INFO_LOG"; then
 fi
 
 echo "P-384 imported-origin live attestation validation: OK"
-echo "external P-384 TLS key import integration test: PASS"
+
+"$SE050CTL" tls-key-ref-file \
+  -b "$BUS" \
+  -a "$ADDRESS" \
+  --profile test \
+  --identity "$IDENTITY" \
+  --slot "$SLOT" \
+  --curve p384 \
+  --imported \
+  --out "$REFERENCE_KEY" \
+  >/dev/null
+
+mode="$(stat -c '%a' "$REFERENCE_KEY")"
+if [[ "$mode" != "600" ]]; then
+  echo "unexpected P-384 reference-key permissions: $mode (expected 600)" >&2
+  exit 1
+fi
+
+OPENSSL_CONF=/dev/null openssl ec \
+  -in "$REFERENCE_KEY" \
+  -pubout \
+  -outform DER \
+  -out "$REFERENCE_PUBLIC_DER" \
+  >/dev/null 2>&1
+
+if ! cmp -s "$SOURCE_PUBLIC_DER" "$REFERENCE_PUBLIC_DER"; then
+  echo "P-384 reference-key public key does not match the imported source key" >&2
+  exit 1
+fi
+echo "P-384 reference-key public key: matches imported source key"
+
+cat > "$OPENSSL_CNF" <<EOF_CNF
+config_diagnostics = 1
+openssl_conf = openssl_init
+
+[openssl_init]
+providers = provider_sect
+
+[provider_sect]
+nxp_prov = nxp_sect
+default = default_sect
+
+[nxp_sect]
+identity = nxp_prov
+module = $PROVIDER
+activate = 1
+
+[default_sect]
+activate = 1
+EOF_CNF
+
+printf 'SE050 external P-384 import Provider test\n' > "$INPUT"
+
+set +e
+OPENSSL_CONF="$OPENSSL_CNF" \
+EX_SSS_BOOT_SSS_PORT="$SSS_PORT" \
+openssl pkeyutl \
+  -inkey "$REFERENCE_KEY" \
+  -sign \
+  -rawin \
+  -in "$INPUT" \
+  -out "$SIGNATURE" \
+  -digest sha384 \
+  >"$SIGN_LOG" 2>&1
+sign_rc=$?
+set -e
+
+if (( sign_rc != 0 )); then
+  echo "NXP Provider signing with the imported P-384 SE050 key failed" >&2
+  echo "see $SIGN_LOG" >&2
+  exit 1
+fi
+
+if [[ ! -s "$SIGNATURE" ]]; then
+  echo "NXP Provider produced an empty P-384 signature" >&2
+  exit 1
+fi
+
+set +e
+OPENSSL_CONF=/dev/null openssl pkeyutl \
+  -verify \
+  -pubin \
+  -inkey "$SOURCE_PUBLIC_PEM" \
+  -rawin \
+  -in "$INPUT" \
+  -sigfile "$SIGNATURE" \
+  -digest sha384 \
+  >"$VERIFY_LOG" 2>&1
+verify_rc=$?
+set -e
+
+if (( verify_rc != 0 )); then
+  echo "P-384 signature verification against the original software public key failed" >&2
+  echo "see $VERIFY_LOG" >&2
+  exit 1
+fi
+
+echo "NXP Provider P-384 sign with imported key: OK"
+echo "software verify with original P-384 public key: OK"
+echo "external P-384 TLS key import + Provider sign integration test: PASS"
