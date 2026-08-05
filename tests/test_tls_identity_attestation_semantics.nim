@@ -13,7 +13,10 @@ proc appendU32Be(data: var seq[uint8], value: uint32) =
   data.add(uint8((value shr 8) and 0xFF))
   data.add(uint8(value and 0xFF))
 
-proc attributesFor(profile: TlsIdentityProfile): seq[uint8] =
+proc attributesFor(
+    profile: TlsIdentityProfile,
+    origin: uint8 = Se050ObjectOriginInternal
+): seq[uint8] =
   result.appendU32Be(profile.keyObjectId)
   result.add(profile.expectedKeyType())
   result.add(Se050SetIndicatorNotSet)
@@ -23,10 +26,13 @@ proc attributesFor(profile: TlsIdentityProfile): seq[uint8] =
   result.add(0x08'u8)
   result.appendU32Be(0'u32)
   result.appendU32Be(policyHeader(profile.keyPolicy()))
-  result.add(Se050ObjectOriginInternal)
+  result.add(origin)
   result.appendU32Be(1'u32)
 
-proc validAttestedObject(profile: TlsIdentityProfile): AttestedObjectRead =
+proc validAttestedObject(
+    profile: TlsIdentityProfile,
+    origin: uint8 = Se050ObjectOriginInternal
+): AttestedObjectRead =
   var publicKey = @[0x04'u8]
   for i in 0 ..< 64:
     publicKey.add(uint8(i))
@@ -48,7 +54,7 @@ proc validAttestedObject(profile: TlsIdentityProfile): AttestedObjectRead =
       objectDataPresent: true,
       objectData: publicKey,
       chipId: chipId,
-      attributes: attributesFor(profile),
+      attributes: attributesFor(profile, origin),
       objectInfo: @[0x00'u8, 0x20'u8],
       timestamp: newSeq[uint8](12),
       signature: @[0x30'u8, 0x00'u8]
@@ -92,15 +98,42 @@ suite "SE050 TLS identity attestation semantics":
     check verified.value.profile.kind == tipProduction
     check verified.value.profile.slot == tisSlotB
 
-  test "rejects an externally generated key":
+  test "internal validation rejects an externally generated key":
     let profile = testTlsIdentityProfile(tisSlotA)
-    var attested = validAttestedObject(profile)
-    attested.response.attributes[^5] = Se050ObjectOriginExternal
+    let attested = validAttestedObject(
+      profile,
+      origin = Se050ObjectOriginExternal
+    )
 
     let verified = verifyTlsIdentityAttestationSemantics(attested, profile)
     check not verified.ok
     check verified.error.kind == seTlsIdentityValidationFailed
     check verified.error.message.contains("origin must be internal")
+
+  test "imported validation accepts an externally generated key":
+    let profile = testTlsIdentityProfile(tisSlotA)
+    let verified = verifyImportedTlsIdentityAttestationSemantics(
+      validAttestedObject(
+        profile,
+        origin = Se050ObjectOriginExternal
+      ),
+      profile
+    )
+
+    check verified.ok
+    check verified.value.attributes.origin == Se050ObjectOriginExternal
+    check verified.value.publicKey.len == EcP256UncompressedPublicKeyLength
+
+  test "imported validation rejects an internally generated key":
+    let profile = testTlsIdentityProfile(tisSlotA)
+    let verified = verifyImportedTlsIdentityAttestationSemantics(
+      validAttestedObject(profile),
+      profile
+    )
+
+    check not verified.ok
+    check verified.error.kind == seTlsIdentityValidationFailed
+    check verified.error.message.contains("origin must be external")
 
   test "rejects generic development signing policy":
     let profile = testTlsIdentityProfile(tisSlotA)

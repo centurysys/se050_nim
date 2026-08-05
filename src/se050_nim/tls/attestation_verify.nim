@@ -60,11 +60,16 @@ proc semanticFailure(
 # Public API
 # =============================================================================
 
-proc verifyTlsIdentityAttestationSemantics*(
+proc verifyTlsIdentityAttestationSemanticsForOrigin(
     attested: AttestedObjectRead,
-    profile: TlsIdentityProfile
+    profile: TlsIdentityProfile,
+    expectedOrigin: uint8
 ): SE[TlsIdentityAttestationSemantics] =
-  ## Validates the signed fields needed to accept one TLS client identity key.
+  ## Validates the signed fields common to internal and imported TLS keys.
+  ##
+  ## The expected origin is deliberately kept in this private helper. Public
+  ## callers use separate internal/imported entry points so origin validation
+  ## cannot be weakened accidentally.
   ##
   ## Certificate-chain and ECDSA attestation-signature checks must be completed
   ## separately before the caller treats these semantics as trusted.
@@ -152,9 +157,9 @@ proc verifyTlsIdentityAttestationSemantics*(
       &"TLS identity object owner auth ID must be 0x{DefaultAuthObjectId.toHex(8)}"
     )
 
-  if attributes.value.origin != Se050ObjectOriginInternal:
+  if attributes.value.origin != expectedOrigin:
     return semanticFailure(
-      &"TLS identity key origin must be internal; got {objectOriginName(attributes.value.origin)}"
+      &"TLS identity key origin must be {objectOriginName(expectedOrigin)}; got {objectOriginName(attributes.value.origin)}"
     )
 
   if not attributes.value.objectVersionPresent:
@@ -192,3 +197,32 @@ proc verifyTlsIdentityAttestationSemantics*(
     objectSize: objectSize.value,
     publicKey: attested.response.objectData
   ))
+
+proc verifyTlsIdentityAttestationSemantics*(
+    attested: AttestedObjectRead,
+    profile: TlsIdentityProfile
+): SE[TlsIdentityAttestationSemantics] =
+  ## Validates an internally generated TLS client identity key.
+  ##
+  ## This preserves the original strict behavior: the signed object origin must
+  ## be SE050 internal generation.
+  result = verifyTlsIdentityAttestationSemanticsForOrigin(
+    attested = attested,
+    profile = profile,
+    expectedOrigin = Se050ObjectOriginInternal
+  )
+
+proc verifyImportedTlsIdentityAttestationSemantics*(
+    attested: AttestedObjectRead,
+    profile: TlsIdentityProfile
+): SE[TlsIdentityAttestationSemantics] =
+  ## Validates an externally generated TLS client identity imported into SE050.
+  ##
+  ## All TLS profile, P-256, policy, object-size, and public-key checks are
+  ## identical to the internal path. Only the required signed origin differs.
+  result = verifyTlsIdentityAttestationSemanticsForOrigin(
+    attested = attested,
+    profile = profile,
+    expectedOrigin = Se050ObjectOriginExternal
+  )
+

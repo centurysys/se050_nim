@@ -7,9 +7,9 @@
 # live ReadType/ReadPublicKey results with NXP attestation so persistence,
 # object type, policy, origin, and public-key binding are all verified.
 #
-# The current TLS identity profile is intentionally limited to internally
-# generated P-256 key pairs. Imported-key support will add an explicit origin
-# expectation later rather than weakening these checks.
+# Internal and imported P-256 keys intentionally use separate public entry
+# points. They share all live and attestation checks except for the explicitly
+# required signed object origin.
 
 import std/options
 import std/strformat
@@ -33,6 +33,10 @@ import ./attestation_verify
 # =============================================================================
 
 type
+  TlsIdentityOriginMode = enum
+    tiomInternal,
+    tiomImported
+
   TlsIdentityLiveInfo* = object
     profile*: TlsIdentityProfile
     objectType*: uint8
@@ -43,14 +47,18 @@ type
 # Public API
 # =============================================================================
 
-proc inspectTlsIdentity*(
+proc inspectTlsIdentityForOrigin(
     se: Se050Transport,
-    profile: TlsIdentityProfile
+    profile: TlsIdentityProfile,
+    originMode: TlsIdentityOriginMode
 ): SE[TlsIdentityLiveInfo] =
-  ## Performs the trust checks required before accepting an existing TLS key.
+  ## Performs the trust checks shared by internal and imported TLS keys.
+  ##
+  ## The origin mode is private to this module. Public callers must select one
+  ## of the explicit internal/imported entry points below.
   ##
   ## The object type and persistence come from the live ReadType response.
-  ## Object ID, key type, internal origin, policy, and public key are then
+  ## Object ID, key type, expected origin, policy, and public key are then
   ## independently bound by NXP ReadObject-with-Attestation.
   if not profile.isValid():
     return fail[TlsIdentityLiveInfo](
@@ -147,10 +155,18 @@ proc inspectTlsIdentity*(
       signature.error.sw
     )
 
-  let semantics = verifyTlsIdentityAttestationSemantics(
-    attested = attested.value,
-    profile = profile
-  )
+  let semantics =
+    case originMode
+    of tiomInternal:
+      verifyTlsIdentityAttestationSemantics(
+        attested = attested.value,
+        profile = profile
+      )
+    of tiomImported:
+      verifyImportedTlsIdentityAttestationSemantics(
+        attested = attested.value,
+        profile = profile
+      )
   if not semantics.ok:
     return fail[TlsIdentityLiveInfo](
       semantics.error.kind,
@@ -170,3 +186,27 @@ proc inspectTlsIdentity*(
     publicKey: livePublicKey.value,
     semantics: semantics.value
   ))
+
+proc inspectTlsIdentity*(
+    se: Se050Transport,
+    profile: TlsIdentityProfile
+): SE[TlsIdentityLiveInfo] =
+  ## Validates an internally generated persistent TLS identity.
+  result = inspectTlsIdentityForOrigin(
+    se = se,
+    profile = profile,
+    originMode = tiomInternal
+  )
+
+proc inspectImportedTlsIdentity*(
+    se: Se050Transport,
+    profile: TlsIdentityProfile
+): SE[TlsIdentityLiveInfo] =
+  ## Validates an externally generated persistent TLS identity imported into
+  ## the managed TLS object slot.
+  result = inspectTlsIdentityForOrigin(
+    se = se,
+    profile = profile,
+    originMode = tiomImported
+  )
+
