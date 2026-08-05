@@ -6,9 +6,9 @@
 # key encoder. The final file is installed atomically without overwriting an
 # existing path and is created with private-key-style 0600 permissions.
 #
-# The current implementation is intentionally limited to the existing P-256,
-# internally generated TLS identity profile. Multi-algorithm and imported-key
-# support will extend the identity validation model before using this path.
+# P-256 internally generated and externally imported TLS identities use
+# separate public export entry points. Both produce the same NXP reference-key
+# format; only the required live attestation origin differs.
 
 import std/os
 import std/posix_utils
@@ -123,16 +123,16 @@ proc writeP256ReferenceKeyFile*(
 
   result = writeReferenceKeyPemAtomic(outputPath, pem)
 
-proc writeTlsReferenceKeyFile*(
+proc writeTlsReferenceKeyFileForOrigin(
     se: Se050Transport,
     profile: TlsIdentityProfile,
-    outputPath: string
+    outputPath: string,
+    imported: bool
 ): SE[TlsIdentityLiveInfo] =
-  ## Validates one live TLS identity and writes its OpenSSL reference-key PEM.
+  ## Shared implementation for the explicit internal/imported public APIs.
   ##
-  ## Existing paths are never overwritten. The returned live information is the
-  ## exact identity state that was validated and used to create the file, so a
-  ## CLI caller does not need to inspect the SE050 object a second time.
+  ## `imported` is deliberately private to this module. Public callers cannot
+  ## weaken origin validation by supplying an arbitrary expected origin.
   let outputChecked = validateReferenceKeyOutputPath(outputPath)
   if not outputChecked.ok:
     return fail[TlsIdentityLiveInfo](
@@ -164,7 +164,12 @@ proc writeTlsReferenceKeyFile*(
       &"TLS identity {profile.name} identity {profile.identity} slot {profile.slot.slotName()} does not exist"
     )
 
-  let inspected = se.inspectTlsIdentity(profile)
+  let inspected =
+    if imported:
+      se.inspectImportedTlsIdentity(profile)
+    else:
+      se.inspectTlsIdentity(profile)
+
   if not inspected.ok:
     return fail[TlsIdentityLiveInfo](
       inspected.error.kind,
@@ -185,3 +190,34 @@ proc writeTlsReferenceKeyFile*(
     )
 
   result = ok(inspected.value)
+
+proc writeTlsReferenceKeyFile*(
+    se: Se050Transport,
+    profile: TlsIdentityProfile,
+    outputPath: string
+): SE[TlsIdentityLiveInfo] =
+  ## Validates an internally generated TLS identity and writes its reference key.
+  ##
+  ## Existing behavior remains strict: signed origin must be internal.
+  result = writeTlsReferenceKeyFileForOrigin(
+    se = se,
+    profile = profile,
+    outputPath = outputPath,
+    imported = false
+  )
+
+proc writeImportedTlsReferenceKeyFile*(
+    se: Se050Transport,
+    profile: TlsIdentityProfile,
+    outputPath: string
+): SE[TlsIdentityLiveInfo] =
+  ## Validates an externally imported TLS identity and writes its reference key.
+  ##
+  ## The file format is identical to the internally generated path, but the
+  ## signed SE050 object origin is required to be external.
+  result = writeTlsReferenceKeyFileForOrigin(
+    se = se,
+    profile = profile,
+    outputPath = outputPath,
+    imported = true
+  )

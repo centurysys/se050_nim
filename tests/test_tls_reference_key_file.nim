@@ -113,3 +113,21 @@ suite "TLS OpenSSL reference-key file export":
     check written.error.kind == seInvalidArgument
     check written.error.message == "TLS identity profile is invalid"
     check not fileExists(outputPath)
+
+  test "imported live export rejects an invalid profile before transport access":
+    let directory = createTempDir("se050-refkey-", "")
+    defer:
+      removeTestDirectory(directory)
+
+    let outputPath = directory / "device.key"
+    var profile = testTlsIdentityProfile(0'u16, tisSlotA)
+    profile.keyRole = "invalid-role"
+
+    let se: Se050Transport = nil
+    let written = se.writeImportedTlsReferenceKeyFile(profile, outputPath)
+
+    check not written.ok
+    check written.error.kind == seInvalidArgument
+    check written.error.message == "TLS identity profile is invalid"
+    check not fileExists(outputPath)
+

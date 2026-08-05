@@ -999,7 +999,8 @@ proc runTlsKeyRefFile(
     profileText: string,
     identityText: string,
     slotText: string,
-    outputPath: string
+    outputPath: string,
+    imported: bool
 ): int =
   ## Exports one validated TLS identity as an NXP OpenSSL reference-key PEM.
   let profile = parseTlsIdentityProfile(profileText, identityText, slotText)
@@ -1007,7 +1008,11 @@ proc runTlsKeyRefFile(
     raise newException(ValueError, "--out is required for tls-key-ref-file")
 
   let se = openAndRequestAtr(busText, addressText, debug)
-  let written = se.writeTlsReferenceKeyFile(profile, outputPath)
+  let written =
+    if imported:
+      se.writeImportedTlsReferenceKeyFile(profile, outputPath)
+    else:
+      se.writeTlsReferenceKeyFile(profile, outputPath)
   if not written.ok:
     printSe050Error("TLS reference-key export failed", written.error)
     return 1
@@ -1016,6 +1021,8 @@ proc runTlsKeyRefFile(
   echo &"identity: {profile.identity}"
   echo &"slot: {profile.slot.slotName()}"
   echo "format: NXP P-256 reference-key PEM"
+  let provisioning = if imported: "externally imported" else: "SE050 internally generated"
+  echo &"provisioning: {provisioning}"
   echo "private key material: not exported"
   result = 0
 
@@ -1027,7 +1034,8 @@ proc runTlsKeyPubkey(
     identityText: string,
     slotText: string,
     formatText: string,
-    outputPath: string
+    outputPath: string,
+    imported: bool
 ): int =
   ## Exports the validated TLS identity public key for CSR/key matching.
   let profile = parseTlsIdentityProfile(profileText, identityText, slotText)
@@ -1050,7 +1058,11 @@ proc runTlsKeyPubkey(
     )
     return 1
 
-  let inspected = inspectTlsIdentity(se, profile)
+  let inspected =
+    if imported:
+      inspectImportedTlsIdentity(se, profile)
+    else:
+      inspectTlsIdentity(se, profile)
   if not inspected.ok:
     printSe050Error("TLS identity validation failed", inspected.error)
     return 1
@@ -1075,6 +1087,8 @@ proc runTlsKeyPubkey(
   echo &"slot: {profile.slot.slotName()}"
   echo &"format: {formatName}"
   echo &"length: {output.len}"
+  let provisioning = if imported: "externally imported" else: "SE050 internally generated"
+  echo &"provisioning: {provisioning}"
   result = 0
 
 proc runTlsKeyImport(
@@ -1176,7 +1190,8 @@ proc runTlsKeyInfo(
     debug: bool,
     profileText: string,
     identityText: string,
-    slotText: string
+    slotText: string,
+    imported: bool
 ): int =
   let profile = parseTlsIdentityProfile(profileText, identityText, slotText)
   let se = openAndRequestAtr(busText, addressText, debug)
@@ -1195,12 +1210,18 @@ proc runTlsKeyInfo(
     )
     return 1
 
-  let inspected = inspectTlsIdentity(se, profile)
+  let inspected =
+    if imported:
+      inspectImportedTlsIdentity(se, profile)
+    else:
+      inspectTlsIdentity(se, profile)
   if not inspected.ok:
     printSe050Error("TLS identity validation failed", inspected.error)
     return 1
 
   printTlsIdentityInfo(inspected.value, none(bool))
+  let provisioning = if imported: "externally imported" else: "SE050 internally generated"
+  echo &"  provisioning: {provisioning}"
   result = 0
 
 proc runUid(busText: string, addressText: string, debug: bool, separator: string): int =
@@ -2087,6 +2108,7 @@ proc main(): int =
       option("--identity", default = some("0"), help = "TLS identity number, default: 0")
       option("--slot", required = true, help = "TLS identity slot: A or B")
       option("--out", required = true, help = "Output reference-key PEM file; existing paths are not overwritten")
+      flag("--imported", help = "Require an externally imported TLS key instead of the default internally generated key")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
         quit(runTlsKeyRefFile(
@@ -2096,7 +2118,8 @@ proc main(): int =
           opts.profile,
           opts.identity,
           opts.slot,
-          opts.out
+          opts.out,
+          opts.imported
         ))
 
     command("tls-key-pubkey"):
@@ -2108,6 +2131,7 @@ proc main(): int =
       option("--slot", required = true, help = "TLS identity slot: A or B")
       option("--format", default = some("spki-der"), help = "Output format: raw or spki-der, default: spki-der")
       option("--out", required = true, help = "Output file")
+      flag("--imported", help = "Require an externally imported TLS key instead of the default internally generated key")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
         quit(runTlsKeyPubkey(
@@ -2118,7 +2142,8 @@ proc main(): int =
           opts.identity,
           opts.slot,
           opts.format,
-          opts.out
+          opts.out,
+          opts.imported
         ))
 
     command("tls-key-import"):
@@ -2168,6 +2193,7 @@ proc main(): int =
       option("--profile", required = true, help = "TLS identity profile: test or production")
       option("--identity", default = some("0"), help = "TLS identity number, default: 0")
       option("--slot", required = true, help = "TLS identity slot: A or B")
+      flag("--imported", help = "Require an externally imported TLS key instead of the default internally generated key")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
         quit(runTlsKeyInfo(
@@ -2176,7 +2202,8 @@ proc main(): int =
           opts.debug,
           opts.profile,
           opts.identity,
-          opts.slot
+          opts.slot,
+          opts.imported
         ))
 
     command("exists"):
