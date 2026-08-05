@@ -10,6 +10,7 @@ BUS="0"
 ADDRESS="0x48"
 SSS_PORT="${EX_SSS_BOOT_SSS_PORT:-/dev/i2c-0:0x48}"
 BASE_PORT="18453"
+IMPORTED=0
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CLIENT_BIN="$SCRIPT_DIR/std_net_mtls_client"
@@ -36,6 +37,8 @@ Options:
   --base-port N         TLS 1.3 port; TLS 1.2 uses N+1 (default: 18453)
   --client PATH          prebuilt ARM64 std/net client
                          (default: tools/std_net_mtls_client beside this script)
+  --imported             require an externally imported TLS identity
+                         (default: internally generated identity)
   -h, --help            show this help
 USAGE
 }
@@ -52,6 +55,7 @@ while [[ $# -gt 0 ]]; do
     --sss-port) SSS_PORT="$2"; shift 2 ;;
     --base-port) BASE_PORT="$2"; shift 2 ;;
     --client) CLIENT_BIN="$2"; shift 2 ;;
+    --imported) IMPORTED=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -113,6 +117,14 @@ echo "workdir: $WORKDIR"
 
 export EX_SSS_BOOT_SSS_PORT="$SSS_PORT"
 
+origin_args=()
+if (( IMPORTED == 1 )); then
+  origin_args+=(--imported)
+  echo "TLS identity provisioning: externally imported"
+else
+  echo "TLS identity provisioning: SE050 internally generated"
+fi
+
 REFERENCE_KEY="$WORKDIR/device.key"
 LIVE_PUBLIC_DER="$WORKDIR/se050-public.der"
 CLIENT_PUBLIC_DER="$WORKDIR/client-public.der"
@@ -124,6 +136,7 @@ OPENSSL_CNF="$WORKDIR/openssl.cnf"
   --profile "$PROFILE" \
   --identity "$IDENTITY" \
   --slot "$SLOT" \
+  "${origin_args[@]}" \
   --out "$REFERENCE_KEY"
 
 mode="$(stat -c '%a' "$REFERENCE_KEY")"
@@ -140,6 +153,7 @@ echo "reference-key permissions: 0600"
   --profile "$PROFILE" \
   --identity "$IDENTITY" \
   --slot "$SLOT" \
+  "${origin_args[@]}" \
   --format spki-der \
   --out "$LIVE_PUBLIC_DER"
 
