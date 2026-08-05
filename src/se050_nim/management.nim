@@ -24,6 +24,20 @@ const
   P1Default = 0x00'u8
   P2Version = 0x20'u8
 
+  # SE05x ReadECCurveList:
+  #   CLA = 0x80
+  #   INS = INS_READ = 0x02
+  #   P1  = P1_CURVE = 0x0B
+  #   P2  = P2_LIST  = 0x25
+  #   Le  = 0x00
+  CurveListCla = 0x80'u8
+  CurveListInsRead = 0x02'u8
+  CurveListP1Curve = 0x0B'u8
+  CurveListP2List = 0x25'u8
+
+  SetIndicatorNotSet = 0x01'u8
+  SetIndicatorSet = 0x02'u8
+
   ConfigEcdaa* = 0x0001'u16
   ConfigEcdsaEcdhEcdhe* = 0x0002'u16
   ConfigEddsa* = 0x0004'u16
@@ -51,6 +65,24 @@ type
     appletConfig*: uint16
     secureBoxMajor*: uint8
     secureBoxMinor*: uint8
+
+  EcCurveSetState* = enum
+    ## ReadECCurveList state for one Weierstrass curve identifier.
+    ##
+    ## "Set" means the curve parameters are instantiated in the SE05x and the
+    ## curve is available to EC key commands. It is deliberately not named
+    ## "supported": ReadECCurveList reports current instantiation state, not the
+    ## complete silicon capability matrix.
+    ecCurveNotSet,
+    ecCurveSet
+
+  EcCurveListInfo* = object
+    ## SetIndicator values returned by ReadECCurveList.
+    ##
+    ## Index 0 corresponds to curve ID 0x01, index 1 to 0x02, and so on.
+    ## Keeping this as a sequence lets newer applets append future Weierstrass
+    ## identifiers without making the parser reject an otherwise valid response.
+    indicators*: seq[uint8]
 
 # =============================================================================
 # Internal helpers
@@ -94,6 +126,157 @@ proc knownFeatureBits*(): seq[uint16] =
     ConfigFipsModeDisabled,
     ConfigI2cm,
   ]
+
+proc ecCurveName*(curveId: uint8): string =
+  ## Human-readable names for the consecutive SE05x Weierstrass curve IDs.
+  result = case curveId
+  of 0x01'u8: "NIST P-192"
+  of 0x02'u8: "NIST P-224"
+  of 0x03'u8: "NIST P-256"
+  of 0x04'u8: "NIST P-384"
+  of 0x05'u8: "NIST P-521"
+  of 0x06'u8: "Brainpool P-160"
+  of 0x07'u8: "Brainpool P-192"
+  of 0x08'u8: "Brainpool P-224"
+  of 0x09'u8: "Brainpool P-256"
+  of 0x0A'u8: "Brainpool P-320"
+  of 0x0B'u8: "Brainpool P-384"
+  of 0x0C'u8: "Brainpool P-512"
+  of 0x0D'u8: "secp160k1"
+  of 0x0E'u8: "secp192k1"
+  of 0x0F'u8: "secp224k1"
+  of 0x10'u8: "secp256k1"
+  of 0x11'u8: "TPM ECC BN P-256"
+  else: &"curve 0x{curveId.toHex(2)}"
+
+proc buildReadEcCurveListApdu*(): seq[uint8] =
+  ## Builds the no-payload ReadECCurveList Case-2 short APDU.
+  result = @[
+    CurveListCla,
+    CurveListInsRead,
+    CurveListP1Curve,
+    CurveListP2List,
+    0x00'u8 # Le
+  ]
+
+proc parseReadEcCurveListResponse*(
+    response: openArray[uint8]
+): SE[EcCurveListInfo] =
+  ## Parses ReadECCurveList TAG_1 SetIndicator bytes.
+  ##
+  ## SE05x_ECCurve_t assigns the Weierstrass identifiers consecutively from
+  ## 0x01. Therefore TAG_1 byte zero describes curve 0x01, byte one describes
+  ## curve 0x02, etc.
+  let st = checkStatus(response, "ReadECCurveList")
+  if not st.ok:
+    return fail[EcCurveListInfo](
+      st.error.kind,
+      st.error.message,
+      st.error.sw
+    )
+
+  let data = dataWithoutStatus(response)
+  if not data.ok:
+    return fail[EcCurveListInfo](
+      data.error.kind,
+      data.error.message,
+      data.error.sw
+    )
+
+  if data.value.len < 2:
+    return fail[EcCurveListInfo](
+      seInvalidResponse,
+      "ReadECCurveList response does not contain TAG_1"
+    )
+
+  if data.value[0] != Tag1:
+    return fail[EcCurveListInfo](
+      seInvalidResponse,
+      "ReadECCurveList response does not start with TAG_1"
+    )
+
+  let tlvLen = readTlvLength(data.value, 1)
+  if not tlvLen.ok:
+    return fail[EcCurveListInfo](
+      tlvLen.error.kind,
+      tlvLen.error.message,
+      tlvLen.error.sw
+    )
+
+  let valueStart = tlvLen.value.nextIndex
+  let valueEnd = valueStart + tlvLen.value.length
+  if valueEnd > data.value.len:
+    return fail[EcCurveListInfo](
+      seInvalidResponse,
+      "ReadECCurveList TAG_1 value is truncated"
+    )
+
+  if valueEnd != data.value.len:
+    return fail[EcCurveListInfo](
+      seInvalidResponse,
+      "ReadECCurveList response contains trailing data"
+    )
+
+  if tlvLen.value.length == 0:
+    return fail[EcCurveListInfo](
+      seInvalidResponse,
+      "ReadECCurveList returned an empty curve list"
+    )
+
+  var indicators = newSeq[uint8](tlvLen.value.length)
+  for i in 0 ..< tlvLen.value.length:
+    let indicator = data.value[valueStart + i]
+    if indicator != SetIndicatorNotSet and indicator != SetIndicatorSet:
+      return fail[EcCurveListInfo](
+        seInvalidResponse,
+        &"ReadECCurveList contains invalid SetIndicator 0x{indicator.toHex(2)} at curve ID 0x{(i + 1).toHex(2)}"
+      )
+    indicators[i] = indicator
+
+  result = ok(EcCurveListInfo(indicators: indicators))
+
+proc ecCurveSetState*(
+    info: EcCurveListInfo,
+    curveId: uint8
+): SE[EcCurveSetState] =
+  ## Returns the current instantiation state for one Weierstrass curve ID.
+  if curveId == 0'u8 or curveId >= 0x40'u8:
+    return fail[EcCurveSetState](
+      seInvalidArgument,
+      &"curve ID 0x{curveId.toHex(2)} is not a Weierstrass curve identifier"
+    )
+
+  let index = int(curveId) - 1
+  if index >= info.indicators.len:
+    return fail[EcCurveSetState](
+      seInvalidArgument,
+      &"curve ID 0x{curveId.toHex(2)} is not present in this ReadECCurveList response"
+    )
+
+  case info.indicators[index]
+  of SetIndicatorNotSet:
+    result = ok(ecCurveNotSet)
+  of SetIndicatorSet:
+    result = ok(ecCurveSet)
+  else:
+    result = fail[EcCurveSetState](
+      seInvalidResponse,
+      &"invalid SetIndicator for curve ID 0x{curveId.toHex(2)}"
+    )
+
+proc isEcCurveInstantiated*(
+    info: EcCurveListInfo,
+    curveId: uint8
+): SE[bool] =
+  let state = info.ecCurveSetState(curveId)
+  if not state.ok:
+    return fail[bool](
+      state.error.kind,
+      state.error.message,
+      state.error.sw
+    )
+
+  result = ok(state.value == ecCurveSet)
 
 proc buildGetVersionApduWithEmptyLc(): seq[uint8] =
   ## GetVersion has no payload. AN12413 lists an Lc field and Le=0x00.
@@ -175,6 +358,33 @@ proc parseGetVersionResponse(response: openArray[uint8]): SE[Se050VersionInfo] =
 # =============================================================================
 # API
 # =============================================================================
+
+proc readEcCurveList*(
+    se: Se050Transport,
+    selectFirst: bool = true
+): SE[EcCurveListInfo] =
+  ## Reads the current Weierstrass-curve instantiation state from the SE05x.
+  ##
+  ## This is a read-only diagnostic operation. It does not create, modify, or
+  ## delete any curve parameters.
+  if selectFirst:
+    let selected = se.selectApplet()
+    if not selected.ok:
+      return fail[EcCurveListInfo](
+        selected.error.kind,
+        selected.error.message,
+        selected.error.sw
+      )
+
+  let response = se.transceiveApdu(buildReadEcCurveListApdu())
+  if not response.ok:
+    return fail[EcCurveListInfo](
+      response.error.kind,
+      response.error.message,
+      response.error.sw
+    )
+
+  result = parseReadEcCurveListResponse(response.value)
 
 proc getVersionInfo*(
     se: Se050Transport,

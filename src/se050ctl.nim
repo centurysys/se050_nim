@@ -1257,6 +1257,46 @@ proc runRandom(
   echo randomHex.value
   result = 0
 
+proc runCurveList(
+    busText: string,
+    addressText: string,
+    debug: bool
+): int =
+  let se = openAndRequestAtr(busText, addressText, debug)
+
+  let curves = se.readEcCurveList(selectFirst = true)
+  if not curves.ok:
+    printSe050Error("ReadECCurveList failed", curves.error)
+    return 1
+
+  echo "Weierstrass EC curves:"
+  echo "  state describes current SE05x curve instantiation, not silicon capability"
+
+  for index, indicator in curves.value.indicators:
+    let curveId = uint8(index + 1)
+    let state =
+      case indicator
+      of 0x01'u8: "not-set"
+      of 0x02'u8: "set"
+      else: "invalid"
+
+    echo &"  0x{curveId.toHex(2)} {ecCurveName(curveId)}: {state}"
+
+  echo "TLS import candidates:"
+  for curveId in [
+      Se050CurveNistP256,
+      Se050CurveNistP384,
+      Se050CurveNistP521
+  ]:
+    let instantiated = curves.value.isEcCurveInstantiated(curveId)
+    if not instantiated.ok:
+      echo &"  {ecCurveName(curveId)}: unavailable ({instantiated.error.message})"
+    else:
+      let state = if instantiated.value: "instantiated" else: "not instantiated"
+      echo &"  {ecCurveName(curveId)}: {state}"
+
+  result = 0
+
 proc runVersion(
     busText: string,
     addressText: string,
@@ -2024,6 +2064,14 @@ proc main(): int =
       run:
         let separator = if opts.colon: ":" else: ""
         quit(runRandom(opts.bus, opts.address, opts.debug, opts.len, separator))
+
+    command("curve-list"):
+      help("Read the currently instantiated SE05x Weierstrass EC curves.")
+      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
+      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      flag("-d", "--debug", help = "Print T=1 over I2C frames")
+      run:
+        quit(runCurveList(opts.bus, opts.address, opts.debug))
 
     command("version"):
       help("Read SE050 applet version and feature configuration.")

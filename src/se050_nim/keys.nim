@@ -50,6 +50,8 @@ const
 
   # ECCurve constants.
   Se050CurveNistP256* = 0x03'u8
+  Se050CurveNistP384* = 0x04'u8
+  Se050CurveNistP521* = 0x05'u8
   Se050CurveX25519* = 0x41'u8
 
   # SecureObjectType constants used by ReadType after key generation.
