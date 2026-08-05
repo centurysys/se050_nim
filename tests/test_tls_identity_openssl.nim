@@ -64,3 +64,40 @@ suite "SE050 TLS identity OpenSSL Provider references":
     compressed[0] = 0x02'u8
     expect ValueError:
       discard p256PublicKeyToSpkiDer(compressed)
+
+
+  test "wraps an uncompressed P-384 public key as SubjectPublicKeyInfo DER":
+    var raw = @[0x04'u8]
+    for i in 0 ..< 96:
+      raw.add(uint8(i))
+
+    let der = p384PublicKeyToSpkiDer(raw)
+    check der.len == 120
+    check der[0] == 0x30'u8
+    check der[1] == 0x76'u8
+    check der[2 .. 3] == @[0x30'u8, 0x10'u8]
+    check der[13 .. 19] == @[
+      0x06'u8, 0x05'u8, 0x2B'u8, 0x81'u8, 0x04'u8, 0x00'u8, 0x22'u8
+    ]
+    check der[20 .. 22] == @[0x03'u8, 0x62'u8, 0x00'u8]
+    check der[23 .. ^1] == raw
+
+  test "rejects invalid P-384 public key encodings":
+    expect ValueError:
+      discard p384PublicKeyToSpkiDer(newSeq[uint8](96))
+
+    var compressed = newSeq[uint8](97)
+    compressed[0] = 0x03'u8
+    expect ValueError:
+      discard p384PublicKeyToSpkiDer(compressed)
+
+  test "dispatches managed TLS public-key SPKI conversion by curve":
+    var p256 = newSeq[uint8](65)
+    p256[0] = 0x04'u8
+    check ecPublicKeyToSpkiDer(ecCurveP256, p256) ==
+      p256PublicKeyToSpkiDer(p256)
+
+    var p384 = newSeq[uint8](97)
+    p384[0] = 0x04'u8
+    check ecPublicKeyToSpkiDer(ecCurveP384, p384) ==
+      p384PublicKeyToSpkiDer(p384)

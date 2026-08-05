@@ -4,8 +4,8 @@
 #
 # Cryptographic signature and certificate-chain validation prove that a
 # ReadObject-with-Attestation response came from a trusted SE050. This layer
-# additionally proves that the signed Secure Object is the exact P-256 TLS
-# client identity key required by the selected A/B profile.
+# additionally proves that the signed Secure Object is the exact TLS client
+# identity key and EC curve required by the selected A/B profile.
 #
 # Persistence is intentionally not claimed here: Applet 7.2 attested attributes
 # do not include the ReadType TransientIndicator. Callers that require a
@@ -28,8 +28,10 @@ import ./profile
 
 const
   TlsIdentityAttestationFreshnessLength* = 16
-  TlsIdentityP256PublicKeyLength* = 65
+  TlsIdentityP256PublicKeyLength* = Se050P256UncompressedPublicKeyLength
   TlsIdentityP256PrivateKeySizeBytes* = 32'u16
+  TlsIdentityP384PublicKeyLength* = Se050P384UncompressedPublicKeyLength
+  TlsIdentityP384PrivateKeySizeBytes* = 48'u16
   Se050AttestationTimestampLength = 12
   DefaultAuthObjectId = 0'u32
 
@@ -60,11 +62,16 @@ proc semanticFailure(
 # Public API
 # =============================================================================
 
-proc verifyTlsIdentityAttestationSemantics*(
+proc verifyTlsIdentityAttestationSemanticsForOrigin(
     attested: AttestedObjectRead,
-    profile: TlsIdentityProfile
+    profile: TlsIdentityProfile,
+    expectedOrigin: uint8
 ): SE[TlsIdentityAttestationSemantics] =
-  ## Validates the signed fields needed to accept one TLS client identity key.
+  ## Validates the signed fields common to internal and imported TLS keys.
+  ##
+  ## The expected origin is deliberately kept in this private helper. Public
+  ## callers use separate internal/imported entry points so origin validation
+  ## cannot be weakened accidentally.
   ##
   ## Certificate-chain and ECDSA attestation-signature checks must be completed
   ## separately before the caller treats these semantics as trusted.
@@ -97,10 +104,11 @@ proc verifyTlsIdentityAttestationSemantics*(
   if not attested.response.objectDataPresent:
     return semanticFailure("attestation response does not contain a public key")
 
-  if attested.response.objectData.len != TlsIdentityP256PublicKeyLength or
+  let expectedPublicKeyLength = profile.expectedPublicKeyLength()
+  if attested.response.objectData.len != expectedPublicKeyLength or
       attested.response.objectData[0] != 0x04'u8:
     return semanticFailure(
-      "attested public key is not a 65-byte uncompressed P-256 point"
+      &"attested public key is not a {expectedPublicKeyLength}-byte uncompressed {profile.curve.curveDisplayName()} point"
     )
 
   if attested.response.chipId.len != Se050UidLength:
@@ -121,9 +129,10 @@ proc verifyTlsIdentityAttestationSemantics*(
       objectSize.error.sw
     )
 
-  if objectSize.value != TlsIdentityP256PrivateKeySizeBytes:
+  let expectedPrivateKeySize = profile.expectedPrivateKeySizeBytes()
+  if objectSize.value != expectedPrivateKeySize:
     return semanticFailure(
-      &"attested object size must be {TlsIdentityP256PrivateKeySizeBytes} bytes; got {objectSize.value}"
+      &"attested {profile.curve.curveDisplayName()} object size must be {expectedPrivateKeySize} bytes; got {objectSize.value}"
     )
 
   let attributes = parseAttestedObjectAttributes(attested.response.attributes)
@@ -141,7 +150,7 @@ proc verifyTlsIdentityAttestationSemantics*(
 
   if attributes.value.objectType != profile.expectedKeyType():
     return semanticFailure(
-      &"signed object type 0x{attributes.value.objectType.toHex(2)} does not match expected P-256 key-pair type 0x{profile.expectedKeyType().toHex(2)}"
+      &"signed object type 0x{attributes.value.objectType.toHex(2)} does not match expected {profile.curve.curveDisplayName()} key-pair type 0x{profile.expectedKeyType().toHex(2)}"
     )
 
   if attributes.value.authAttribute != Se050SetIndicatorNotSet:
@@ -152,9 +161,9 @@ proc verifyTlsIdentityAttestationSemantics*(
       &"TLS identity object owner auth ID must be 0x{DefaultAuthObjectId.toHex(8)}"
     )
 
-  if attributes.value.origin != Se050ObjectOriginInternal:
+  if attributes.value.origin != expectedOrigin:
     return semanticFailure(
-      &"TLS identity key origin must be internal; got {objectOriginName(attributes.value.origin)}"
+      &"TLS identity key origin must be {objectOriginName(expectedOrigin)}; got {objectOriginName(attributes.value.origin)}"
     )
 
   if not attributes.value.objectVersionPresent:
@@ -192,3 +201,32 @@ proc verifyTlsIdentityAttestationSemantics*(
     objectSize: objectSize.value,
     publicKey: attested.response.objectData
   ))
+
+proc verifyTlsIdentityAttestationSemantics*(
+    attested: AttestedObjectRead,
+    profile: TlsIdentityProfile
+): SE[TlsIdentityAttestationSemantics] =
+  ## Validates an internally generated TLS client identity key.
+  ##
+  ## This preserves the original strict behavior: the signed object origin must
+  ## be SE050 internal generation.
+  result = verifyTlsIdentityAttestationSemanticsForOrigin(
+    attested = attested,
+    profile = profile,
+    expectedOrigin = Se050ObjectOriginInternal
+  )
+
+proc verifyImportedTlsIdentityAttestationSemantics*(
+    attested: AttestedObjectRead,
+    profile: TlsIdentityProfile
+): SE[TlsIdentityAttestationSemantics] =
+  ## Validates an externally generated TLS client identity imported into SE050.
+  ##
+  ## All TLS profile, curve, policy, object-size, and public-key checks are
+  ## identical to the internal path. Only the required signed origin differs.
+  result = verifyTlsIdentityAttestationSemanticsForOrigin(
+    attested = attested,
+    profile = profile,
+    expectedOrigin = Se050ObjectOriginExternal
+  )
+

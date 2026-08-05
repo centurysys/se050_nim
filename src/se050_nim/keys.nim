@@ -13,6 +13,7 @@ import ./transport
 import ./apdu
 import ./tlv
 import ./objects
+import ./secure_memory
 
 # =============================================================================
 # Constants
@@ -23,6 +24,7 @@ const
   Tag1 = 0x41'u8
   Tag2 = 0x42'u8
   Tag3 = 0x43'u8
+  Tag4 = 0x44'u8
   Tag7 = 0x47'u8
 
   # SE05x WriteECKey APDU for generating an EC key pair inside SE050.
@@ -48,13 +50,20 @@ const
 
   # ECCurve constants.
   Se050CurveNistP256* = 0x03'u8
+  Se050CurveNistP384* = 0x04'u8
+  Se050CurveNistP521* = 0x05'u8
   Se050CurveX25519* = 0x41'u8
 
-  # SecureObjectType constants used by ReadType after key generation.
+  # SecureObjectType constants used by ReadType after key creation.
+  # Applet >= 7.2 uses curve-specific EC object types; the P-384 values below
+  # match NXP Plug & Trust se05x_enums.h.
   Se050TypeEcKeyPair* = 0x01'u8
   Se050TypeEcKeyPairNistP256* = 0x29'u8
   Se050TypeEcPrivKeyNistP256* = 0x2A'u8
   Se050TypeEcPubKeyNistP256* = 0x2B'u8
+  Se050TypeEcKeyPairNistP384* = 0x2D'u8
+  Se050TypeEcPrivKeyNistP384* = 0x2E'u8
+  Se050TypeEcPubKeyNistP384* = 0x2F'u8
   Se050TypeEcKeyPairMontDh25519* = 0x69'u8
   Se050TypeEcPrivKeyMontDh25519* = 0x6A'u8
   Se050TypeEcPubKeyMontDh25519* = 0x6B'u8
@@ -132,7 +141,13 @@ const
   # empty reads before the SE050 emits WTX or the final response. Keep the
   # extended wait local to key generation so quick commands keep failing fast.
   KeyGenerationMaxReadRetries = 200
+  KeyImportMaxReadRetries = 200
   CryptoOperationMaxReadRetries = 200
+
+  Se050P256PrivateKeyLength* = 32
+  Se050P256UncompressedPublicKeyLength* = 65
+  Se050P384PrivateKeyLength* = 48
+  Se050P384UncompressedPublicKeyLength* = 97
 
 # =============================================================================
 # Types
@@ -141,7 +156,8 @@ const
 type
   EcCurveKind* = enum
     ecCurveP256,
-    ecCurveX25519
+    ecCurveX25519,
+    ecCurveP384
 
   EcKeyPolicy* = object
     ## Access-rule header for an SE050 EC key object policy entry.
@@ -200,16 +216,25 @@ proc appendTlvBytes(buf: var seq[uint8], tag: uint8, value: openArray[uint8]) =
 proc curveId*(curve: EcCurveKind): uint8 =
   result = case curve
   of ecCurveP256: Se050CurveNistP256
+  of ecCurveP384: Se050CurveNistP384
   of ecCurveX25519: Se050CurveX25519
 
 proc curveName*(curve: EcCurveKind): string =
   result = case curve
   of ecCurveP256: "p256"
+  of ecCurveP384: "p384"
   of ecCurveX25519: "x25519"
+
+proc curveDisplayName*(curve: EcCurveKind): string =
+  result = case curve
+  of ecCurveP256: "P-256"
+  of ecCurveP384: "P-384"
+  of ecCurveX25519: "X25519"
 
 proc expectedKeyPairType*(curve: EcCurveKind): uint8 =
   result = case curve
   of ecCurveP256: Se050TypeEcKeyPairNistP256
+  of ecCurveP384: Se050TypeEcKeyPairNistP384
   of ecCurveX25519: Se050TypeEcKeyPairMontDh25519
 
 proc developmentEcKeyPolicy*(): EcKeyPolicy =
@@ -379,6 +404,110 @@ proc buildGenerateEcKeyPairApdu(
   for b in payload:
     result.value.add(b)
   result.ok = true
+
+proc buildImportWeierstrassKeyPairApdu(
+    objectId: uint32,
+    curveId: uint8,
+    curveName: string,
+    privateKeyLength: int,
+    publicKeyLength: int,
+    privateKey: openArray[uint8],
+    publicKey: openArray[uint8],
+    policy: EcKeyPolicy
+): SE[seq[uint8]] =
+  ## Shared WriteECKey builder for externally generated Weierstrass key pairs.
+  ##
+  ## TAG_3 and TAG_4 must both be present for P1_KEY_PAIR import. Private keys
+  ## are fixed-width big-endian scalars and public keys use uncompressed
+  ## 0x04 || X || Y encoding.
+  ##
+  ## The returned APDU contains the private scalar. Callers must treat it as
+  ## sensitive memory and clear it after use.
+  if privateKey.len != privateKeyLength:
+    return fail[seq[uint8]](
+      seInvalidArgument,
+      curveName & " private key must be exactly " &
+        $privateKeyLength & " bytes"
+    )
+
+  if publicKey.len != publicKeyLength:
+    return fail[seq[uint8]](
+      seInvalidArgument,
+      curveName & " public key must be exactly " &
+        $publicKeyLength & " bytes"
+    )
+
+  if publicKey[0] != 0x04'u8:
+    return fail[seq[uint8]](
+      seInvalidArgument,
+      curveName & " public key must use uncompressed 0x04 || X || Y encoding"
+    )
+
+  var payload: seq[uint8] = @[]
+  defer:
+    secureZero(payload)
+
+  payload.appendTlvBytes(TagPolicy, encodeEcKeyPolicy(policy))
+  payload.appendTlvU32(Tag1, objectId)
+  payload.appendTlvU8(Tag2, curveId)
+  payload.appendTlvBytes(Tag3, privateKey)
+  payload.appendTlvBytes(Tag4, publicKey)
+
+  if payload.len > 255:
+    return fail[seq[uint8]](
+      seApduTooLarge,
+      "WriteECKey " & curveName & " import payload is too large for a short APDU"
+    )
+
+  result.value = @[
+    WriteEcKeyCla,
+    WriteEcKeyIns,
+    WriteEcKeyP1KeyPairEc,
+    WriteEcKeyP2Default,
+    uint8(payload.len)
+  ]
+  for b in payload:
+    result.value.add(b)
+  result.ok = true
+
+proc buildImportP256KeyPairApdu*(
+    objectId: uint32,
+    privateKey: openArray[uint8],
+    publicKey: openArray[uint8],
+    policy: EcKeyPolicy
+): SE[seq[uint8]] =
+  ## Builds a WriteECKey APDU that imports an externally generated P-256 key pair.
+  result = buildImportWeierstrassKeyPairApdu(
+    objectId = objectId,
+    curveId = Se050CurveNistP256,
+    curveName = "P-256",
+    privateKeyLength = Se050P256PrivateKeyLength,
+    publicKeyLength = Se050P256UncompressedPublicKeyLength,
+    privateKey = privateKey,
+    publicKey = publicKey,
+    policy = policy
+  )
+
+proc buildImportP384KeyPairApdu*(
+    objectId: uint32,
+    privateKey: openArray[uint8],
+    publicKey: openArray[uint8],
+    policy: EcKeyPolicy
+): SE[seq[uint8]] =
+  ## Builds a WriteECKey APDU that imports an externally generated P-384 key pair.
+  ##
+  ## The target SE05x must already report NIST P-384 as instantiated. This
+  ## low-level builder deliberately does not query or modify global curve state.
+  result = buildImportWeierstrassKeyPairApdu(
+    objectId = objectId,
+    curveId = Se050CurveNistP384,
+    curveName = "P-384",
+    privateKeyLength = Se050P384PrivateKeyLength,
+    publicKeyLength = Se050P384UncompressedPublicKeyLength,
+    privateKey = privateKey,
+    publicKey = publicKey,
+    policy = policy
+  )
 
 proc buildEcdsaSignApdu*(
     objectId: uint32,
@@ -576,6 +705,160 @@ proc generateP256KeyPair*(
   )
 
 
+proc importP256KeyPair*(
+    se: Se050Transport,
+    objectId: uint32,
+    privateKey: openArray[uint8],
+    publicKey: openArray[uint8],
+    policy: EcKeyPolicy,
+    selectFirst: bool = true
+): SE[void] =
+  ## Imports an externally generated NIST P-256 key pair into SE050.
+  ##
+  ## This is a raw low-level primitive. It deliberately does not check managed
+  ## TLS object ranges, existing-object ownership, certificate matching, or
+  ## attestation semantics. Higher layers must perform those checks before
+  ## calling this function.
+  ##
+  ## The WriteECKey command contains the private scalar, so the complete
+  ## transaction uses the sensitive transport path and the temporary APDU copy
+  ## is cleared before returning.
+  if selectFirst:
+    let selected = se.selectApplet()
+    if not selected.ok:
+      return fail[void](
+        selected.error.kind,
+        selected.error.message,
+        selected.error.sw
+      )
+
+  var apdu = buildImportP256KeyPairApdu(
+    objectId = objectId,
+    privateKey = privateKey,
+    publicKey = publicKey,
+    policy = policy
+  )
+  if not apdu.ok:
+    return fail[void](
+      apdu.error.kind,
+      apdu.error.message,
+      apdu.error.sw
+    )
+
+  defer:
+    secureZero(apdu.value)
+
+  let oldMaxRetries = se.maxRetries
+  if se.maxRetries < KeyImportMaxReadRetries:
+    se.maxRetries = KeyImportMaxReadRetries
+
+  let response = se.transceiveSensitiveApdu(apdu.value)
+  se.maxRetries = oldMaxRetries
+
+  if not response.ok:
+    return fail[void](
+      response.error.kind,
+      response.error.message,
+      response.error.sw
+    )
+
+  result = checkStatus(response.value, "WriteECKey")
+
+proc importP256KeyPair*(
+    se: Se050Transport,
+    objectId: uint32,
+    privateKey: openArray[uint8],
+    publicKey: openArray[uint8],
+    selectFirst: bool = true
+): SE[void] =
+  ## Imports a P-256 key pair using the historical development EC-key policy.
+  ##
+  ## Product TLS provisioning should pass the managed TLS profile policy
+  ## explicitly rather than using this convenience overload.
+  result = se.importP256KeyPair(
+    objectId = objectId,
+    privateKey = privateKey,
+    publicKey = publicKey,
+    policy = developmentEcKeyPolicy(),
+    selectFirst = selectFirst
+  )
+
+proc importP384KeyPair*(
+    se: Se050Transport,
+    objectId: uint32,
+    privateKey: openArray[uint8],
+    publicKey: openArray[uint8],
+    policy: EcKeyPolicy,
+    selectFirst: bool = true
+): SE[void] =
+  ## Imports an externally generated NIST P-384 key pair into SE050.
+  ##
+  ## This is a raw low-level primitive. The caller must ensure that NIST P-384
+  ## is already instantiated and must perform object ownership, certificate,
+  ## policy, and attestation checks at the appropriate higher layer.
+  ##
+  ## The WriteECKey command contains the private scalar, so the complete
+  ## transaction uses the sensitive transport path and the temporary APDU copy
+  ## is cleared before returning.
+  if selectFirst:
+    let selected = se.selectApplet()
+    if not selected.ok:
+      return fail[void](
+        selected.error.kind,
+        selected.error.message,
+        selected.error.sw
+      )
+
+  var apdu = buildImportP384KeyPairApdu(
+    objectId = objectId,
+    privateKey = privateKey,
+    publicKey = publicKey,
+    policy = policy
+  )
+  if not apdu.ok:
+    return fail[void](
+      apdu.error.kind,
+      apdu.error.message,
+      apdu.error.sw
+    )
+
+  defer:
+    secureZero(apdu.value)
+
+  let oldMaxRetries = se.maxRetries
+  if se.maxRetries < KeyImportMaxReadRetries:
+    se.maxRetries = KeyImportMaxReadRetries
+
+  let response = se.transceiveSensitiveApdu(apdu.value)
+  se.maxRetries = oldMaxRetries
+
+  if not response.ok:
+    return fail[void](
+      response.error.kind,
+      response.error.message,
+      response.error.sw
+    )
+
+  result = checkStatus(response.value, "WriteECKey")
+
+proc importP384KeyPair*(
+    se: Se050Transport,
+    objectId: uint32,
+    privateKey: openArray[uint8],
+    publicKey: openArray[uint8],
+    selectFirst: bool = true
+): SE[void] =
+  ## Imports a P-384 key pair using the historical development EC-key policy.
+  ##
+  ## Product TLS provisioning should pass its managed profile policy explicitly.
+  result = se.importP384KeyPair(
+    objectId = objectId,
+    privateKey = privateKey,
+    publicKey = publicKey,
+    policy = developmentEcKeyPolicy(),
+    selectFirst = selectFirst
+  )
+
 proc readPublicKey*(
     se: Se050Transport,
     objectId: uint32,
@@ -661,7 +944,9 @@ proc deriveSharedSecret*(
   if se.maxRetries < CryptoOperationMaxReadRetries:
     se.maxRetries = CryptoOperationMaxReadRetries
 
-  let response = se.transceiveApdu(apdu.value)
+  # The response contains the derived shared secret, so suppress raw T=1
+  # frame logging and clear temporary transport copies.
+  let response = se.transceiveSensitiveApdu(apdu.value)
   se.maxRetries = oldMaxRetries
 
   if not response.ok:

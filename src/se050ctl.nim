@@ -14,6 +14,7 @@ import std/strutils
 
 import argparse
 import se050_nim
+import se050_nim/secure_memory
 
 # =============================================================================
 # SE050 object namespace policy used by this CLI
@@ -80,12 +81,6 @@ type
   ObjectRef = object
     objectId: uint32
     source: string
-
-  TlsIdentityLiveInfo = object
-    profile: TlsIdentityProfile
-    objectType: uint8
-    publicKey: seq[uint8]
-    semantics: TlsIdentityAttestationSemantics
 
 # =============================================================================
 # Utility
@@ -417,10 +412,23 @@ proc parseCurveKind(s: string): EcCurveKind =
   else:
     raise newException(ValueError, &"unsupported curve for se050ctl keygen: {s}")
 
+proc parseTlsIdentityCurve(value: string): EcCurveKind =
+  case value.strip().toLowerAscii()
+  of "p256", "prime256v1", "nist-p256", "nist_p256", "secp256r1":
+    result = ecCurveP256
+  of "p384", "nist-p384", "nist_p384", "secp384r1":
+    result = ecCurveP384
+  else:
+    raise newException(
+      ValueError,
+      &"TLS identity curve must be p256 or p384: {value}"
+    )
+
 proc parseTlsIdentityProfile(
     profileText: string,
     identityText: string,
-    slotText: string
+    slotText: string,
+    curve: EcCurveKind = ecCurveP256
 ): TlsIdentityProfile =
   let kind =
     case profileText.strip().toLowerAscii()
@@ -453,7 +461,7 @@ proc parseTlsIdentityProfile(
         &"TLS identity slot must be A or B: {slotText}"
       )
 
-  result = tlsIdentityProfile(kind, uint16(identity32), slot)
+  result = tlsIdentityProfile(kind, uint16(identity32), slot, curve)
   if not result.isValid():
     raise newException(ValueError, "resolved TLS identity profile is invalid")
 
@@ -562,6 +570,109 @@ proc rawStringToBytes(data: string): seq[uint8] =
   for i, ch in data:
     result[i] = uint8(ord(ch))
 
+proc readTlsImportPrivateKeyFile(path: string): SE[string] =
+  ## Reads an external private-key file without invoking the openssl CLI.
+  ##
+  ## The returned string may contain PEM or DER bytes. The caller owns the
+  ## returned mutable buffer and must clear it with secureZero() after use.
+  let normalized = path.strip()
+  if normalized.len == 0:
+    return fail[string](
+      seInvalidArgument,
+      "TLS private-key input path is empty"
+    )
+
+  try:
+    let data = readFile(normalized)
+    if data.len == 0:
+      return fail[string](
+        seInvalidArgument,
+        &"TLS private-key file is empty: {normalized}"
+      )
+    result = ok(data)
+  except CatchableError as e:
+    result = fail[string](
+      seInvalidArgument,
+      &"cannot read TLS private-key file {normalized}: {e.msg}"
+    )
+
+proc readTlsImportCertificateFile(path: string): SE[seq[uint8]] =
+  ## Reads one matching X.509 certificate as DER or conventional PEM.
+  ##
+  ## Certificate parsing itself remains in the OpenSSL-backed import library;
+  ## this helper only removes PEM framing and Base64 encoding when present.
+  const
+    PemBegin = "-----BEGIN CERTIFICATE-----"
+    PemEnd = "-----END CERTIFICATE-----"
+
+  let normalized = path.strip()
+  if normalized.len == 0:
+    return fail[seq[uint8]](
+      seInvalidArgument,
+      "TLS certificate input path is empty"
+    )
+
+  var raw: string
+  try:
+    raw = readFile(normalized)
+  except CatchableError as e:
+    return fail[seq[uint8]](
+      seInvalidArgument,
+      &"cannot read TLS certificate file {normalized}: {e.msg}"
+    )
+
+  if raw.len == 0:
+    return fail[seq[uint8]](
+      seInvalidArgument,
+      &"TLS certificate file is empty: {normalized}"
+    )
+
+  let trimmed = raw.strip()
+  if trimmed.startsWith(PemBegin):
+    if not trimmed.endsWith(PemEnd):
+      return fail[seq[uint8]](
+        seInvalidArgument,
+        &"TLS certificate PEM has invalid framing: {normalized}"
+      )
+
+    let bodyStart = PemBegin.len
+    let bodyEnd = trimmed.len - PemEnd.len
+    if bodyEnd <= bodyStart:
+      return fail[seq[uint8]](
+        seInvalidArgument,
+        &"TLS certificate PEM body is empty: {normalized}"
+      )
+
+    var compact = ""
+    for ch in trimmed[bodyStart ..< bodyEnd]:
+      if ch in {' ', '\t', '\r', '\n'}:
+        continue
+      compact.add(ch)
+
+    if compact.len == 0:
+      return fail[seq[uint8]](
+        seInvalidArgument,
+        &"TLS certificate PEM body is empty: {normalized}"
+      )
+
+    let decoded = decodeBase64(compact)
+    if not decoded.ok:
+      return fail[seq[uint8]](
+        decoded.error.kind,
+        &"invalid TLS certificate PEM {normalized}: {decoded.error.message}",
+        decoded.error.sw
+      )
+
+    return decoded
+
+  if trimmed.startsWith("-----BEGIN"):
+    return fail[seq[uint8]](
+      seInvalidArgument,
+      &"unsupported PEM object in TLS certificate file: {normalized}"
+    )
+
+  result = ok(rawStringToBytes(raw))
+
 proc writeRawBytes(path: string, data: openArray[uint8], context: string): bool =
   try:
     writeFile(path, bytesToRawString(data))
@@ -622,134 +733,6 @@ proc openAndRequestAtr(busText: string, addressText: string, debug: bool): Se050
   if not atr.ok:
     printSe050Error("ATR failed", atr.error)
     quit(1)
-
-proc inspectTlsIdentity(
-    se: Se050Transport,
-    profile: TlsIdentityProfile
-): SE[TlsIdentityLiveInfo] =
-  ## Performs the trust checks required before accepting an existing TLS key.
-  ##
-  ## The object type and persistence come from the live ReadType response.
-  ## Object ID, key type, internal origin, policy, and public key are then
-  ## independently bound by NXP ReadObject-with-Attestation.
-  if not profile.isValid():
-    return fail[TlsIdentityLiveInfo](
-      seInvalidArgument,
-      "TLS identity profile is invalid"
-    )
-
-  let typ = se.readObjectType(
-    objectId = profile.keyObjectId,
-    selectFirst = false
-  )
-  if not typ.ok:
-    return fail[TlsIdentityLiveInfo](
-      typ.error.kind,
-      typ.error.message,
-      typ.error.sw
-    )
-
-  if typ.value.objectType != profile.expectedKeyType():
-    return fail[TlsIdentityLiveInfo](
-      seTlsIdentityValidationFailed,
-      &"live object type 0x{typ.value.objectType.toHex(2)} does not match expected P-256 key-pair type 0x{profile.expectedKeyType().toHex(2)}"
-    )
-
-  if typ.value.transientIndicator.isNone or
-      typ.value.transientIndicator.get() != 0x01'u8:
-    return fail[TlsIdentityLiveInfo](
-      seTlsIdentityValidationFailed,
-      "TLS identity object is not persistent"
-    )
-
-  let livePublicKey = se.readPublicKey(
-    objectId = profile.keyObjectId,
-    selectFirst = false
-  )
-  if not livePublicKey.ok:
-    return fail[TlsIdentityLiveInfo](
-      livePublicKey.error.kind,
-      livePublicKey.error.message,
-      livePublicKey.error.sw
-    )
-
-  let certificate = se.readAttestationCertificate(selectFirst = false)
-  if not certificate.ok:
-    return fail[TlsIdentityLiveInfo](
-      certificate.error.kind,
-      certificate.error.message,
-      certificate.error.sw
-    )
-
-  let chain = verifyCertificateChain(
-    leafCertificateDer = certificate.value,
-    trustAnchorsDer = nxpAttestationTrustAnchors(),
-    intermediatesDer = nxpAttestationIntermediates()
-  )
-  if not chain.ok:
-    return fail[TlsIdentityLiveInfo](
-      chain.error.kind,
-      chain.error.message,
-      chain.error.sw
-    )
-
-  let freshness = se.getRandomBytes(
-    TlsIdentityAttestationFreshnessLength,
-    selectFirst = false
-  )
-  if not freshness.ok:
-    return fail[TlsIdentityLiveInfo](
-      freshness.error.kind,
-      freshness.error.message,
-      freshness.error.sw
-    )
-
-  let attested = se.readObjectWithAttestation(
-    objectId = profile.keyObjectId,
-    freshness = freshness.value,
-    selectFirst = false
-  )
-  if not attested.ok:
-    return fail[TlsIdentityLiveInfo](
-      attested.error.kind,
-      attested.error.message,
-      attested.error.sw
-    )
-
-  let signature = verifyAttestationSignature(
-    attested = attested.value,
-    certificateDer = certificate.value
-  )
-  if not signature.ok:
-    return fail[TlsIdentityLiveInfo](
-      signature.error.kind,
-      signature.error.message,
-      signature.error.sw
-    )
-
-  let semantics = verifyTlsIdentityAttestationSemantics(
-    attested = attested.value,
-    profile = profile
-  )
-  if not semantics.ok:
-    return fail[TlsIdentityLiveInfo](
-      semantics.error.kind,
-      semantics.error.message,
-      semantics.error.sw
-    )
-
-  if livePublicKey.value != semantics.value.publicKey:
-    return fail[TlsIdentityLiveInfo](
-      seTlsIdentityValidationFailed,
-      "live public key does not match the attested public key"
-    )
-
-  result = ok(TlsIdentityLiveInfo(
-    profile: profile,
-    objectType: typ.value.objectType,
-    publicKey: livePublicKey.value,
-    semantics: semantics.value
-  ))
 
 proc printTlsIdentityInfo(info: TlsIdentityLiveInfo, created: Option[bool]) =
   let profile = info.profile
@@ -1022,6 +1005,47 @@ proc runTlsKeyRef(
   echo profile.opensslProviderKeyUri()
   result = 0
 
+proc runTlsKeyRefFile(
+    busText: string,
+    addressText: string,
+    debug: bool,
+    profileText: string,
+    identityText: string,
+    slotText: string,
+    curveText: string,
+    outputPath: string,
+    imported: bool
+): int =
+  ## Exports one validated TLS identity as an NXP OpenSSL reference-key PEM.
+  let curve = parseTlsIdentityCurve(curveText)
+  let profile = parseTlsIdentityProfile(
+    profileText,
+    identityText,
+    slotText,
+    curve
+  )
+  if outputPath.strip().len == 0:
+    raise newException(ValueError, "--out is required for tls-key-ref-file")
+
+  let se = openAndRequestAtr(busText, addressText, debug)
+  let written =
+    if imported:
+      se.writeImportedTlsReferenceKeyFile(profile, outputPath)
+    else:
+      se.writeTlsReferenceKeyFile(profile, outputPath)
+  if not written.ok:
+    printSe050Error("TLS reference-key export failed", written.error)
+    return 1
+
+  echo &"{objectIdHex(profile.keyObjectId)}: validated OpenSSL reference key written to {outputPath}"
+  echo &"identity: {profile.identity}"
+  echo &"slot: {profile.slot.slotName()}"
+  echo &"format: NXP {curveName(profile.curve)} reference-key PEM"
+  let provisioning = if imported: "externally imported" else: "SE050 internally generated"
+  echo &"provisioning: {provisioning}"
+  echo "private key material: not exported"
+  result = 0
+
 proc runTlsKeyPubkey(
     busText: string,
     addressText: string,
@@ -1029,11 +1053,19 @@ proc runTlsKeyPubkey(
     profileText: string,
     identityText: string,
     slotText: string,
+    curveText: string,
     formatText: string,
-    outputPath: string
+    outputPath: string,
+    imported: bool
 ): int =
   ## Exports the validated TLS identity public key for CSR/key matching.
-  let profile = parseTlsIdentityProfile(profileText, identityText, slotText)
+  let curve = parseTlsIdentityCurve(curveText)
+  let profile = parseTlsIdentityProfile(
+    profileText,
+    identityText,
+    slotText,
+    curve
+  )
   let outputFormat = parseTlsPublicKeyFormat(formatText)
   if outputPath.strip().len == 0:
     raise newException(ValueError, "--out is required for tls-key-pubkey")
@@ -1053,7 +1085,11 @@ proc runTlsKeyPubkey(
     )
     return 1
 
-  let inspected = inspectTlsIdentity(se, profile)
+  let inspected =
+    if imported:
+      inspectImportedTlsIdentity(se, profile)
+    else:
+      inspectTlsIdentity(se, profile)
   if not inspected.ok:
     printSe050Error("TLS identity validation failed", inspected.error)
     return 1
@@ -1063,7 +1099,10 @@ proc runTlsKeyPubkey(
     of tpkRaw:
       inspected.value.publicKey
     of tpkSpkiDer:
-      p256PublicKeyToSpkiDer(inspected.value.publicKey)
+      ecPublicKeyToSpkiDer(
+        profile.curve,
+        inspected.value.publicKey
+      )
 
   if not writeRawBytes(
       outputPath,
@@ -1078,6 +1117,79 @@ proc runTlsKeyPubkey(
   echo &"slot: {profile.slot.slotName()}"
   echo &"format: {formatName}"
   echo &"length: {output.len}"
+  let provisioning = if imported: "externally imported" else: "SE050 internally generated"
+  echo &"provisioning: {provisioning}"
+  result = 0
+
+proc runTlsKeyImport(
+    busText: string,
+    addressText: string,
+    debug: bool,
+    profileText: string,
+    identityText: string,
+    slotText: string,
+    curveText: string,
+    privateKeyPath: string,
+    certificatePath: string
+): int =
+  ## Imports one externally generated P-256 or P-384 TLS identity into an empty
+  ## managed slot.
+  ##
+  ## All host-side key/certificate checks are completed by the library before
+  ## it mutates the SE050. P-384 additionally requires the standard curve to
+  ## have been explicitly instantiated beforehand. The source key file buffer
+  ## is explicitly cleared before this command returns.
+  let curve = parseTlsIdentityCurve(curveText)
+  let profile = parseTlsIdentityProfile(
+    profileText,
+    identityText,
+    slotText,
+    curve
+  )
+
+  var loadedKey = readTlsImportPrivateKeyFile(privateKeyPath)
+  if not loadedKey.ok:
+    printSe050Error("TLS private-key load failed", loadedKey.error)
+    return 2
+
+  var encodedKey = move(loadedKey.value)
+  defer:
+    secureZero(encodedKey)
+
+  let certificate = readTlsImportCertificateFile(certificatePath)
+  if not certificate.ok:
+    printSe050Error("TLS certificate load failed", certificate.error)
+    return 2
+
+  let se = openAndRequestAtr(busText, addressText, debug)
+  let imported =
+    case curve
+    of ecCurveP256:
+      se.importP256TlsIdentity(
+        profile = profile,
+        encodedKey = encodedKey,
+        certificateDer = certificate.value
+      )
+    of ecCurveP384:
+      se.importP384TlsIdentity(
+        profile = profile,
+        encodedKey = encodedKey,
+        certificateDer = certificate.value
+      )
+    else:
+      fail[TlsIdentityLiveInfo](
+        seInvalidArgument,
+        "unsupported managed TLS import curve"
+      )
+
+  if not imported.ok:
+    printSe050Error("TLS key import failed", imported.error)
+    return 1
+
+  printTlsIdentityInfo(imported.value, none(bool))
+  echo &"  provisioning: externally imported {curveName(curve)} private key"
+  echo "  certificate/key match: verified before SE050 write"
+  echo "  source/live public key match: verified after SE050 write"
   result = 0
 
 proc runTlsKeygen(
@@ -1133,9 +1245,17 @@ proc runTlsKeyInfo(
     debug: bool,
     profileText: string,
     identityText: string,
-    slotText: string
+    slotText: string,
+    curveText: string,
+    imported: bool
 ): int =
-  let profile = parseTlsIdentityProfile(profileText, identityText, slotText)
+  let curve = parseTlsIdentityCurve(curveText)
+  let profile = parseTlsIdentityProfile(
+    profileText,
+    identityText,
+    slotText,
+    curve
+  )
   let se = openAndRequestAtr(busText, addressText, debug)
 
   let exists = se.objectExists(
@@ -1152,12 +1272,18 @@ proc runTlsKeyInfo(
     )
     return 1
 
-  let inspected = inspectTlsIdentity(se, profile)
+  let inspected =
+    if imported:
+      inspectImportedTlsIdentity(se, profile)
+    else:
+      inspectTlsIdentity(se, profile)
   if not inspected.ok:
     printSe050Error("TLS identity validation failed", inspected.error)
     return 1
 
   printTlsIdentityInfo(inspected.value, none(bool))
+  let provisioning = if imported: "externally imported" else: "SE050 internally generated"
+  echo &"  provisioning: {provisioning}"
   result = 0
 
 proc runUid(busText: string, addressText: string, debug: bool, separator: string): int =
@@ -1191,6 +1317,122 @@ proc runRandom(
     return 1
 
   echo randomHex.value
+  result = 0
+
+proc runCurveList(
+    busText: string,
+    addressText: string,
+    debug: bool
+): int =
+  let se = openAndRequestAtr(busText, addressText, debug)
+
+  let curves = se.readEcCurveList(selectFirst = true)
+  if not curves.ok:
+    printSe050Error("ReadECCurveList failed", curves.error)
+    return 1
+
+  echo "Weierstrass EC curves:"
+  echo "  state describes current SE05x curve instantiation, not silicon capability"
+
+  for index, indicator in curves.value.indicators:
+    let curveId = uint8(index + 1)
+    let state =
+      case indicator
+      of 0x01'u8: "not-set"
+      of 0x02'u8: "set"
+      else: "invalid"
+
+    echo &"  0x{curveId.toHex(2)} {ecCurveName(curveId)}: {state}"
+
+  echo "TLS import candidates:"
+  for curveId in [
+      Se050CurveNistP256,
+      Se050CurveNistP384,
+      Se050CurveNistP521
+  ]:
+    let instantiated = curves.value.isEcCurveInstantiated(curveId)
+    if not instantiated.ok:
+      echo &"  {ecCurveName(curveId)}: unavailable ({instantiated.error.message})"
+    else:
+      let state = if instantiated.value: "instantiated" else: "not instantiated"
+      echo &"  {ecCurveName(curveId)}: {state}"
+
+  result = 0
+
+proc runCurveProvisionP384(
+    busText: string,
+    addressText: string,
+    debug: bool,
+    confirmed: bool
+): int =
+  ## Explicitly provisions the standard NIST P-384 curve domain parameters.
+  ##
+  ## Curve state is global SE05x state, not a disposable key object. Require an
+  ## affirmative flag before opening the transport so accidental invocation of
+  ## the command cannot mutate a device.
+  if not confirmed:
+    stderr.writeLine(
+      "curve-provision-p384 refused: this changes persistent global SE05x curve state; " &
+      "re-run with --yes after checking 'se050ctl curve-list'"
+    )
+    return 2
+
+  let se = openAndRequestAtr(busText, addressText, debug)
+
+  let before = se.readEcCurveList(selectFirst = true)
+  if not before.ok:
+    printSe050Error("ReadECCurveList before P-384 provisioning failed", before.error)
+    return 1
+
+  let beforeState = before.value.ecCurveSetState(Se050CurveNistP384)
+  if not beforeState.ok:
+    printSe050Error("P-384 curve-state lookup failed", beforeState.error)
+    return 1
+
+  let beforeText =
+    if beforeState.value == ecCurveSet:
+      "set"
+    else:
+      "not-set"
+
+  echo "NIST P-384 curve provisioning:"
+  echo &"  before: {beforeText}"
+  echo "  parameters: fixed standard secp384r1 / NIST P-384 values"
+
+  let provisioned = se.provisionNistP384Curve(selectFirst = false)
+  if not provisioned.ok:
+    printSe050Error("NIST P-384 curve provisioning failed", provisioned.error)
+    return 1
+
+  case provisioned.value
+  of ecCurveAlreadyInstantiated:
+    echo "  action: none (already instantiated)"
+  of ecCurveProvisioned:
+    echo "  action: CreateECCurve + A/B/G/N/PRIME"
+
+  let after = se.readEcCurveList(selectFirst = false)
+  if not after.ok:
+    printSe050Error("ReadECCurveList after P-384 provisioning failed", after.error)
+    return 1
+
+  let afterState = after.value.ecCurveSetState(Se050CurveNistP384)
+  if not afterState.ok:
+    printSe050Error("P-384 post-provision curve-state lookup failed", afterState.error)
+    return 1
+
+  let afterText =
+    if afterState.value == ecCurveSet:
+      "set"
+    else:
+      "not-set"
+
+  echo &"  after: {afterText}"
+
+  if afterState.value != ecCurveSet:
+    stderr.writeLine("NIST P-384 provisioning did not leave the curve instantiated")
+    return 1
+
+  echo "NIST P-384 curve provisioning: OK"
   result = 0
 
 proc runVersion(
@@ -1961,6 +2203,28 @@ proc main(): int =
         let separator = if opts.colon: ":" else: ""
         quit(runRandom(opts.bus, opts.address, opts.debug, opts.len, separator))
 
+    command("curve-list"):
+      help("Read the currently instantiated SE05x Weierstrass EC curves.")
+      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
+      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      flag("-d", "--debug", help = "Print T=1 over I2C frames")
+      run:
+        quit(runCurveList(opts.bus, opts.address, opts.debug))
+
+    command("curve-provision-p384"):
+      help("Provision the fixed standard NIST P-384 curve parameters when currently not-set.")
+      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
+      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      flag("--yes", help = "Confirm modification of persistent global SE05x curve state")
+      flag("-d", "--debug", help = "Print T=1 over I2C frames")
+      run:
+        quit(runCurveProvisionP384(
+          opts.bus,
+          opts.address,
+          opts.debug,
+          opts.yes
+        ))
+
     command("version"):
       help("Read SE050 applet version and feature configuration.")
       option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
@@ -2036,6 +2300,30 @@ proc main(): int =
           opts.slot
         ))
 
+    command("tls-key-ref-file"):
+      help("Export an attestation-validated TLS identity as an NXP OpenSSL reference-key PEM.")
+      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
+      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("--profile", required = true, help = "TLS identity profile: test or production")
+      option("--identity", default = some("0"), help = "TLS identity number, default: 0")
+      option("--slot", required = true, help = "TLS identity slot: A or B")
+      option("--curve", default = some("p256"), help = "TLS identity curve: p256 or p384, default: p256")
+      option("--out", required = true, help = "Output reference-key PEM file; existing paths are not overwritten")
+      flag("--imported", help = "Require an externally imported TLS key instead of the default internally generated key")
+      flag("-d", "--debug", help = "Print T=1 over I2C frames")
+      run:
+        quit(runTlsKeyRefFile(
+          opts.bus,
+          opts.address,
+          opts.debug,
+          opts.profile,
+          opts.identity,
+          opts.slot,
+          opts.curve,
+          opts.out,
+          opts.imported
+        ))
+
     command("tls-key-pubkey"):
       help("Export an attestation-validated TLS identity public key.")
       option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
@@ -2043,8 +2331,10 @@ proc main(): int =
       option("--profile", required = true, help = "TLS identity profile: test or production")
       option("--identity", default = some("0"), help = "TLS identity number, default: 0")
       option("--slot", required = true, help = "TLS identity slot: A or B")
+      option("--curve", default = some("p256"), help = "TLS identity curve: p256 or p384, default: p256")
       option("--format", default = some("spki-der"), help = "Output format: raw or spki-der, default: spki-der")
       option("--out", required = true, help = "Output file")
+      flag("--imported", help = "Require an externally imported TLS key instead of the default internally generated key")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
         quit(runTlsKeyPubkey(
@@ -2054,8 +2344,34 @@ proc main(): int =
           opts.profile,
           opts.identity,
           opts.slot,
+          opts.curve,
           opts.format,
-          opts.out
+          opts.out,
+          opts.imported
+        ))
+
+    command("tls-key-import"):
+      help("Import an external P-256 or P-384 private key into one empty SE050 TLS identity slot.")
+      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
+      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("--profile", required = true, help = "TLS identity profile: test or production")
+      option("--identity", default = some("0"), help = "TLS identity number, default: 0")
+      option("--slot", required = true, help = "TLS identity slot: A or B")
+      option("--curve", default = some("p256"), help = "External key curve: p256 or p384, default: p256")
+      option("--key", required = true, help = "External unencrypted EC private key file in PEM or DER")
+      option("--cert", required = true, help = "Matching X.509 certificate file in PEM or DER")
+      flag("-d", "--debug", help = "Print non-sensitive T=1 over I2C frames; key-import frames are redacted")
+      run:
+        quit(runTlsKeyImport(
+          opts.bus,
+          opts.address,
+          opts.debug,
+          opts.profile,
+          opts.identity,
+          opts.slot,
+          opts.curve,
+          opts.key,
+          opts.cert
         ))
 
     command("tls-keygen"):
@@ -2083,6 +2399,8 @@ proc main(): int =
       option("--profile", required = true, help = "TLS identity profile: test or production")
       option("--identity", default = some("0"), help = "TLS identity number, default: 0")
       option("--slot", required = true, help = "TLS identity slot: A or B")
+      option("--curve", default = some("p256"), help = "TLS identity curve: p256 or p384, default: p256")
+      flag("--imported", help = "Require an externally imported TLS key instead of the default internally generated key")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
         quit(runTlsKeyInfo(
@@ -2091,7 +2409,9 @@ proc main(): int =
           opts.debug,
           opts.profile,
           opts.identity,
-          opts.slot
+          opts.slot,
+          opts.curve,
+          opts.imported
         ))
 
     command("exists"):

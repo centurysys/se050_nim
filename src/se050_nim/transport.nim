@@ -20,6 +20,7 @@ import std/os
 
 import ./errors
 import ./i2c
+import ./secure_memory
 
 # =============================================================================
 # Types
@@ -173,16 +174,27 @@ proc makeSBlockResponse(stype: uint8, inf: openArray[uint8] = []): seq[uint8] =
 # Raw I2C access
 # =============================================================================
 
-proc writeRaw(self: Se050Transport, frame: openArray[uint8]): SE[void] =
+proc writeRaw(
+    self: Se050Transport,
+    frame: openArray[uint8],
+    sensitive: bool = false
+): SE[void] =
   if self.debug:
-    echo "T1 TX: ", hexDump(frame)
+    if sensitive:
+      echo &"T1 TX: <redacted sensitive frame, {frame.len} bytes>"
+    else:
+      echo "T1 TX: ", hexDump(frame)
 
   if not self.i2c.write(frame):
     return fail[void](seI2cWriteFailed, "I2C write failed")
 
   result = ok()
 
-proc readRaw(self: Se050Transport, readLen: int): SE[seq[uint8]] =
+proc readRaw(
+    self: Se050Transport,
+    readLen: int,
+    sensitive: bool = false
+): SE[seq[uint8]] =
   ## Polls until the SE050 has a T=1 frame ready.
   ##
   ## SE050 signals a busy state by NACKing I2C reads. Commands involving
@@ -190,11 +202,16 @@ proc readRaw(self: Se050Transport, readLen: int): SE[seq[uint8]] =
   ## previous fixed 8 x 5 ms window expired before the first WTX/I-block was
   ## available. Use a bounded incremental backoff instead.
   for attempt in 0 ..< self.maxReadPolls:
-    let rxChars = self.i2c.read(readLen)
+    var rxChars = self.i2c.read(readLen)
     if rxChars.len > 0:
       let rx = toBytes(rxChars)
+      if sensitive:
+        secureZero(rxChars)
       if self.debug:
-        echo "T1 RX: ", hexDump(rx)
+        if sensitive:
+          echo &"T1 RX: <redacted sensitive frame, {rx.len} bytes>"
+        else:
+          echo "T1 RX: ", hexDump(rx)
       return ok(rx)
 
     if attempt + 1 < self.maxReadPolls:
@@ -208,8 +225,11 @@ proc readRaw(self: Se050Transport, readLen: int): SE[seq[uint8]] =
     &"I2C read returned no data after {self.maxReadPolls} polls"
   )
 
-proc readRaw(self: Se050Transport): SE[seq[uint8]] =
-  result = self.readRaw(self.maxReadLen)
+proc readRaw(
+    self: Se050Transport,
+    sensitive: bool = false
+): SE[seq[uint8]] =
+  result = self.readRaw(self.maxReadLen, sensitive = sensitive)
 
 # =============================================================================
 # Frame parsing
@@ -231,6 +251,9 @@ proc parseFrame(raw: openArray[uint8]): SE[T1Frame] =
     return fail[T1Frame](seInvalidLen, &"incomplete frame: got {raw.len}, need {totalLen}")
 
   var frameBytes = newSeq[uint8](totalLen)
+  defer:
+    secureZero(frameBytes)
+
   for i in 0 ..< totalLen:
     frameBytes[i] = raw[i]
 
@@ -255,12 +278,17 @@ proc parseFrame(raw: openArray[uint8]): SE[T1Frame] =
 
   result = ok(f)
 
-proc readFrame(self: Se050Transport): SE[T1Frame] =
-  let rawRes = self.readRaw()
+proc readFrame(
+    self: Se050Transport,
+    sensitive: bool = false
+): SE[T1Frame] =
+  var rawRes = self.readRaw(sensitive = sensitive)
   if not rawRes.ok:
     return fail[T1Frame](rawRes.error.kind, rawRes.error.message)
 
   result = parseFrame(rawRes.value)
+  if sensitive:
+    secureZero(rawRes.value)
 
 
 proc rBlockErrorMessage(pcb: uint8): string =
@@ -361,15 +389,39 @@ proc requestAtr*(self: Se050Transport): SE[seq[uint8]] =
 
   result = first
 
-proc sendWtxResponse(self: Se050Transport, wtxm: uint8): SE[void] =
+proc sendWtxResponse(
+    self: Se050Transport,
+    wtxm: uint8,
+    sensitive: bool = false
+): SE[void] =
   let rsp = makeSBlockResponse(STypeWtx, @[wtxm])
-  result = self.writeRaw(rsp)
+  result = self.writeRaw(rsp, sensitive = sensitive)
 
-proc sendRACK(self: Se050Transport): SE[void] =
+proc sendRACK(
+    self: Se050Transport,
+    sensitive: bool = false
+): SE[void] =
   let ack = self.makeRBlock(0)
-  result = self.writeRaw(ack)
+  result = self.writeRaw(ack, sensitive = sensitive)
 
-proc transceiveApdu*(self: Se050Transport, apdu: openArray[uint8]): SE[seq[uint8]] =
+proc sendApduIBlock(
+    self: Se050Transport,
+    chunk: openArray[uint8],
+    more: bool,
+    sensitive: bool
+): SE[void] =
+  var tx = self.makeIBlock(chunk, more)
+  defer:
+    if sensitive:
+      secureZero(tx)
+
+  result = self.writeRaw(tx, sensitive = sensitive)
+
+proc transceiveApduImpl(
+    self: Se050Transport,
+    apdu: openArray[uint8],
+    sensitive: bool
+): SE[seq[uint8]] =
   ## Sends one APDU and returns the APDU response bytes.
   ##
   ## The returned bytes are the INF payload reassembled from I-block responses.
@@ -388,20 +440,23 @@ proc transceiveApdu*(self: Se050Transport, apdu: openArray[uint8]): SE[seq[uint8
     for i in 0 ..< chunkLen:
       chunk[i] = apdu[offset + i]
 
-    let tx = self.makeIBlock(chunk, more)
-    let w = self.writeRaw(tx)
+    let w = self.sendApduIBlock(chunk, more, sensitive)
+    if sensitive:
+      secureZero(chunk)
     if not w.ok:
       return fail[seq[uint8]](w.error.kind, w.error.message)
 
     if more:
       while true:
-        let rf = self.readFrame()
+        var rf = self.readFrame(sensitive = sensitive)
         if not rf.ok:
           return fail[seq[uint8]](rf.error.kind, rf.error.message)
 
         case rf.value.kind
         of fkRBlock:
           let errorCode = rf.value.pcb and PcbRErrorMask
+          if sensitive:
+            secureZero(rf.value.inf)
           if errorCode != 0:
             retries += 1
             if retries > self.maxRetries:
@@ -416,16 +471,22 @@ proc transceiveApdu*(self: Se050Transport, apdu: openArray[uint8]): SE[seq[uint8
           let stype = rf.value.pcb and PcbSTypeMask
           if stype == STypeWtx:
             let wtxm = if rf.value.inf.len > 0: rf.value.inf[0] else: 1'u8
-            let wr = self.sendWtxResponse(wtxm)
+            if sensitive:
+              secureZero(rf.value.inf)
+            let wr = self.sendWtxResponse(wtxm, sensitive = sensitive)
             if not wr.ok:
               return fail[seq[uint8]](wr.error.kind, wr.error.message)
           else:
+            if sensitive:
+              secureZero(rf.value.inf)
             return fail[seq[uint8]](
               seUnexpectedFrame,
               &"unexpected S-block during command chaining: 0x{rf.value.pcb:02X}"
             )
 
         of fkIBlock:
+          if sensitive:
+            secureZero(rf.value.inf)
           return fail[seq[uint8]](
             seUnexpectedFrame,
             "unexpected I-block before final command block"
@@ -435,9 +496,12 @@ proc transceiveApdu*(self: Se050Transport, apdu: openArray[uint8]): SE[seq[uint8
       offset += chunkLen
 
   var response: seq[uint8] = @[]
+  defer:
+    if sensitive:
+      secureZero(response)
 
   while true:
-    let rf = self.readFrame()
+    var rf = self.readFrame(sensitive = sensitive)
     if not rf.ok:
       return fail[seq[uint8]](rf.error.kind, rf.error.message)
 
@@ -445,32 +509,42 @@ proc transceiveApdu*(self: Se050Transport, apdu: openArray[uint8]): SE[seq[uint8
     of fkIBlock:
       let seqNo = uint8((rf.value.pcb and PcbISeqMask) shr 6)
       if seqNo != self.rxSeq:
+        if sensitive:
+          secureZero(rf.value.inf)
         let nack = self.makeRBlock(0x02)
-        discard self.writeRaw(nack)
+        discard self.writeRaw(nack, sensitive = sensitive)
         return fail[seq[uint8]](
           seUnexpectedFrame,
           &"unexpected I-block seq: got {seqNo}, expected {self.rxSeq}"
         )
 
       response.add(rf.value.inf)
+      if sensitive:
+        secureZero(rf.value.inf)
       self.rxSeq = self.rxSeq xor 1
 
       let more = (rf.value.pcb and PcbIMore) != 0
       if more:
-        let ack = self.sendRACK()
+        let ack = self.sendRACK(sensitive = sensitive)
         if not ack.ok:
           return fail[seq[uint8]](ack.error.kind, ack.error.message)
       else:
-        return ok(response)
+        result = ok(response)
+        response = @[]
+        return
 
     of fkSBlock:
       let stype = rf.value.pcb and PcbSTypeMask
       if stype == STypeWtx:
         let wtxm = if rf.value.inf.len > 0: rf.value.inf[0] else: 1'u8
-        let wr = self.sendWtxResponse(wtxm)
+        if sensitive:
+          secureZero(rf.value.inf)
+        let wr = self.sendWtxResponse(wtxm, sensitive = sensitive)
         if not wr.ok:
           return fail[seq[uint8]](wr.error.kind, wr.error.message)
       else:
+        if sensitive:
+          secureZero(rf.value.inf)
         return fail[seq[uint8]](
           seUnexpectedFrame,
           &"unexpected S-block while waiting APDU response: 0x{rf.value.pcb:02X}"
@@ -478,6 +552,31 @@ proc transceiveApdu*(self: Se050Transport, apdu: openArray[uint8]): SE[seq[uint8
 
     of fkRBlock:
       let errorCode = rf.value.pcb and PcbRErrorMask
+      if sensitive:
+        secureZero(rf.value.inf)
       if errorCode != 0:
         return fail[seq[uint8]](seDeviceRnaK, &"device returned R-NACK: 0x{errorCode:02X}")
       return fail[seq[uint8]](seUnexpectedFrame, "unexpected R-ACK while waiting APDU response")
+
+
+proc transceiveApdu*(
+    self: Se050Transport,
+    apdu: openArray[uint8]
+): SE[seq[uint8]] =
+  ## Sends an ordinary APDU and returns the APDU response bytes.
+  ##
+  ## Debug logging retains the existing full T=1 frame dump behavior. Commands
+  ## or responses that may contain secret material must instead use
+  ## transceiveSensitiveApdu().
+  result = self.transceiveApduImpl(apdu, sensitive = false)
+
+proc transceiveSensitiveApdu*(
+    self: Se050Transport,
+    apdu: openArray[uint8]
+): SE[seq[uint8]] =
+  ## Sends an APDU transaction that may contain secret command or response data.
+  ##
+  ## T=1 TX/RX frame bytes are redacted from debug output and temporary transport
+  ## copies are cleared after use where ownership permits. The input APDU and the
+  ## returned response remain owned by the caller and are not cleared here.
+  result = self.transceiveApduImpl(apdu, sensitive = true)

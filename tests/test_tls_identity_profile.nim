@@ -68,6 +68,39 @@ suite "SE050 TLS client identity profiles":
     check testB.keyObjectId == testA.keyObjectId + 1'u32
     check prodB.keyObjectId == prodA.keyObjectId + 1'u32
 
+
+  test "explicit P-384 profiles preserve the same lifecycle slot IDs":
+    let testP384 = testTlsIdentityProfile(0'u16, tisSlotA, ecCurveP384)
+    let prodP384 = productionTlsIdentityProfile(3'u16, tisSlotB, ecCurveP384)
+
+    check testP384.curve == ecCurveP384
+    check testP384.curve.curveId() == Se050CurveNistP384
+    check testP384.expectedKeyType() == Se050TypeEcKeyPairNistP384
+    check testP384.expectedKeyType() == 0x2D'u8
+    check testP384.expectedPrivateKeySizeBytes() == 48'u16
+    check testP384.expectedPublicKeyLength() == 97
+    check testP384.keyObjectId == TlsIdentityTestSlotAObjectId
+    check testP384.isValid()
+
+    check prodP384.curve == ecCurveP384
+    check prodP384.keyObjectId == 0x20000207'u32
+    check prodP384.isValid()
+
+  test "object-ID resolution requires an explicit curve for P-384":
+    let defaultProfile = tlsIdentityProfileForObjectId(
+      TlsIdentityTestSlotAObjectId
+    )
+    let p384Profile = tlsIdentityProfileForObjectId(
+      TlsIdentityTestSlotAObjectId,
+      ecCurveP384
+    )
+
+    check defaultProfile.isSome
+    check defaultProfile.get().curve == ecCurveP256
+    check p384Profile.isSome
+    check p384Profile.get().curve == ecCurveP384
+    check p384Profile.get().expectedKeyType() == Se050TypeEcKeyPairNistP384
+
   test "TLS policy is SIGN plus READ plus DELETE for every slot":
     let profiles = [
       testTlsIdentityProfile(0'u16, tisSlotA),
