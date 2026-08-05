@@ -6,15 +6,16 @@
 # key encoder. The final file is installed atomically without overwriting an
 # existing path and is created with private-key-style 0600 permissions.
 #
-# P-256 internally generated and externally imported TLS identities use
-# separate public export entry points. Both produce the same NXP reference-key
-# format; only the required live attestation origin differs.
+# Internally generated and externally imported TLS identities use separate
+# public export entry points. P-256 and P-384 share the NXP reference-key
+# suffix layout but retain their own SEC1 named-curve and public-key encoding.
 
 import std/os
 import std/posix_utils
 import std/strformat
 
 import ../errors
+import ../keys
 import ../objects
 import ../transport
 import ./profile
@@ -123,6 +124,48 @@ proc writeP256ReferenceKeyFile*(
 
   result = writeReferenceKeyPemAtomic(outputPath, pem)
 
+proc writeP384ReferenceKeyFile*(
+    objectId: uint32,
+    publicKey: openArray[uint8],
+    outputPath: string
+): SE[void] =
+  ## Writes one P-384 NXP reference-key PEM without SE050 access.
+  var pem: string
+  try:
+    pem = encodeP384ReferenceKeyPem(objectId, publicKey)
+  except ValueError as error:
+    return fail[void](
+      seInvalidArgument,
+      &"cannot encode P-384 reference key: {error.msg}"
+    )
+
+  result = writeReferenceKeyPemAtomic(outputPath, pem)
+
+proc writeEcReferenceKeyFile(
+    curve: EcCurveKind,
+    objectId: uint32,
+    publicKey: openArray[uint8],
+    outputPath: string
+): SE[void] =
+  case curve
+  of ecCurveP256:
+    result = writeP256ReferenceKeyFile(
+      objectId = objectId,
+      publicKey = publicKey,
+      outputPath = outputPath
+    )
+  of ecCurveP384:
+    result = writeP384ReferenceKeyFile(
+      objectId = objectId,
+      publicKey = publicKey,
+      outputPath = outputPath
+    )
+  else:
+    result = fail[void](
+      seInvalidArgument,
+      &"OpenSSL reference-key export does not support curve {curveName(curve)}"
+    )
+
 proc writeTlsReferenceKeyFileForOrigin(
     se: Se050Transport,
     profile: TlsIdentityProfile,
@@ -177,7 +220,8 @@ proc writeTlsReferenceKeyFileForOrigin(
       inspected.error.sw
     )
 
-  let written = writeP256ReferenceKeyFile(
+  let written = writeEcReferenceKeyFile(
+    curve = inspected.value.profile.curve,
     objectId = inspected.value.profile.keyObjectId,
     publicKey = inspected.value.publicKey,
     outputPath = outputPath

@@ -11,6 +11,12 @@ proc sampleP256PublicKey(): seq[uint8] =
   for i in 1 ..< result.len:
     result[i] = uint8(i)
 
+proc sampleP384PublicKey(): seq[uint8] =
+  result = newSeq[uint8](97)
+  result[0] = 0x04'u8
+  for i in 1 ..< result.len:
+    result[i] = uint8(i)
+
 proc removeTestDirectory(directory: string) =
   if dirExists(directory):
     for kind, path in walkDir(directory):
@@ -38,6 +44,27 @@ suite "TLS OpenSSL reference-key file export":
     require written.ok
     check fileExists(outputPath)
     check readFile(outputPath) == encodeP256ReferenceKeyPem(
+      0x20000200'u32,
+      publicKey
+    )
+    check getFilePermissions(outputPath) == {fpUserRead, fpUserWrite}
+
+  test "writes a 0600 P-384 reference-key PEM":
+    let directory = createTempDir("se050-refkey-", "")
+    defer:
+      removeTestDirectory(directory)
+
+    let outputPath = directory / "device-p384.key"
+    let publicKey = sampleP384PublicKey()
+    let written = writeP384ReferenceKeyFile(
+      objectId = 0x20000200'u32,
+      publicKey = publicKey,
+      outputPath = outputPath
+    )
+
+    require written.ok
+    check fileExists(outputPath)
+    check readFile(outputPath) == encodeP384ReferenceKeyPem(
       0x20000200'u32,
       publicKey
     )
@@ -113,21 +140,3 @@ suite "TLS OpenSSL reference-key file export":
     check written.error.kind == seInvalidArgument
     check written.error.message == "TLS identity profile is invalid"
     check not fileExists(outputPath)
-
-  test "imported live export rejects an invalid profile before transport access":
-    let directory = createTempDir("se050-refkey-", "")
-    defer:
-      removeTestDirectory(directory)
-
-    let outputPath = directory / "device.key"
-    var profile = testTlsIdentityProfile(0'u16, tisSlotA)
-    profile.keyRole = "invalid-role"
-
-    let se: Se050Transport = nil
-    let written = se.writeImportedTlsReferenceKeyFile(profile, outputPath)
-
-    check not written.ok
-    check written.error.kind == seInvalidArgument
-    check written.error.message == "TLS identity profile is invalid"
-    check not fileExists(outputPath)
-

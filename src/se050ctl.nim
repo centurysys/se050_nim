@@ -1012,11 +1012,18 @@ proc runTlsKeyRefFile(
     profileText: string,
     identityText: string,
     slotText: string,
+    curveText: string,
     outputPath: string,
     imported: bool
 ): int =
   ## Exports one validated TLS identity as an NXP OpenSSL reference-key PEM.
-  let profile = parseTlsIdentityProfile(profileText, identityText, slotText)
+  let curve = parseTlsIdentityCurve(curveText)
+  let profile = parseTlsIdentityProfile(
+    profileText,
+    identityText,
+    slotText,
+    curve
+  )
   if outputPath.strip().len == 0:
     raise newException(ValueError, "--out is required for tls-key-ref-file")
 
@@ -1033,7 +1040,7 @@ proc runTlsKeyRefFile(
   echo &"{objectIdHex(profile.keyObjectId)}: validated OpenSSL reference key written to {outputPath}"
   echo &"identity: {profile.identity}"
   echo &"slot: {profile.slot.slotName()}"
-  echo "format: NXP P-256 reference-key PEM"
+  echo &"format: NXP {curveName(profile.curve)} reference-key PEM"
   let provisioning = if imported: "externally imported" else: "SE050 internally generated"
   echo &"provisioning: {provisioning}"
   echo "private key material: not exported"
@@ -2290,6 +2297,7 @@ proc main(): int =
       option("--profile", required = true, help = "TLS identity profile: test or production")
       option("--identity", default = some("0"), help = "TLS identity number, default: 0")
       option("--slot", required = true, help = "TLS identity slot: A or B")
+      option("--curve", default = some("p256"), help = "TLS identity curve: p256 or p384, default: p256")
       option("--out", required = true, help = "Output reference-key PEM file; existing paths are not overwritten")
       flag("--imported", help = "Require an externally imported TLS key instead of the default internally generated key")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
@@ -2301,6 +2309,7 @@ proc main(): int =
           opts.profile,
           opts.identity,
           opts.slot,
+          opts.curve,
           opts.out,
           opts.imported
         ))
