@@ -85,6 +85,90 @@ proc evpPublicKeyGetOctetStringParam*(
   dynlib: LibCrypto
 .}
 
+proc evpPublicKeyGetBnParam*(
+    publicKey: pointer,
+    key: cstring,
+    value: ptr pointer
+): cint {.
+  cdecl,
+  importc: "EVP_PKEY_get_bn_param",
+  dynlib: LibCrypto
+.}
+
+proc evpPublicKeyContextNewFromPkey*(
+    libraryContext: pointer,
+    publicKey: pointer,
+    propertyQuery: cstring
+): pointer {.
+  cdecl,
+  importc: "EVP_PKEY_CTX_new_from_pkey",
+  dynlib: LibCrypto
+.}
+
+proc evpPublicKeyContextFree*(context: pointer) {.
+  cdecl,
+  importc: "EVP_PKEY_CTX_free",
+  dynlib: LibCrypto
+.}
+
+proc evpPublicKeyPrivateCheck*(context: pointer): cint {.
+  cdecl,
+  importc: "EVP_PKEY_private_check",
+  dynlib: LibCrypto
+.}
+
+proc evpPublicKeyPairwiseCheck*(context: pointer): cint {.
+  cdecl,
+  importc: "EVP_PKEY_pairwise_check",
+  dynlib: LibCrypto
+.}
+
+proc bnToBinaryPadded*(
+    value: pointer,
+    output: ptr uint8,
+    outputLength: cint
+): cint {.
+  cdecl,
+  importc: "BN_bn2binpad",
+  dynlib: LibCrypto
+.}
+
+proc bnFree*(value: pointer) {.
+  cdecl,
+  importc: "BN_free",
+  dynlib: LibCrypto
+.}
+
+proc osslDecoderContextNewForPkey*(
+    publicKey: ptr pointer,
+    inputType: cstring,
+    inputStructure: cstring,
+    keyType: cstring,
+    selection: cint,
+    libraryContext: pointer,
+    propertyQuery: cstring
+): pointer {.
+  cdecl,
+  importc: "OSSL_DECODER_CTX_new_for_pkey",
+  dynlib: LibCrypto
+.}
+
+proc osslDecoderContextFree*(context: pointer) {.
+  cdecl,
+  importc: "OSSL_DECODER_CTX_free",
+  dynlib: LibCrypto
+.}
+
+proc osslDecoderFromData*(
+    context: pointer,
+    data: ptr ptr uint8,
+    dataLength: ptr csize_t
+): cint {.
+  cdecl,
+  importc: "OSSL_DECODER_from_data",
+  dynlib: LibCrypto
+.}
+
 proc evpMdContextNew*(): pointer {.
   cdecl,
   importc: "EVP_MD_CTX_new",
