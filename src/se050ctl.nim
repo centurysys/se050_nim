@@ -1053,12 +1053,19 @@ proc runTlsKeyPubkey(
     profileText: string,
     identityText: string,
     slotText: string,
+    curveText: string,
     formatText: string,
     outputPath: string,
     imported: bool
 ): int =
   ## Exports the validated TLS identity public key for CSR/key matching.
-  let profile = parseTlsIdentityProfile(profileText, identityText, slotText)
+  let curve = parseTlsIdentityCurve(curveText)
+  let profile = parseTlsIdentityProfile(
+    profileText,
+    identityText,
+    slotText,
+    curve
+  )
   let outputFormat = parseTlsPublicKeyFormat(formatText)
   if outputPath.strip().len == 0:
     raise newException(ValueError, "--out is required for tls-key-pubkey")
@@ -1092,7 +1099,10 @@ proc runTlsKeyPubkey(
     of tpkRaw:
       inspected.value.publicKey
     of tpkSpkiDer:
-      p256PublicKeyToSpkiDer(inspected.value.publicKey)
+      ecPublicKeyToSpkiDer(
+        profile.curve,
+        inspected.value.publicKey
+      )
 
   if not writeRawBytes(
       outputPath,
@@ -2321,6 +2331,7 @@ proc main(): int =
       option("--profile", required = true, help = "TLS identity profile: test or production")
       option("--identity", default = some("0"), help = "TLS identity number, default: 0")
       option("--slot", required = true, help = "TLS identity slot: A or B")
+      option("--curve", default = some("p256"), help = "TLS identity curve: p256 or p384, default: p256")
       option("--format", default = some("spki-der"), help = "Output format: raw or spki-der, default: spki-der")
       option("--out", required = true, help = "Output file")
       flag("--imported", help = "Require an externally imported TLS key instead of the default internally generated key")
@@ -2333,6 +2344,7 @@ proc main(): int =
           opts.profile,
           opts.identity,
           opts.slot,
+          opts.curve,
           opts.format,
           opts.out,
           opts.imported

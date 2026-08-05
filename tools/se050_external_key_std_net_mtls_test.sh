@@ -5,6 +5,7 @@ SE050CTL="se050ctl"
 PROVIDER="/usr/local/lib/libsssProvider.so"
 IDENTITY="0"
 SLOT="A"
+CURVE="p256"
 BUS="0"
 ADDRESS="0x48"
 SSS_PORT="${EX_SSS_BOOT_SSS_PORT:-/dev/i2c-0:0x48}"
@@ -18,8 +19,9 @@ usage() {
   cat <<USAGE
 Usage: $0 [options]
 
-Import a disposable external P-256 key into one EMPTY test TLS identity slot,
-then run the ordinary Nim std/net mutual-TLS test against that imported key.
+Import a disposable external P-256 or P-384 key into one EMPTY test TLS
+identity slot, then run the ordinary Nim std/net mutual-TLS test against that
+imported key.
 
 The test proves the complete path:
 
@@ -39,6 +41,7 @@ Options:
   --provider PATH       NXP OpenSSL Provider (default: /usr/local/lib/libsssProvider.so)
   --identity N          test TLS identity number (default: 0)
   --slot A|B            empty test TLS identity slot (default: A)
+  --curve NAME          p256 or p384 (default: p256)
   --bus N               I2C bus (default: 0)
   --address HEX         SE050 I2C address (default: 0x48)
   --sss-port VALUE      EX_SSS_BOOT_SSS_PORT value (default: /dev/i2c-0:0x48)
@@ -57,6 +60,7 @@ while [[ $# -gt 0 ]]; do
     --provider) PROVIDER="$2"; shift 2 ;;
     --identity) IDENTITY="$2"; shift 2 ;;
     --slot) SLOT="$2"; shift 2 ;;
+    --curve) CURVE="${2,,}"; shift 2 ;;
     --bus) BUS="$2"; shift 2 ;;
     --address) ADDRESS="$2"; shift 2 ;;
     --sss-port) SSS_PORT="$2"; shift 2 ;;
@@ -67,6 +71,11 @@ while [[ $# -gt 0 ]]; do
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+if [[ "$CURVE" != "p256" && "$CURVE" != "p384" ]]; then
+  echo "--curve must be p256 or p384" >&2
+  exit 2
+fi
 
 SLOT="${SLOT^^}"
 if [[ "$SLOT" != "A" && "$SLOT" != "B" ]]; then
@@ -133,6 +142,7 @@ export EX_SSS_BOOT_SSS_PORT="$SSS_PORT"
 
 SOURCE_KEY="$WORKDIR/source.key"
 SOURCE_CERT="$WORKDIR/source.crt"
+CURVE_LOG="$WORKDIR/curve-list.log"
 PREFLIGHT_LOG="$WORKDIR/preflight.log"
 IMPORT_LOG="$WORKDIR/import.log"
 IMPORTED_INFO_LOG="$WORKDIR/imported-info.log"
@@ -216,6 +226,21 @@ trap cleanup_test_object EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+if [[ "$CURVE" == "p384" ]]; then
+  "$SE050CTL" curve-list \
+    -b "$BUS" \
+    -a "$ADDRESS" \
+    >"$CURVE_LOG" 2>&1
+
+  if ! grep -Eq '0x04 NIST P-384: set|NIST P-384: instantiated' "$CURVE_LOG"; then
+    echo "NIST P-384 is not instantiated; refusing mTLS import test" >&2
+    echo "this script never modifies global curve state" >&2
+    echo "see $CURVE_LOG" >&2
+    exit 1
+  fi
+  echo "preflight: NIST P-384 is instantiated"
+fi
+
 if object_status "$PREFLIGHT_LOG"; then
   preflight_rc=0
 else
@@ -240,9 +265,16 @@ esac
 # This certificate is used only for the pre-write key/certificate match check
 # in tls-key-import. The actual mTLS client certificate is generated later by
 # se050_std_net_mtls_test.sh from the imported SE050 Reference Key.
+openssl_curve="P-256"
+source_digest="sha256"
+if [[ "$CURVE" == "p384" ]]; then
+  openssl_curve="P-384"
+  source_digest="sha384"
+fi
+
 OPENSSL_CONF=/dev/null openssl genpkey \
   -algorithm EC \
-  -pkeyopt ec_paramgen_curve:P-256 \
+  -pkeyopt "ec_paramgen_curve:${openssl_curve}" \
   -out "$SOURCE_KEY" \
   >/dev/null 2>&1
 chmod 600 "$SOURCE_KEY"
@@ -250,7 +282,7 @@ chmod 600 "$SOURCE_KEY"
 OPENSSL_CONF=/dev/null openssl req \
   -new \
   -x509 \
-  -sha256 \
+  "-${source_digest}" \
   -days 1 \
   -key "$SOURCE_KEY" \
   -subj "/CN=se050-external-import-mtls-${IDENTITY}-${SLOT}" \
@@ -266,6 +298,7 @@ OPENSSL_CONF=/dev/null openssl req \
   --profile test \
   --identity "$IDENTITY" \
   --slot "$SLOT" \
+  --curve "$CURVE" \
   --key "$SOURCE_KEY" \
   --cert "$SOURCE_CERT" \
   >"$IMPORT_LOG" 2>&1
@@ -276,6 +309,7 @@ OPENSSL_CONF=/dev/null openssl req \
   --profile test \
   --identity "$IDENTITY" \
   --slot "$SLOT" \
+  --curve "$CURVE" \
   --imported \
   >"$IMPORTED_INFO_LOG" 2>&1
 
@@ -285,7 +319,15 @@ if ! grep -Fq 'origin: external' "$IMPORTED_INFO_LOG"; then
   exit 1
 fi
 
-echo "external P-256 key import: OK"
+# se050ctl prints the canonical CLI curve name (p256/p384), not the
+# human-readable display name. Keep this check tied to that stable CLI value.
+if ! grep -Fq "curve: ${CURVE}" "$IMPORTED_INFO_LOG"; then
+  echo "imported-origin validation did not report curve ${CURVE}" >&2
+  echo "see $IMPORTED_INFO_LOG" >&2
+  exit 1
+fi
+
+echo "external $CURVE key import: OK"
 echo "imported-origin live validation: OK"
 
 bash "$MTLS_TEST" \
@@ -294,6 +336,7 @@ bash "$MTLS_TEST" \
   --profile test \
   --identity "$IDENTITY" \
   --slot "$SLOT" \
+  --curve "$CURVE" \
   --bus "$BUS" \
   --address "$ADDRESS" \
   --sss-port "$SSS_PORT" \
@@ -301,4 +344,4 @@ bash "$MTLS_TEST" \
   --client "$CLIENT_BIN" \
   --imported
 
-echo "external P-256 import + Nim std/net TLS 1.3/TLS 1.2 mTLS: PASS"
+echo "external $CURVE import + Nim std/net TLS 1.3/TLS 1.2 mTLS: PASS"

@@ -6,6 +6,7 @@ PROVIDER="/usr/local/lib/libsssProvider.so"
 PROFILE="test"
 IDENTITY="0"
 SLOT="A"
+CURVE="p256"
 BUS="0"
 ADDRESS="0x48"
 SSS_PORT="${EX_SSS_BOOT_SSS_PORT:-/dev/i2c-0:0x48}"
@@ -31,6 +32,7 @@ Options:
   --profile NAME        test or production (default: test)
   --identity N          TLS identity number (default: 0)
   --slot A|B            TLS identity slot (default: A)
+  --curve NAME          p256 or p384 (default: p256)
   --bus N               I2C bus for se050ctl validation (default: 0)
   --address HEX         I2C address for se050ctl validation (default: 0x48)
   --sss-port VALUE      EX_SSS_BOOT_SSS_PORT value (default: /dev/i2c-0:0x48)
@@ -50,6 +52,7 @@ while [[ $# -gt 0 ]]; do
     --profile) PROFILE="$2"; shift 2 ;;
     --identity) IDENTITY="$2"; shift 2 ;;
     --slot) SLOT="$2"; shift 2 ;;
+    --curve) CURVE="${2,,}"; shift 2 ;;
     --bus) BUS="$2"; shift 2 ;;
     --address) ADDRESS="$2"; shift 2 ;;
     --sss-port) SSS_PORT="$2"; shift 2 ;;
@@ -63,6 +66,11 @@ done
 
 if [[ "$PROFILE" != "test" && "$PROFILE" != "production" ]]; then
   echo "--profile must be test or production" >&2
+  exit 2
+fi
+
+if [[ "$CURVE" != "p256" && "$CURVE" != "p384" ]]; then
+  echo "--curve must be p256 or p384" >&2
   exit 2
 fi
 
@@ -117,6 +125,8 @@ echo "workdir: $WORKDIR"
 
 export EX_SSS_BOOT_SSS_PORT="$SSS_PORT"
 
+echo "TLS identity curve: $CURVE"
+
 origin_args=()
 if (( IMPORTED == 1 )); then
   origin_args+=(--imported)
@@ -130,12 +140,22 @@ LIVE_PUBLIC_DER="$WORKDIR/se050-public.der"
 CLIENT_PUBLIC_DER="$WORKDIR/client-public.der"
 OPENSSL_CNF="$WORKDIR/openssl.cnf"
 
+client_digest="sha256"
+client_sigalg="ECDSA+SHA256"
+client_named_curve="prime256v1"
+if [[ "$CURVE" == "p384" ]]; then
+  client_digest="sha384"
+  client_sigalg="ECDSA+SHA384"
+  client_named_curve="secp384r1"
+fi
+
 "$SE050CTL" tls-key-ref-file \
   -b "$BUS" \
   -a "$ADDRESS" \
   --profile "$PROFILE" \
   --identity "$IDENTITY" \
   --slot "$SLOT" \
+  --curve "$CURVE" \
   "${origin_args[@]}" \
   --out "$REFERENCE_KEY"
 
@@ -153,6 +173,7 @@ echo "reference-key permissions: 0600"
   --profile "$PROFILE" \
   --identity "$IDENTITY" \
   --slot "$SLOT" \
+  --curve "$CURVE" \
   "${origin_args[@]}" \
   --format spki-der \
   --out "$LIVE_PUBLIC_DER"
@@ -234,7 +255,7 @@ OPENSSL_CONF=/dev/null openssl x509 \
 
 OPENSSL_CONF="$OPENSSL_CNF" openssl req \
   -new \
-  -sha256 \
+  "-${client_digest}" \
   -key "$REFERENCE_KEY" \
   -subj "/CN=se050-std-net-client-${IDENTITY}-${SLOT}" \
   -out "$WORKDIR/client.csr" \
@@ -315,14 +336,16 @@ run_nim_handshake() {
 
   local -a server_tls_args=("$tls_option")
 
-  # TLS 1.3 with the same reference key already succeeds. For TLS 1.2,
-  # constrain the test to an ECDHE-ECDSA cipher actually offered by the Nim/
-  # OpenSSL client, P-256, and ECDSA/SHA-256 for client CertificateVerify.
+  # TLS 1.3 negotiates the client CertificateVerify algorithm normally.
+  # For TLS 1.2, select both the ECDSA signature algorithm and the EC group
+  # consistently with the managed TLS identity curve. OpenSSL also uses the
+  # configured group list while validating the peer EC certificate, so forcing
+  # prime256v1 here would reject a valid P-384 client key as "wrong curve".
   if [[ "$label" == "tls1_2" ]]; then
     server_tls_args+=(
       -cipher ECDHE-ECDSA-AES128-GCM-SHA256
-      -named_curve prime256v1
-      -client_sigalgs ECDSA+SHA256
+      -named_curve "$client_named_curve"
+      -client_sigalgs "$client_sigalg"
       -state
       -msg
     )
@@ -398,4 +421,4 @@ echo "OpenSSL config: $OPENSSL_CNF"
 echo "reference key: $REFERENCE_KEY"
 echo "client certificate: $WORKDIR/client.crt"
 echo "Nim client binary: $CLIENT_BIN"
-echo "Nim std/net transparent SE050 mTLS test: PASS"
+echo "Nim std/net transparent SE050 $CURVE mTLS test: PASS"
