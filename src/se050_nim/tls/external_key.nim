@@ -8,9 +8,10 @@
 # limited to P-256 until device curve capability/provisioning is handled.
 #
 # No public API exports or retains the private scalar. The decoded EVP_PKEY
-# exists only while the input is being validated. The import path extracts the
-# P-256 scalar only after all host-side checks and the SE050 empty-slot guard,
-# sends it through the sensitive transport path, and clears the temporary copy.
+# exists only while the input is being validated. P-256 import extracts its
+# scalar only after all host-side checks and the SE050 empty-slot guard. P-384
+# now has the same private scalar extraction primitive prepared internally, but
+# it is not connected to the managed SE050 import workflow in this step.
 
 import ../errors
 import ../openssl_ffi
@@ -55,12 +56,25 @@ type
     publicKey*: array[65, uint8]
     publicKeySpkiDer*: seq[uint8]
 
+  P384PrivateKeyInfo* = object
+    ## Validated public metadata for an external P-384 private key.
+    ##
+    ## The private scalar is intentionally not retained or exposed.
+    bits*: int
+    curveName*: string
+    publicKey*: array[97, uint8]
+    publicKeySpkiDer*: seq[uint8]
+
   ValidatedEcPrivateKey = object
     handle: pointer
     curve: ExternalEcCurve
     curveName: string
 
   ValidatedP256PrivateKey = object
+    handle: pointer
+    curveName: string
+
+  ValidatedP384PrivateKey = object
     handle: pointer
     curveName: string
 
@@ -74,6 +88,7 @@ const
   P521CoordinateLength = 66
 
   P256UncompressedPublicKeyLength = 65
+  P384UncompressedPublicKeyLength = 97
 
   OpenSslParamGroupName = "group"
   OpenSslParamPrivate = "priv"
@@ -311,6 +326,38 @@ proc readP256PrivateScalar(
 
   result = ok()
 
+proc readP384PrivateScalar(
+    publicKey: pointer,
+    output: var array[48, uint8]
+): SE[void] =
+  ## Extracts the validated P-384 private scalar into a caller-owned temporary
+  ## buffer.
+  ##
+  ## This helper remains private: public host-side APIs expose only public
+  ## metadata. The OpenSSL BIGNUM is cleared before release, and the future
+  ## SE050 import caller must clear `output` immediately after WriteECKey.
+  var value: pointer = nil
+
+  opensslErrorClear()
+  if evpPublicKeyGetBnParam(publicKey, OpenSslParamPrivate, addr value) != 1 or
+      value == nil:
+    return fail[void](
+      seCryptoError,
+      opensslErrorMessage("OpenSSL failed to read the P-384 private scalar")
+    )
+
+  defer:
+    bnClearFree(value)
+
+  let written = bnToBinaryPadded(value, addr output[0], cint(output.len))
+  if written != cint(output.len):
+    return fail[void](
+      seCryptoError,
+      opensslErrorMessage("OpenSSL failed to encode the P-384 private scalar")
+    )
+
+  result = ok()
+
 proc readEcPublicKey(
     publicKey: pointer,
     curve: ExternalEcCurve
@@ -417,6 +464,29 @@ proc loadValidatedP256PrivateKey(
     curveName: decoded.value.curveName
   ))
 
+proc loadValidatedP384PrivateKey(
+    encodedKey: openArray[uint8]
+): SE[ValidatedP384PrivateKey] =
+  let decoded = loadValidatedEcPrivateKey(encodedKey)
+  if not decoded.ok:
+    return fail[ValidatedP384PrivateKey](
+      decoded.error.kind,
+      decoded.error.message,
+      decoded.error.sw
+    )
+
+  if decoded.value.curve != eecP384:
+    evpPublicKeyFree(decoded.value.handle)
+    return fail[ValidatedP384PrivateKey](
+      seInvalidArgument,
+      "external TLS EC private key is not a P-384 key"
+    )
+
+  result = ok(ValidatedP384PrivateKey(
+    handle: decoded.value.handle,
+    curveName: decoded.value.curveName
+  ))
+
 proc extractEcPrivateKeyInfo(
     decoded: ValidatedEcPrivateKey
 ): SE[EcPrivateKeyInfo] =
@@ -481,6 +551,43 @@ proc extractP256PrivateKeyInfo(
     publicKeySpkiDer: spki.value
   ))
 
+proc extractP384PrivateKeyInfo(
+    publicKeyHandle: pointer,
+    curveName: string
+): SE[P384PrivateKeyInfo] =
+  let publicKey = readEcPublicKey(publicKeyHandle, eecP384)
+  if not publicKey.ok:
+    return fail[P384PrivateKeyInfo](
+      publicKey.error.kind,
+      publicKey.error.message,
+      publicKey.error.sw
+    )
+
+  if publicKey.value.len != P384UncompressedPublicKeyLength:
+    return fail[P384PrivateKeyInfo](
+      seCryptoError,
+      "OpenSSL returned an unexpected P-384 public-key length"
+    )
+
+  let spki = encodePublicKeySpkiDer(publicKeyHandle)
+  if not spki.ok:
+    return fail[P384PrivateKeyInfo](
+      spki.error.kind,
+      spki.error.message,
+      spki.error.sw
+    )
+
+  var fixedPublicKey: array[97, uint8]
+  for i in 0 ..< fixedPublicKey.len:
+    fixedPublicKey[i] = publicKey.value[i]
+
+  result = ok(P384PrivateKeyInfo(
+    bits: P384Bits,
+    curveName: curveName,
+    publicKey: fixedPublicKey,
+    publicKeySpkiDer: spki.value
+  ))
+
 proc parseEcPrivateKeyBytes(
     encodedKey: openArray[uint8]
 ): SE[EcPrivateKeyInfo] =
@@ -526,6 +633,31 @@ proc parseP256PrivateKeyBytes(
     result = fail[P256PrivateKeyInfo](
       seCryptoError,
       "OpenSSL private-key handling failed: " & e.msg
+    )
+
+proc parseP384PrivateKeyBytes(
+    encodedKey: openArray[uint8]
+): SE[P384PrivateKeyInfo] =
+  let decoded = loadValidatedP384PrivateKey(encodedKey)
+  if not decoded.ok:
+    return fail[P384PrivateKeyInfo](
+      decoded.error.kind,
+      decoded.error.message,
+      decoded.error.sw
+    )
+
+  defer:
+    evpPublicKeyFree(decoded.value.handle)
+
+  try:
+    result = extractP384PrivateKeyInfo(
+      decoded.value.handle,
+      decoded.value.curveName
+    )
+  except CatchableError as e:
+    result = fail[P384PrivateKeyInfo](
+      seCryptoError,
+      "OpenSSL P-384 private-key handling failed: " & e.msg
     )
 
 proc validateP256PrivateKeyCertificateMatchHandle(
@@ -602,6 +734,84 @@ proc validateP256PrivateKeyCertificateMatchBytes(
     evpPublicKeyFree(decoded.value.handle)
 
   result = validateP256PrivateKeyCertificateMatchHandle(
+    decoded.value,
+    certificateDer
+  )
+
+proc validateP384PrivateKeyCertificateMatchHandle(
+    decoded: ValidatedP384PrivateKey,
+    certificateDer: openArray[uint8]
+): SE[P384PrivateKeyInfo] =
+  let certificate = loadX509Certificate(certificateDer)
+  if not certificate.ok:
+    return fail[P384PrivateKeyInfo](
+      certificate.error.kind,
+      certificate.error.message,
+      certificate.error.sw
+    )
+
+  defer:
+    x509Free(certificate.value)
+
+  try:
+    let certificatePublicKey = x509GetPublicKey(certificate.value)
+    if certificatePublicKey == nil:
+      return fail[P384PrivateKeyInfo](
+        seCryptoError,
+        opensslErrorMessage("OpenSSL failed to extract the certificate public key")
+      )
+
+    defer:
+      evpPublicKeyFree(certificatePublicKey)
+
+    opensslErrorClear()
+    let comparison = evpPublicKeyEq(decoded.handle, certificatePublicKey)
+    case comparison
+    of 1:
+      result = extractP384PrivateKeyInfo(
+        decoded.handle,
+        decoded.curveName
+      )
+    of 0, -1:
+      result = fail[P384PrivateKeyInfo](
+        seInvalidArgument,
+        "certificate public key does not match the external TLS P-384 private key"
+      )
+    of -2:
+      result = fail[P384PrivateKeyInfo](
+        seCryptoError,
+        "OpenSSL does not support comparing the external private key and " &
+          "certificate public key"
+      )
+    else:
+      result = fail[P384PrivateKeyInfo](
+        seCryptoError,
+        opensslErrorMessage(
+          "OpenSSL failed to compare the external private key and certificate public key"
+        )
+      )
+  except CatchableError as e:
+    result = fail[P384PrivateKeyInfo](
+      seCryptoError,
+      "OpenSSL P-384 private-key/certificate matching failed: " & e.msg
+    )
+
+proc validateP384PrivateKeyCertificateMatchBytes(
+    encodedKey: openArray[uint8],
+    certificateDer: openArray[uint8]
+): SE[P384PrivateKeyInfo] =
+  let decoded = loadValidatedP384PrivateKey(encodedKey)
+  if not decoded.ok:
+    return fail[P384PrivateKeyInfo](
+      decoded.error.kind,
+      decoded.error.message,
+      decoded.error.sw
+    )
+
+  defer:
+    evpPublicKeyFree(decoded.value.handle)
+
+  result = validateP384PrivateKeyCertificateMatchHandle(
     decoded.value,
     certificateDer
   )
@@ -810,6 +1020,53 @@ proc parseP256PrivateKey*(encodedKey: string): SE[P256PrivateKeyInfo] =
 
   result = parseP256PrivateKeyBytes(
     encodedKey.toOpenArrayByte(0, encodedKey.high)
+  )
+
+proc parseP384PrivateKey*(
+    encodedKey: openArray[uint8]
+): SE[P384PrivateKeyInfo] =
+  ## Parses and validates one unencrypted P-384 private key from PEM or DER.
+  ##
+  ## This API returns only public metadata. The private scalar is neither
+  ## exported nor retained.
+  result = parseP384PrivateKeyBytes(encodedKey)
+
+proc parseP384PrivateKey*(encodedKey: string): SE[P384PrivateKeyInfo] =
+  ## String overload suitable for binary-safe `readFile()` input.
+  if encodedKey.len == 0:
+    return fail[P384PrivateKeyInfo](
+      seInvalidArgument,
+      "external private key must not be empty"
+    )
+
+  result = parseP384PrivateKeyBytes(
+    encodedKey.toOpenArrayByte(0, encodedKey.high)
+  )
+
+proc validateP384PrivateKeyCertificateMatch*(
+    encodedKey: openArray[uint8],
+    certificateDer: openArray[uint8]
+): SE[P384PrivateKeyInfo] =
+  ## Parses and validates a P-384 private key and verifies that its key pair
+  ## matches the SubjectPublicKeyInfo contained in the DER certificate.
+  ##
+  ## No SE050 operation is performed by this API.
+  result = validateP384PrivateKeyCertificateMatchBytes(encodedKey, certificateDer)
+
+proc validateP384PrivateKeyCertificateMatch*(
+    encodedKey: string,
+    certificateDer: openArray[uint8]
+): SE[P384PrivateKeyInfo] =
+  ## String overload suitable for binary-safe `readFile()` private-key input.
+  if encodedKey.len == 0:
+    return fail[P384PrivateKeyInfo](
+      seInvalidArgument,
+      "external private key must not be empty"
+    )
+
+  result = validateP384PrivateKeyCertificateMatchBytes(
+    encodedKey.toOpenArrayByte(0, encodedKey.high),
+    certificateDer
   )
 
 proc validateP256PrivateKeyCertificateMatch*(
