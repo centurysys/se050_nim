@@ -7,13 +7,20 @@
 # accepts only NIST P-256 EC private keys, matching the currently supported
 # managed TLS identity profile.
 #
-# No private scalar is exported or retained by this module. The decoded
-# EVP_PKEY exists only while the input is being validated and public metadata
-# is extracted. A later import step can add narrowly scoped private-component
-# extraction immediately before the SE050 write operation.
+# No public API exports or retains the private scalar. The decoded EVP_PKEY
+# exists only while the input is being validated. The import path extracts the
+# P-256 scalar only after all host-side checks and the SE050 empty-slot guard,
+# sends it through the sensitive transport path, and clears the temporary copy.
 
 import ../errors
 import ../openssl_ffi
+import ../secure_memory
+import ../transport
+import ../apdu
+import ../objects
+import ../keys
+import ./profile
+import ./live_identity
 
 # =============================================================================
 # Types and constants
@@ -39,6 +46,7 @@ const
   P256UncompressedPublicKeyLength = 65
 
   OpenSslParamGroupName = "group"
+  OpenSslParamPrivate = "priv"
   OpenSslParamPublicX = "qx"
   OpenSslParamPublicY = "qy"
 
@@ -203,6 +211,35 @@ proc readP256PublicCoordinate(
 
   result = ok()
 
+proc readP256PrivateScalar(
+    publicKey: pointer,
+    output: var array[32, uint8]
+): SE[void] =
+  ## Extracts the validated P-256 private scalar into a caller-owned temporary
+  ## buffer. The OpenSSL BIGNUM is cleared before release; the caller must also
+  ## clear `output` as soon as the SE050 write has completed.
+  var value: pointer = nil
+
+  opensslErrorClear()
+  if evpPublicKeyGetBnParam(publicKey, OpenSslParamPrivate, addr value) != 1 or
+      value == nil:
+    return fail[void](
+      seCryptoError,
+      opensslErrorMessage("OpenSSL failed to read the P-256 private scalar")
+    )
+
+  defer:
+    bnClearFree(value)
+
+  let written = bnToBinaryPadded(value, addr output[0], cint(output.len))
+  if written != cint(output.len):
+    return fail[void](
+      seCryptoError,
+      opensslErrorMessage("OpenSSL failed to encode the P-256 private scalar")
+    )
+
+  result = ok()
+
 proc readP256PublicKey(publicKey: pointer): SE[array[65, uint8]] =
   var x: array[32, uint8]
   var y: array[32, uint8]
@@ -327,21 +364,10 @@ proc parseP256PrivateKeyBytes(
       "OpenSSL private-key handling failed: " & e.msg
     )
 
-proc validateP256PrivateKeyCertificateMatchBytes(
-    encodedKey: openArray[uint8],
+proc validateP256PrivateKeyCertificateMatchHandle(
+    decoded: ValidatedP256PrivateKey,
     certificateDer: openArray[uint8]
 ): SE[P256PrivateKeyInfo] =
-  let decoded = loadValidatedP256PrivateKey(encodedKey)
-  if not decoded.ok:
-    return fail[P256PrivateKeyInfo](
-      decoded.error.kind,
-      decoded.error.message,
-      decoded.error.sw
-    )
-
-  defer:
-    evpPublicKeyFree(decoded.value.handle)
-
   let certificate = loadX509Certificate(certificateDer)
   if not certificate.ok:
     return fail[P256PrivateKeyInfo](
@@ -365,12 +391,12 @@ proc validateP256PrivateKeyCertificateMatchBytes(
       evpPublicKeyFree(certificatePublicKey)
 
     opensslErrorClear()
-    let comparison = evpPublicKeyEq(decoded.value.handle, certificatePublicKey)
+    let comparison = evpPublicKeyEq(decoded.handle, certificatePublicKey)
     case comparison
     of 1:
       result = extractP256PrivateKeyInfo(
-        decoded.value.handle,
-        decoded.value.curveName
+        decoded.handle,
+        decoded.curveName
       )
     of 0, -1:
       result = fail[P256PrivateKeyInfo](
@@ -395,6 +421,184 @@ proc validateP256PrivateKeyCertificateMatchBytes(
       seCryptoError,
       "OpenSSL private-key/certificate matching failed: " & e.msg
     )
+
+proc validateP256PrivateKeyCertificateMatchBytes(
+    encodedKey: openArray[uint8],
+    certificateDer: openArray[uint8]
+): SE[P256PrivateKeyInfo] =
+  let decoded = loadValidatedP256PrivateKey(encodedKey)
+  if not decoded.ok:
+    return fail[P256PrivateKeyInfo](
+      decoded.error.kind,
+      decoded.error.message,
+      decoded.error.sw
+    )
+
+  defer:
+    evpPublicKeyFree(decoded.value.handle)
+
+  result = validateP256PrivateKeyCertificateMatchHandle(
+    decoded.value,
+    certificateDer
+  )
+
+proc withCleanupNote(
+    primary: Se050Error,
+    cleanupNote: string
+): SE[TlsIdentityLiveInfo] =
+  if cleanupNote.len == 0:
+    return fail[TlsIdentityLiveInfo](
+      primary.kind,
+      primary.message,
+      primary.sw
+    )
+
+  result = fail[TlsIdentityLiveInfo](
+    primary.kind,
+    primary.message & "; " & cleanupNote,
+    primary.sw
+  )
+
+proc cleanupNewTlsIdentityObject(
+    se: Se050Transport,
+    profile: TlsIdentityProfile
+): string =
+  ## Best-effort cleanup after an import attempt. The slot was proven empty
+  ## immediately before WriteECKey, so any object now present was created by
+  ## this import attempt.
+  let exists = se.objectExists(
+    objectId = profile.keyObjectId,
+    selectFirst = false
+  )
+  if not exists.ok:
+    return "cleanup could not confirm imported object state: " &
+      exists.error.errorMessage()
+
+  if not exists.value:
+    return ""
+
+  let deleted = se.deleteSecureObject(
+    objectId = profile.keyObjectId,
+    selectFirst = false
+  )
+  if not deleted.ok:
+    return "cleanup could not delete the newly imported TLS object: " &
+      deleted.error.errorMessage()
+
+  result = ""
+
+proc importP256TlsIdentityBytes(
+    se: Se050Transport,
+    profile: TlsIdentityProfile,
+    encodedKey: openArray[uint8],
+    certificateDer: openArray[uint8]
+): SE[TlsIdentityLiveInfo] =
+  ## Imports one externally generated P-256 TLS identity after completing all
+  ## host-side key/certificate checks and proving that the managed slot is empty.
+  if not profile.isValid():
+    return fail[TlsIdentityLiveInfo](
+      seInvalidArgument,
+      "TLS identity profile is invalid"
+    )
+
+  let decoded = loadValidatedP256PrivateKey(encodedKey)
+  if not decoded.ok:
+    return fail[TlsIdentityLiveInfo](
+      decoded.error.kind,
+      decoded.error.message,
+      decoded.error.sw
+    )
+
+  defer:
+    evpPublicKeyFree(decoded.value.handle)
+
+  let keyInfo = validateP256PrivateKeyCertificateMatchHandle(
+    decoded.value,
+    certificateDer
+  )
+  if not keyInfo.ok:
+    return fail[TlsIdentityLiveInfo](
+      keyInfo.error.kind,
+      keyInfo.error.message,
+      keyInfo.error.sw
+    )
+
+  # No SE050 command is issued until the complete host-side key and certificate
+  # validation above has succeeded.
+  let selected = se.selectApplet()
+  if not selected.ok:
+    return fail[TlsIdentityLiveInfo](
+      selected.error.kind,
+      selected.error.message,
+      selected.error.sw
+    )
+
+  let exists = se.objectExists(
+    objectId = profile.keyObjectId,
+    selectFirst = false
+  )
+  if not exists.ok:
+    return fail[TlsIdentityLiveInfo](
+      exists.error.kind,
+      exists.error.message,
+      exists.error.sw
+    )
+
+  if exists.value:
+    return fail[TlsIdentityLiveInfo](
+      seInvalidArgument,
+      "TLS identity import refused because the managed object slot already exists"
+    )
+
+  # Extract the private scalar only after all validation and the empty-slot
+  # guard have completed. This is the only extra CPU-side copy of the scalar.
+  var privateScalar: array[32, uint8]
+  let scalar = readP256PrivateScalar(decoded.value.handle, privateScalar)
+  if not scalar.ok:
+    secureZero(privateScalar)
+    return fail[TlsIdentityLiveInfo](
+      scalar.error.kind,
+      scalar.error.message,
+      scalar.error.sw
+    )
+
+  var imported: SE[void]
+  try:
+    imported = se.importP256KeyPair(
+      objectId = profile.keyObjectId,
+      privateKey = privateScalar,
+      publicKey = keyInfo.value.publicKey,
+      policy = profile.keyPolicy(),
+      selectFirst = false
+    )
+  finally:
+    secureZero(privateScalar)
+
+  if not imported.ok:
+    return withCleanupNote(
+      imported.error,
+      cleanupNewTlsIdentityObject(se, profile)
+    )
+
+  let live = se.inspectImportedTlsIdentity(profile)
+  if not live.ok:
+    return withCleanupNote(
+      live.error,
+      cleanupNewTlsIdentityObject(se, profile)
+    )
+
+  if live.value.publicKey != @(keyInfo.value.publicKey):
+    let mismatch = Se050Error(
+      kind: seTlsIdentityValidationFailed,
+      message: "imported TLS public key does not match the validated external key",
+      sw: 0
+    )
+    return withCleanupNote(
+      mismatch,
+      cleanupNewTlsIdentityObject(se, profile)
+    )
+
+  result = live
 
 # =============================================================================
 # Public API
@@ -447,5 +651,52 @@ proc validateP256PrivateKeyCertificateMatch*(
   result = validateP256PrivateKeyCertificateMatchBytes(
     encodedKey.toOpenArrayByte(0, encodedKey.high),
     certificateDer
+  )
+
+
+proc importP256TlsIdentity*(
+    se: Se050Transport,
+    profile: TlsIdentityProfile,
+    encodedKey: openArray[uint8],
+    certificateDer: openArray[uint8]
+): SE[TlsIdentityLiveInfo] =
+  ## Imports an externally generated P-256 private key into one managed TLS slot.
+  ##
+  ## The private key and DER certificate are fully parsed and matched before any
+  ## SE050 command is issued. Existing objects are never overwritten. The
+  ## private scalar is extracted only immediately before WriteECKey, sent over
+  ## the sensitive transport path, and its temporary CPU copy is then cleared.
+  ##
+  ## On a failed WriteECKey or failed post-import live validation, the function
+  ## makes a best-effort attempt to remove any object created by this call.
+  ##
+  ## Ownership of `encodedKey` remains with the caller. A caller that loaded the
+  ## key into mutable memory (for example with readFile()) should clear that
+  ## original buffer after this function returns.
+  result = importP256TlsIdentityBytes(
+    se = se,
+    profile = profile,
+    encodedKey = encodedKey,
+    certificateDer = certificateDer
+  )
+
+proc importP256TlsIdentity*(
+    se: Se050Transport,
+    profile: TlsIdentityProfile,
+    encodedKey: string,
+    certificateDer: openArray[uint8]
+): SE[TlsIdentityLiveInfo] =
+  ## Binary-safe string overload for private-key file contents.
+  if encodedKey.len == 0:
+    return fail[TlsIdentityLiveInfo](
+      seInvalidArgument,
+      "external private key must not be empty"
+    )
+
+  result = importP256TlsIdentityBytes(
+    se = se,
+    profile = profile,
+    encodedKey = encodedKey.toOpenArrayByte(0, encodedKey.high),
+    certificateDer = certificateDer
   )
 

@@ -165,3 +165,31 @@ suite "external TLS P-256 private-key parsing":
     if not matched.ok:
       check matched.error.kind in {seCryptoError, seInvalidResponse}
 
+  test "end-to-end import rejects an invalid profile before transport access":
+    var profile = testTlsIdentityProfile(0'u16, tisSlotA)
+    profile.keyRole = "invalid-role"
+
+    let se: Se050Transport = nil
+    let imported = se.importP256TlsIdentity(
+      profile,
+      P256Pkcs8Pem,
+      bytesFromBase64(MatchingCertificateDerBase64)
+    )
+
+    check not imported.ok
+    check imported.error.kind == seInvalidArgument
+    check imported.error.message == "TLS identity profile is invalid"
+
+  test "end-to-end import rejects a mismatched certificate before transport access":
+    let profile = testTlsIdentityProfile(0'u16, tisSlotA)
+    let se: Se050Transport = nil
+    let imported = se.importP256TlsIdentity(
+      profile,
+      P256Pkcs8Pem,
+      bytesFromBase64(OtherP256CertificateDerBase64)
+    )
+
+    check not imported.ok
+    check imported.error.kind == seInvalidArgument
+    check imported.error.message.contains("does not match")
+

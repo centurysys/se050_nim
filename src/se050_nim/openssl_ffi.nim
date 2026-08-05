@@ -145,6 +145,12 @@ proc bnFree*(value: pointer) {.
   dynlib: LibCrypto
 .}
 
+proc bnClearFree*(value: pointer) {.
+  cdecl,
+  importc: "BN_clear_free",
+  dynlib: LibCrypto
+.}
+
 proc osslDecoderContextNewForPkey*(
     publicKey: ptr pointer,
     inputType: cstring,
