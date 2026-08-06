@@ -86,27 +86,6 @@ type
 # Utility
 # =============================================================================
 
-proc parseBusNumber(s: string): int =
-  let v = parseInt(s.strip())
-  if v < 0:
-    raise newException(ValueError, &"I2C bus number must be >= 0: {s}")
-  result = v
-
-proc parseI2cAddress(s: string): uint8 =
-  ## Parses a 7-bit I2C address.
-  ##
-  ## The value is treated as hexadecimal to preserve the existing se050_uid
-  ## behavior. Both "48" and "0x48" mean 0x48.
-  var t = s.strip()
-  if t.startsWith("0x") or t.startsWith("0X"):
-    t = t[2 .. ^1]
-
-  let v = parseHexInt(t)
-  if v < 0 or v > 0x7F:
-    raise newException(ValueError, &"I2C address must be in 7-bit range: {s}")
-
-  result = uint8(v)
-
 proc parseLength(s: string, minValue: int, maxValue: int): int =
   let v = parseInt(s.strip())
   if v < minValue or v > maxValue:
@@ -724,10 +703,9 @@ proc printResolvedObjectRef(objectRef: ObjectRef) =
 # =============================================================================
 
 proc openAndRequestAtr(busText: string, addressText: string, debug: bool): Se050Transport =
-  let bus = parseBusNumber(busText)
-  let address = parseI2cAddress(addressText)
+  let endpoint = resolveSe050I2cEndpoint(busText, addressText)
 
-  result = openSe050(bus, address = address, debug = debug)
+  result = openSe050(endpoint.bus, address = endpoint.address, debug = debug)
 
   let atr = result.requestAtr()
   if not atr.ok:
@@ -2184,8 +2162,8 @@ proc main(): int =
 
     command("uid"):
       help("Read the SE050 unique ID object.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       flag("--colon", help = "Print UID as AA:BB:CC...")
       run:
@@ -2194,8 +2172,8 @@ proc main(): int =
 
     command("random"):
       help("Generate random bytes using SE050 GetRandom.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("-l", "--len", required = true, help = "Random byte length, 1..255")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       flag("--colon", help = "Print bytes as AA:BB:CC...")
@@ -2205,16 +2183,16 @@ proc main(): int =
 
     command("curve-list"):
       help("Read the currently instantiated SE05x Weierstrass EC curves.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
         quit(runCurveList(opts.bus, opts.address, opts.debug))
 
     command("curve-provision-p384"):
       help("Provision the fixed standard NIST P-384 curve parameters when currently not-set.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       flag("--yes", help = "Confirm modification of persistent global SE05x curve state")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
@@ -2227,16 +2205,16 @@ proc main(): int =
 
     command("version"):
       help("Read SE050 applet version and feature configuration.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
         quit(runVersion(opts.bus, opts.address, opts.debug))
 
     command("factory-list"):
       help("Show known NXP factory-provisioned cloud and attestation objects.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
         quit(runFactoryList(opts.bus, opts.address, opts.debug))
@@ -2250,8 +2228,8 @@ proc main(): int =
 
     command("factory-cert"):
       help("Export an NXP factory-provisioned cloud identity certificate.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("--kind", default = some("ecc"), help = "Factory identity kind: ecc or rsa, default: ecc")
       option("--identity", default = some("0"), help = "Factory identity number: 0 or 1, default: 0")
       option("--format", default = some("pem"), help = "Output format: pem or der, default: pem")
@@ -2270,8 +2248,8 @@ proc main(): int =
 
     command("factory-pubkey"):
       help("Export the public key from an NXP factory cloud certificate.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("--kind", default = some("ecc"), help = "Factory identity kind: ecc or rsa, default: ecc")
       option("--identity", default = some("0"), help = "Factory identity number: 0 or 1, default: 0")
       option("--format", default = some("spki-der"), help = "Output format: spki-der or pem, default: spki-der")
@@ -2302,8 +2280,8 @@ proc main(): int =
 
     command("tls-key-ref-file"):
       help("Export an attestation-validated TLS identity as an NXP OpenSSL reference-key PEM.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("--profile", required = true, help = "TLS identity profile: test or production")
       option("--identity", default = some("0"), help = "TLS identity number, default: 0")
       option("--slot", required = true, help = "TLS identity slot: A or B")
@@ -2326,8 +2304,8 @@ proc main(): int =
 
     command("tls-key-pubkey"):
       help("Export an attestation-validated TLS identity public key.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("--profile", required = true, help = "TLS identity profile: test or production")
       option("--identity", default = some("0"), help = "TLS identity number, default: 0")
       option("--slot", required = true, help = "TLS identity slot: A or B")
@@ -2352,8 +2330,8 @@ proc main(): int =
 
     command("tls-key-import"):
       help("Import an external P-256 or P-384 private key into one empty SE050 TLS identity slot.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("--profile", required = true, help = "TLS identity profile: test or production")
       option("--identity", default = some("0"), help = "TLS identity number, default: 0")
       option("--slot", required = true, help = "TLS identity slot: A or B")
@@ -2376,8 +2354,8 @@ proc main(): int =
 
     command("tls-keygen"):
       help("Create or validate one fixed SE050 TLS client identity A/B key.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("--profile", required = true, help = "TLS identity profile: test or production")
       option("--identity", default = some("0"), help = "TLS identity number, default: 0")
       option("--slot", required = true, help = "TLS identity slot: A or B")
@@ -2394,8 +2372,8 @@ proc main(): int =
 
     command("tls-key-info"):
       help("Validate and show one fixed SE050 TLS client identity A/B key.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("--profile", required = true, help = "TLS identity profile: test or production")
       option("--identity", default = some("0"), help = "TLS identity number, default: 0")
       option("--slot", required = true, help = "TLS identity slot: A or B")
@@ -2416,8 +2394,8 @@ proc main(): int =
 
     command("exists"):
       help("Check whether an SE050 Secure Object identifier exists.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("--id", default = some(""), help = "Secure Object ID in hex, e.g. 0x30000100")
       option("--area", default = some(""), help = "Object area: dev, customer, vendor, nxp, internal")
       option("--index", default = some(""), help = "Area-relative object index, decimal or 0x-prefixed hex")
@@ -2429,8 +2407,8 @@ proc main(): int =
 
     command("info"):
       help("Read type and size information for an SE050 Secure Object identifier.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("--id", default = some(""), help = "Secure Object ID in hex, e.g. 0x30000100")
       option("--area", default = some(""), help = "Object area: dev, customer, vendor, nxp, internal")
       option("--index", default = some(""), help = "Area-relative object index, decimal or 0x-prefixed hex")
@@ -2441,8 +2419,8 @@ proc main(): int =
 
     command("list"):
       help("List visible SE050 Secure Object identifiers.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("--filter", default = some("0xFF"), help = "SecureObjectType filter byte, default: 0xFF for all types")
       option("--area", default = some(""), help = "Only show IDs in an area: dev, customer, vendor, nxp, internal")
       flag("--annotate", help = "Print area and known-name columns")
@@ -2452,8 +2430,8 @@ proc main(): int =
 
     command("keygen"):
       help("Generate a development SE050 key pair. Only area dev is allowed by this CLI.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("--id", default = some(""), help = "Development Secure Object ID in hex, e.g. 0x30000100")
       option("--area", default = some(""), help = "Object area. For keygen, only dev is allowed")
       option("--index", default = some(""), help = "Area-relative object index, decimal or 0x-prefixed hex")
@@ -2474,8 +2452,8 @@ proc main(): int =
 
     command("pubkey"):
       help("Read the public key from an SE050 EC key pair or EC public key object.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("--id", default = some(""), help = "Secure Object ID in hex, e.g. 0x30000100")
       option("--area", default = some(""), help = "Object area: dev, customer, vendor, nxp, internal")
       option("--index", default = some(""), help = "Area-relative object index, decimal or 0x-prefixed hex")
@@ -2499,8 +2477,8 @@ proc main(): int =
 
     command("attestation-cert"):
       help("Read the NXP-provisioned SE050 device attestation certificate.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("-o", "--out", required = true, help = "Write the DER certificate to this file")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
@@ -2513,8 +2491,8 @@ proc main(): int =
 
     command("attest-read"):
       help("Read an SE050 EC public key with NXP attestation and capture raw verification inputs.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("--id", default = some(""), help = "Secure Object ID in hex, e.g. 0x30000100")
       option("--area", default = some(""), help = "Object area: dev, customer, vendor, nxp, internal")
       option("--index", default = some(""), help = "Area-relative object index, decimal or 0x-prefixed hex")
@@ -2537,8 +2515,8 @@ proc main(): int =
 
     command("attest-verify"):
       help("Verify a configured kitting key, its NXP certificate chain, attestation signature, and signed object attributes.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("--id", default = some(""), help = "Secure Object ID in hex, e.g. 0x30000100")
       option("--area", default = some(""), help = "Object area: dev, customer, vendor, nxp, internal")
       option("--index", default = some(""), help = "Area-relative object index, decimal or 0x-prefixed hex")
@@ -2563,8 +2541,8 @@ proc main(): int =
 
     command("kitting-verify"):
       help("Verify this unit against an attested multi-device kitting CSV.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("--input", required = true, help = "Multi-device kitting CSV file")
       option("--profile", default = some("production"), help = "Kitting profile: production or test, default: production")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
@@ -2579,8 +2557,8 @@ proc main(): int =
 
     command("derive"):
       help("Derive an ECDH shared secret using an SE050 EC key pair and a peer public key file.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("--id", default = some(""), help = "Secure Object ID in hex, e.g. 0x30000100")
       option("--area", default = some(""), help = "Object area: dev, customer, vendor, nxp, internal")
       option("--index", default = some(""), help = "Area-relative object index, decimal or 0x-prefixed hex")
@@ -2606,8 +2584,8 @@ proc main(): int =
 
     command("delete"):
       help("Delete an SE050 Secure Object identifier. Destructive operation; reserved ranges are always guarded.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("--id", default = some(""), help = "Secure Object ID in hex, e.g. 0x30000100")
       option("--area", default = some(""), help = "Object area: dev, customer, vendor, nxp, internal")
       option("--index", default = some(""), help = "Area-relative object index, decimal or 0x-prefixed hex")

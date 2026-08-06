@@ -1,5 +1,6 @@
 import se050_nim/[
   errors,
+  endpoint,
   transport,
   apdu,
   tlv,
@@ -18,6 +19,7 @@ import se050_nim/[
 ]
 
 export errors
+export endpoint
 export transport
 export apdu
 export tlv

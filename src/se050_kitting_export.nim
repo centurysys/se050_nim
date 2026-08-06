@@ -21,21 +21,6 @@ import se050_nim
 # Utility
 # =============================================================================
 
-proc parseBusNumber(value: string): int =
-  result = parseInt(value.strip())
-  if result < 0:
-    raise newException(ValueError, &"I2C bus must be >= 0: {value}")
-
-proc parseAddress(value: string): uint8 =
-  var text = value.strip()
-  if text.startsWith("0x") or text.startsWith("0X"):
-    text = text[2 .. ^1]
-
-  let parsed = parseHexInt(text)
-  if parsed < 0 or parsed > 0x7F:
-    raise newException(ValueError, &"I2C address must be 0x00..0x7F: {value}")
-  result = uint8(parsed)
-
 proc printError(prefix: string, error: Se050Error) =
   stderr.writeLine &"{prefix}: {error.kind}: {error.message}"
   if error.sw != 0:
@@ -96,9 +81,10 @@ proc openAndRequestAtr(
     addressText: string,
     debug: bool
 ): SE[Se050Transport] =
+  let endpoint = resolveSe050I2cEndpoint(busText, addressText)
   let se = openSe050(
-    parseBusNumber(busText),
-    parseAddress(addressText),
+    endpoint.bus,
+    endpoint.address,
     debug
   )
 
@@ -457,8 +443,8 @@ proc main(): int =
 
     command("test"):
       help("Create or reuse the fixed disposable test key and append its record.")
-      option("-b", "--bus", required = true, help = "I2C bus number")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("--append", required = true, help = "Multi-device kitting CSV path")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
@@ -472,8 +458,8 @@ proc main(): int =
 
     command("production"):
       help("Irreversibly create or reuse the fixed production key and append its record.")
-      option("-b", "--bus", required = true, help = "I2C bus number")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("--append", required = true, help = "Multi-device kitting CSV path")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
