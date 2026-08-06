@@ -10,8 +10,10 @@ NXP Plug & Trust Middlewareには依存せず、組み込みLinux製品から必
 
 - Object `0x7FFF0206`からのUID読出し
 - Applet version/config読出し
+- GlobalPlatform IDENTIFYによるSE050 product/OEF/platform情報の読出し
 - 乱数生成
 - Secure Objectのexists/type/size/list/delete helper
+- `list --long`によるtype/persistence/size一覧と、policy許可範囲のgeneric Object read
 - 開発用EC鍵生成と公開鍵読出し
 - P-256 ECDH shared secret導出
 - NXP事前搭載Attestation鍵・個体証明書の利用
@@ -33,6 +35,7 @@ NXP Plug & Trust Middlewareには依存せず、組み込みLinux製品から必
 - NXP OpenSSL ProviderによるP-256/P-384 Reference KeyからのSE050 ECDSA署名
 - `openssl.cnf`からNXP/default Providerをautoloadし、普通のkey file APIからReference Keyを使用
 - SE050固有コードを含まないNim `std/net` clientでP-256/P-384 TLS 1.2 / TLS 1.3 mTLS client authentication
+- `EX_SSS_BOOT_SSS_PORT`によるdirect-I2C endpoint共通指定と、`status`によるread-only一括診断
 
 Production用`0x20000100`のfirmware KEX生成経路も実装済みですが、不可逆な実機試験はまだ完了していません。
 
@@ -153,7 +156,7 @@ Host OSはtrusted environmentとして扱い、SE050とのdirect I2C通信には
 
 - [`docs/openssl-provider.ja.md`](docs/openssl-provider.ja.md): Provider URI、Reference Key、autoload、transparent TLS
 - [`docs/local-mtls-test.ja.md`](docs/local-mtls-test.ja.md): P-256/P-384のローカルmTLS統合試験
-- [`docs/se050ctl-guide.ja.md`](docs/se050ctl-guide.ja.md): import/curve/reference-key CLI
+- [`docs/se050ctl-guide.ja.md`](docs/se050ctl-guide.ja.md): endpoint、診断、Object read、import/curve/reference-key CLI
 - [`docs/factory-identities.ja.md`](docs/factory-identities.ja.md): NXP factory-provisioned Cloud identity
 - [`docs/aws-iot.ja.md`](docs/aws-iot.ja.md): AWS IoT Core接続手順
 - [`docs/azure-iot.ja.md`](docs/azure-iot.ja.md): Azure IoT Hub接続手順
@@ -233,10 +236,27 @@ NXP Attestation Root/Intermediate証明書は`staticRead()`でバイナリへ組
 
 詳細は[`docs/kitting-guide.ja.md`](docs/kitting-guide.ja.md)を参照してください。
 
-## `se050ctl`共通オプション
+## SE050接続先と`se050ctl`共通オプション
+
+普段使いではNXP Providerと同じ`EX_SSS_BOOT_SSS_PORT`を設定すると、各commandの`-b`指定を省略できます。`se050ctl`と`se050-kitting-export`のdirect-I2C接続で共通に使用します。
+
+```sh
+export EX_SSS_BOOT_SSS_PORT=/dev/i2c-0:0x48
+se050ctl status
+se050ctl product-info
+se050ctl list --long
+```
+
+対応する環境変数形式は`/dev/i2c-N[:0xADDR]`です。AccessManagerの`host:port`形式はdirect-I2C endpointではないため受け付けません。
+
+接続先の優先順位は次のとおりです。
+
+- `-b/--bus`を明示した場合、そのbusを使用し、addressは`-a/--address`またはdefault `0x48`を使用する。環境変数のaddressは混在させない。
+- `-b/--bus`を省略した場合、busは`EX_SSS_BOOT_SSS_PORT`から取得する。addressは`-a/--address`、環境変数内のaddress、default `0x48`の順で選択する。
+- busがCLIにも環境変数にも無い場合はエラーとする。
 
 ```text
--b, --bus <n>          I2C bus番号。例: 0は/dev/i2c-0
+-b, --bus <n>          I2C bus番号。未指定時はEX_SSS_BOOT_SSS_PORT
 -a, --address <hex>    SE050 I2C address。default: 0x48
 -d, --debug            T=1 over I2C frameを表示
 ```
@@ -247,9 +267,12 @@ NXP Attestation Root/Intermediate証明書は`staticRead()`でバイナリへ組
 uid                     UID読出し
 random                  乱数生成
 version                 Applet version/config確認
+product-info            OEF ID / product / platform / patch / ROM情報
+status                  接続先・product・curve・factory/TLS identity一括診断
 curve-list              Weierstrass curve instantiation状態読出し
 curve-provision-p384    standard NIST P-384 curveの明示的provisioning
-exists/info/list        Secure Object確認
+exists/info/list        Secure Object確認（list --longで詳細一覧）
+read                    policyで許可されたSecure Objectのhex表示/raw file出力
 keygen/pubkey           開発用EC鍵生成・公開鍵読出し
 tls-keygen              内部生成P-256 TLS identity作成・検証
 tls-key-import          外部P-256/P-384 TLS private key import
@@ -312,7 +335,8 @@ P-256公開鍵は65 bytesの非圧縮point、ECDH shared secretは32 bytesです
 
 `src/se050_nim.nim`は以下の機能群をre-exportします。
 
-- transport/APDU/TLV、UID、乱数、Secure Object、鍵管理
+- direct-I2C endpoint解決、transport/APDU/TLV、UID、乱数、Secure Object、鍵管理
+- GlobalPlatform IDENTIFY parseと既知SE050 OEF/product mapping
 - Attestation証明書読出し、ReadObject-with-Attestation
 - OpenSSL 3によるSHA-256、ECDSA、X.509検証
 - 組み込みNXP Trust Store

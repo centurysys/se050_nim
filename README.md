@@ -10,8 +10,10 @@ The following paths have been verified on hardware with an SE050 Applet 7.2.x de
 
 - UID read from Object `0x7FFF0206`
 - Applet version/configuration readout
+- SE050 product/OEF/platform identification through GlobalPlatform IDENTIFY
 - random generation
 - Secure Object exists/type/size/list/delete helpers
+- detailed `list --long` object inventory and generic policy-permitted Object reads
 - development EC key generation and public-key readout
 - P-256 ECDH shared-secret derivation
 - use of the NXP pre-provisioned attestation key and device certificate
@@ -33,6 +35,7 @@ The following paths have been verified on hardware with an SE050 Applet 7.2.x de
 - NXP Provider-backed ECDSA signing through both P-256 and P-384 Reference Keys
 - NXP/default Provider autoload through `openssl.cnf`
 - TLS 1.2 and TLS 1.3 mutual TLS from an ordinary Nim `std/net` client containing no SE050-specific application code, for both P-256 and P-384
+- shared direct-I2C endpoint selection through `EX_SSS_BOOT_SSS_PORT` and consolidated read-only `status` diagnostics
 
 The production firmware-KEX path at `0x20000100` is implemented, but its irreversible hardware test is still pending.
 
@@ -149,7 +152,7 @@ Details:
 
 - [`docs/openssl-provider.md`](docs/openssl-provider.md): Provider URI, Reference Keys, autoload, and transparent TLS
 - [`docs/local-mtls-test.md`](docs/local-mtls-test.md): local P-256/P-384 mTLS integration tests
-- [`docs/se050ctl-guide.md`](docs/se050ctl-guide.md): curve/import/reference-key CLI
+- [`docs/se050ctl-guide.md`](docs/se050ctl-guide.md): endpoint, diagnostics, Object read, curve/import/reference-key CLI
 - [`docs/factory-identities.md`](docs/factory-identities.md): NXP factory-provisioned cloud identities
 - [`docs/aws-iot.md`](docs/aws-iot.md): AWS IoT Core provisioning/connection
 - [`docs/azure-iot.md`](docs/azure-iot.md): Azure IoT Hub provisioning/connection
@@ -215,10 +218,27 @@ The NXP Attestation Root and Intermediate certificates are embedded with `static
 
 See [`docs/kitting-guide.md`](docs/kitting-guide.md) for details.
 
-## Common `se050ctl` options
+## SE050 endpoint and common `se050ctl` options
+
+For normal use, set the same `EX_SSS_BOOT_SSS_PORT` environment variable used by the NXP Provider. Both `se050ctl` and `se050-kitting-export` use it for direct-I2C access when `-b` is omitted.
+
+```sh
+export EX_SSS_BOOT_SSS_PORT=/dev/i2c-0:0x48
+se050ctl status
+se050ctl product-info
+se050ctl list --long
+```
+
+The supported environment form is `/dev/i2c-N[:0xADDR]`. AccessManager `host:port` endpoints are not direct-I2C endpoints and are rejected.
+
+Endpoint precedence is:
+
+- With explicit `-b/--bus`, use that bus and `-a/--address` or default `0x48`; do not inherit an address from the environment endpoint.
+- Without `-b/--bus`, get the bus from `EX_SSS_BOOT_SSS_PORT`; address precedence is `-a/--address`, environment endpoint address, then default `0x48`.
+- If neither CLI nor the environment supplies a bus, fail instead of guessing.
 
 ```text
--b, --bus <n>          I2C bus number, e.g. 0 for /dev/i2c-0
+-b, --bus <n>          I2C bus number; otherwise EX_SSS_BOOT_SSS_PORT
 -a, --address <hex>    SE050 I2C address, default: 0x48
 -d, --debug            Print T=1 over I2C frames
 ```
@@ -229,7 +249,10 @@ Main commands:
 uid                 Read the UID
 random              Generate random bytes
 version             Inspect Applet version/config
-exists/info/list    Inspect Secure Objects
+product-info        Inspect OEF/product/platform/patch/ROM information
+status              Summarize endpoint, product, curves, and provisioned identities
+exists/info/list    Inspect Secure Objects (`list --long` for details)
+read                Hex-dump or raw-export a policy-permitted Secure Object
 keygen/pubkey       Create development EC keys and read public keys
 tls-keygen           Create or validate a TLS client identity key
 tls-key-info          Show an Attestation-validated TLS identity
@@ -290,7 +313,8 @@ See [`docs/object-ranges.md`](docs/object-ranges.md).
 
 `src/se050_nim.nim` re-exports these functional areas:
 
-- transport/APDU/TLV, UID, random, Secure Object, and key management
+- direct-I2C endpoint resolution, transport/APDU/TLV, UID, random, Secure Object, and key management
+- GlobalPlatform IDENTIFY parsing and known SE050 OEF/product mapping
 - attestation certificate readout and ReadObject-with-Attestation
 - OpenSSL 3 SHA-256, ECDSA, and X.509 verification
 - embedded NXP trust store
