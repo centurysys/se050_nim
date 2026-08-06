@@ -698,6 +698,19 @@ proc printResolvedObjectRef(objectRef: ObjectRef) =
   if objectRef.source != "id":
     echo &"ref: {objectRef.source}"
 
+proc printHexDump(data: openArray[uint8]) =
+  ## Prints readable hexadecimal output without writing raw binary to a terminal.
+  const BytesPerLine = 16
+
+  var offset = 0
+  while offset < data.len:
+    let lineEnd = min(offset + BytesPerLine, data.len)
+    var line = offset.toHex(8)
+    for i in offset ..< lineEnd:
+      line.add &" {data[i].toHex(2)}"
+    echo line
+    offset = lineEnd
+
 # =============================================================================
 # Commands
 # =============================================================================
@@ -1563,6 +1576,73 @@ proc runInfo(
     stderr.writeLine &"ReadSize failed: {size.error.kind}: {size.error.message}"
     if size.error.sw != 0:
       stderr.writeLine &"SW=0x{size.error.sw.toHex(4)}"
+
+  result = 0
+
+proc runRead(
+    busText: string,
+    addressText: string,
+    debug: bool,
+    idText: string,
+    areaText: string,
+    indexText: string,
+    nameText: string,
+    outputPath: string
+): int =
+  ## Reads the policy-permitted value of one Secure Object.
+  ##
+  ## BinaryFile objects are read in bounded chunks using their reported size.
+  ## Other object types use the ordinary ReadObject path. Key-pair objects only
+  ## expose the public portion according to SE05x ReadObject semantics.
+  let objectRef = resolveObjectRef(idText, areaText, indexText, nameText)
+  let se = openAndRequestAtr(busText, addressText, debug)
+
+  let exists = se.objectExists(objectId = objectRef.objectId, selectFirst = true)
+  if not exists.ok:
+    printSe050Error("CheckObjectExists failed", exists.error)
+    return 1
+
+  if not exists.value:
+    stderr.writeLine &"read failed: {objectIdHex(objectRef.objectId)} does not exist"
+    return 1
+
+  let typ = se.readObjectType(objectId = objectRef.objectId, selectFirst = false)
+  if not typ.ok:
+    printSe050Error("ReadType failed", typ.error)
+    return 1
+
+  let objectData =
+    if typ.value.objectType == Se050TypeBinaryFile:
+      let size = se.readObjectSize(objectId = objectRef.objectId, selectFirst = false)
+      if not size.ok:
+        printSe050Error("ReadSize failed", size.error)
+        return 1
+
+      se.readBinaryObject(
+        objectId = objectRef.objectId,
+        objectSize = size.value,
+        selectFirst = false
+      )
+    else:
+      se.readSecureObject(objectId = objectRef.objectId, selectFirst = false)
+
+  if not objectData.ok:
+    printSe050Error("ReadObject failed", objectData.error)
+    return 1
+
+  if outputPath.strip().len > 0:
+    if not writeRawBytes(outputPath, objectData.value, "read"):
+      return 1
+
+    echo &"{objectIdHex(objectRef.objectId)}: raw object data written to {outputPath}"
+    echo &"type: {typeText(typ.value.objectType)}"
+    echo &"length: {objectData.value.len}"
+  else:
+    echo &"id: {objectIdHex(objectRef.objectId)}"
+    printResolvedObjectRef(objectRef)
+    echo &"type: {typeText(typ.value.objectType)}"
+    echo &"length: {objectData.value.len}"
+    printHexDump(objectData.value)
 
   result = 0
 
@@ -2520,6 +2600,28 @@ proc main(): int =
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
         quit(runInfo(opts.bus, opts.address, opts.debug, opts.id, opts.area, opts.index, opts.name))
+
+    command("read"):
+      help("Read the policy-permitted value of an SE050 Secure Object.")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
+      option("--id", default = some(""), help = "Secure Object ID in hex, e.g. 0xF0000013")
+      option("--area", default = some(""), help = "Object area: dev, customer, vendor, nxp, internal")
+      option("--index", default = some(""), help = "Area-relative object index, decimal or 0x-prefixed hex")
+      option("--name", default = some(""), help = "Known object name, currently: uid")
+      option("-o", "--out", default = some(""), help = "Write raw object bytes to this file instead of printing a hex dump")
+      flag("-d", "--debug", help = "Print T=1 over I2C frames")
+      run:
+        quit(runRead(
+          opts.bus,
+          opts.address,
+          opts.debug,
+          opts.id,
+          opts.area,
+          opts.index,
+          opts.name,
+          opts.out
+        ))
 
     command("list"):
       help("List visible SE050 Secure Object identifiers.")
