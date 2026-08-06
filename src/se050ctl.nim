@@ -1572,7 +1572,8 @@ proc runList(
     debug: bool,
     filterText: string,
     areaText: string,
-    annotate: bool
+    annotate: bool,
+    longFormat: bool
 ): int =
   let filter = parseHexByte(filterText)
   let areaFilter =
@@ -1599,10 +1600,53 @@ proc runList(
     if areaFilter.isSome and area != areaFilter.get():
       continue
 
-    if annotate:
-      echo &"{objectIdHex(objectId)}  {area.areaName()}  {knownObjectName(objectId)}"
+    if not longFormat:
+      if annotate:
+        echo &"{objectIdHex(objectId)}  {area.areaName()}  {knownObjectName(objectId)}"
+      else:
+        echo objectIdHex(objectId)
+      continue
+
+    let typ = se.readObjectType(objectId = objectId, selectFirst = false)
+
+    var objectTypeText: string
+    var persistenceText: string
+    var sizeText: string
+
+    if typ.ok:
+      objectTypeText =
+        &"0x{typ.value.objectType.toHex(2)}({objectTypeName(typ.value.objectType)})"
+      persistenceText =
+        if typ.value.transientIndicator.isSome:
+          transientIndicatorName(typ.value.transientIndicator.get())
+        else:
+          "n/a"
+
+      let size = se.readObjectSize(objectId = objectId, selectFirst = false)
+      if size.ok:
+        sizeText = $size.value
+      elif size.error.kind == seApduStatusError:
+        # Applet 7.2 requires ALLOW_READ for ReadSize. ReadIDList may still
+        # expose an object whose policy does not permit its details to be read.
+        sizeText = "-"
+      else:
+        printSe050Error(&"ReadSize failed for {objectIdHex(objectId)}", size.error)
+        return 1
+    elif typ.error.kind == seApduStatusError:
+      # Applet 7.2 also requires ALLOW_READ for ReadType. Keep --long useful
+      # for NXP/platform objects that are visible in ReadIDList but protected
+      # against property reads. Do not issue ReadSize after ReadType was denied.
+      objectTypeText = &"unavailable(SW=0x{typ.error.sw.toHex(4)})"
+      persistenceText = "n/a"
+      sizeText = "-"
     else:
-      echo objectIdHex(objectId)
+      printSe050Error(&"ReadType failed for {objectIdHex(objectId)}", typ.error)
+      return 1
+
+    if annotate:
+      echo &"{objectIdHex(objectId)}  {objectTypeText}  {persistenceText}  {sizeText}  {area.areaName()}  {knownObjectName(objectId)}"
+    else:
+      echo &"{objectIdHex(objectId)}  {objectTypeText}  {persistenceText}  {sizeText}"
 
   result = 0
 
@@ -2484,9 +2528,18 @@ proc main(): int =
       option("--filter", default = some("0xFF"), help = "SecureObjectType filter byte, default: 0xFF for all types")
       option("--area", default = some(""), help = "Only show IDs in an area: dev, customer, vendor, nxp, internal")
       flag("--annotate", help = "Print area and known-name columns")
+      flag("-l", "--long", help = "Also read object type, persistence, and size")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
-        quit(runList(opts.bus, opts.address, opts.debug, opts.filter, opts.area, opts.annotate))
+        quit(runList(
+          opts.bus,
+          opts.address,
+          opts.debug,
+          opts.filter,
+          opts.area,
+          opts.annotate,
+          opts.long
+        ))
 
     command("keygen"):
       help("Generate a development SE050 key pair. Only area dev is allowed by this CLI.")
