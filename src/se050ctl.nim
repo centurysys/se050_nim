@@ -1506,6 +1506,183 @@ proc runVersion(
 
   result = 0
 
+proc se050ErrorInline(e: Se050Error): string =
+  if e.sw != 0'u16:
+    result = &"{e.kind}: {e.message} (SW=0x{e.sw.toHex(4)})"
+  else:
+    result = &"{e.kind}: {e.message}"
+
+proc runStatus(
+    busText: string,
+    addressText: string,
+    debug: bool
+): int =
+  ## Shows a compact read-only health/status summary for one connected SE050.
+  ##
+  ## Core product/version reads are required. Optional diagnostic sections keep
+  ## going when possible so one protected or unavailable object does not hide
+  ## the rest of the device state. A partial diagnostic failure is reflected in
+  ## the final exit code.
+  let endpoint = resolveSe050I2cEndpoint(busText, addressText)
+  let se = openSe050(endpoint.bus, address = endpoint.address, debug = debug)
+
+  let atr = se.requestAtr()
+  if not atr.ok:
+    printSe050Error("ATR failed", atr.error)
+    return 1
+
+  echo &"endpoint: /dev/i2c-{endpoint.bus}:0x{endpoint.address.toHex(2)}"
+
+  # IDENTIFY is a Card Manager command and must run before selecting the IoT
+  # Applet for the remaining status queries.
+  let product = se.getProductInfo()
+  if not product.ok:
+    printSe050Error("GetDataIdentify failed", product.error)
+    return 1
+
+  let version = se.getVersionInfo(selectFirst = true)
+  if not version.ok:
+    printSe050Error("GetVersion failed", version.error)
+    return 1
+
+  let info = product.value
+  let v = version.value
+  echo &"product: {se050ProductName(info.oefId)} (OEF 0x{info.oefId.toHex(4)})"
+  echo &"applet: {v.major}.{v.minor}.{v.patch} (config 0x{v.appletConfig.toHex(4)})"
+
+  var hadDiagnosticError = false
+
+  let uid = se.readUidRaw(selectFirst = false)
+  if uid.ok:
+    echo &"UID: {bytesToHex(uid.value)}"
+  else:
+    echo &"UID: unavailable ({se050ErrorInline(uid.error)})"
+    hadDiagnosticError = true
+
+  echo "curves:"
+  let curves = se.readEcCurveList(selectFirst = false)
+  if curves.ok:
+    for curveId in [
+        Se050CurveNistP256,
+        Se050CurveNistP384,
+        Se050CurveNistP521
+    ]:
+      let state = curves.value.ecCurveSetState(curveId)
+      if state.ok:
+        let stateText =
+          if state.value == ecCurveSet:
+            "set"
+          else:
+            "not-set"
+        echo &"  {ecCurveName(curveId)}: {stateText}"
+      else:
+        echo &"  {ecCurveName(curveId)}: unavailable ({se050ErrorInline(state.error)})"
+        hadDiagnosticError = true
+  else:
+    echo &"  unavailable ({se050ErrorInline(curves.error)})"
+    hadDiagnosticError = true
+
+  echo "factory identities:"
+  for profile in factoryCloudIdentityProfiles():
+    if profile.kind == fciRsa2048 and
+        not v.hasFeature(ConfigRsaPlain) and
+        not v.hasFeature(ConfigRsaCrt):
+      echo &"  {profile.name}: unsupported by applet"
+      continue
+
+    let keyExists = se.objectExists(
+      objectId = profile.keyObjectId,
+      selectFirst = false
+    )
+    if not keyExists.ok:
+      echo &"  {profile.name}: unavailable ({se050ErrorInline(keyExists.error)})"
+      hadDiagnosticError = true
+      continue
+
+    let certificateExists = se.objectExists(
+      objectId = profile.certificateObjectId,
+      selectFirst = false
+    )
+    if not certificateExists.ok:
+      echo &"  {profile.name}: unavailable ({se050ErrorInline(certificateExists.error)})"
+      hadDiagnosticError = true
+      continue
+
+    let state =
+      if keyExists.value and certificateExists.value:
+        "ready"
+      elif not keyExists.value and not certificateExists.value:
+        "missing"
+      elif keyExists.value:
+        "partial (key only)"
+      else:
+        "partial (certificate only)"
+
+    echo &"  {profile.name}: {state}"
+
+  let attestationKey = se.objectExists(
+    objectId = Se050AttestationKeyObjectId,
+    selectFirst = false
+  )
+  let attestationCertificate = se.objectExists(
+    objectId = Se050AttestationCertificateObjectId,
+    selectFirst = false
+  )
+
+  if attestationKey.ok and attestationCertificate.ok:
+    let state =
+      if attestationKey.value and attestationCertificate.value:
+        "ready"
+      elif not attestationKey.value and not attestationCertificate.value:
+        "missing"
+      elif attestationKey.value:
+        "partial (key only)"
+      else:
+        "partial (certificate only)"
+    echo &"  attestation: {state}"
+  else:
+    if not attestationKey.ok:
+      echo &"  attestation: unavailable ({se050ErrorInline(attestationKey.error)})"
+    else:
+      echo &"  attestation: unavailable ({se050ErrorInline(attestationCertificate.error)})"
+    hadDiagnosticError = true
+
+  echo "managed TLS identities:"
+  let ids = se.listObjectIds(selectFirst = false)
+  if not ids.ok:
+    echo &"  unavailable ({se050ErrorInline(ids.error)})"
+    hadDiagnosticError = true
+  else:
+    var foundManagedIdentity = false
+    for objectId in ids.value:
+      let profileMatch = tlsIdentityProfileForObjectId(objectId)
+      if profileMatch.isNone:
+        continue
+
+      foundManagedIdentity = true
+      let profile = profileMatch.get()
+      let typ = se.readObjectType(objectId = objectId, selectFirst = false)
+      if typ.ok:
+        let persistence =
+          if typ.value.transientIndicator.isSome:
+            transientIndicatorName(typ.value.transientIndicator.get())
+          else:
+            "n/a"
+        echo &"  {profile.name} {profile.identity}/{profile.slot.slotName()} " &
+          &"{objectIdHex(objectId)}: {objectTypeName(typ.value.objectType)}, {persistence}"
+      elif typ.error.kind == seApduStatusError:
+        echo &"  {profile.name} {profile.identity}/{profile.slot.slotName()} " &
+          &"{objectIdHex(objectId)}: present, details unavailable (SW=0x{typ.error.sw.toHex(4)})"
+      else:
+        echo &"  {profile.name} {profile.identity}/{profile.slot.slotName()} " &
+          &"{objectIdHex(objectId)}: unavailable ({se050ErrorInline(typ.error)})"
+        hadDiagnosticError = true
+
+    if not foundManagedIdentity:
+      echo "  none"
+
+  result = if hadDiagnosticError: 1 else: 0
+
 proc runExists(
     busText: string,
     addressText: string,
@@ -2394,6 +2571,14 @@ proc main(): int =
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
         quit(runProductInfo(opts.bus, opts.address, opts.debug))
+
+    command("status"):
+      help("Show a compact read-only SE050 device and provisioning status summary.")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
+      flag("-d", "--debug", help = "Print T=1 over I2C frames")
+      run:
+        quit(runStatus(opts.bus, opts.address, opts.debug))
 
     command("factory-list"):
       help("Show known NXP factory-provisioned cloud and attestation objects.")
