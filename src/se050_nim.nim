@@ -9,6 +9,7 @@ import se050_nim/[
   objects,
   keys,
   management,
+  product_info,
   binary_encoding,
   crypto_verify,
   x509_verify,
@@ -28,6 +29,7 @@ export random
 export objects
 export keys
 export management
+export product_info
 export binary_encoding
 export crypto_verify
 export x509_verify

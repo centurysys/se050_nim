@@ -1413,6 +1413,58 @@ proc runCurveProvisionP384(
   echo "NIST P-384 curve provisioning: OK"
   result = 0
 
+proc fipsModeText(value: uint8): string =
+  result = case value
+  of 0x00'u8: "disabled"
+  of 0x01'u8: "enabled"
+  else: &"unknown (0x{value.toHex(2)})"
+
+proc runProductInfo(
+    busText: string,
+    addressText: string,
+    debug: bool
+): int =
+  let se = openAndRequestAtr(busText, addressText, debug)
+
+  # IDENTIFY is a Card Manager command. Run it before selecting the SE05x IoT
+  # Applet for GetVersion below.
+  let product = se.getProductInfo()
+  if not product.ok:
+    printSe050Error("GetDataIdentify failed", product.error)
+    return 1
+
+  let version = se.getVersionInfo(selectFirst = true)
+  if not version.ok:
+    printSe050Error("GetVersion failed", version.error)
+    return 1
+
+  let info = product.value
+  let v = version.value
+  let configurationIdText = bytesToHex(info.configurationId, " ")
+  let patchIdText = bytesToHex(info.patchId, " ")
+  let platformBuildIdText = bytesToHex(info.platformBuildId, " ")
+  let romIdText = bytesToHex(info.romId, " ")
+
+  echo &"product: {se050ProductName(info.oefId)}"
+  echo &"OEF ID: 0x{info.oefId.toHex(4)}"
+  echo &"configuration ID: {configurationIdText}"
+  echo &"applet version: {v.major}.{v.minor}.{v.patch}"
+  echo &"applet config: 0x{v.appletConfig.toHex(4)}"
+  echo &"patch ID: {patchIdText}"
+
+  let platformId = info.jcopPlatformId()
+  if platformId.len > 0:
+    echo &"JCOP platform ID: {platformId}"
+  else:
+    echo "JCOP platform ID: n/a"
+
+  echo &"platform build ID: {platformBuildIdText}"
+  echo &"FIPS mode: {fipsModeText(info.fipsMode)}"
+  echo &"pre-perso state: 0x{info.prePersoState.toHex(2)}"
+  echo &"ROM ID: {romIdText}"
+
+  result = 0
+
 proc runVersion(
     busText: string,
     addressText: string,
@@ -2210,6 +2262,14 @@ proc main(): int =
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
         quit(runVersion(opts.bus, opts.address, opts.debug))
+
+    command("product-info"):
+      help("Read SE05x product/variant and platform identification data.")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
+      flag("-d", "--debug", help = "Print T=1 over I2C frames")
+      run:
+        quit(runProductInfo(opts.bus, opts.address, opts.debug))
 
     command("factory-list"):
       help("Show known NXP factory-provisioned cloud and attestation objects.")
