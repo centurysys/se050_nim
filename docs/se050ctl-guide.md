@@ -6,8 +6,8 @@
 
 Included:
 
-- UID, random, and Applet version/config
-- Secure Object exists/info/list
+- UID, random, Applet version/config, and product/OEF/platform information
+- Secure Object exists/info/list, detailed inventory, and generic policy-permitted reads
 - development-range EC key creation and deletion
 - managed TLS identities by identity number + A/B slot (internal P-256 generation and external P-256/P-384 import)
 - EC curve-state/P-384 provisioning, TLS public/Reference Key export, and P-256 ECDH derive
@@ -15,6 +15,7 @@ Included:
 - raw ReadObject-with-Attestation capture
 - live attestation diagnostics with explicit CA files
 - kitting CSV and live-device verification with embedded NXP CAs
+- read-only endpoint/product/curve/factory/TLS identity status summary
 
 Excluded:
 
@@ -24,10 +25,25 @@ Excluded:
 - HKDF/AES-GCM envelope processing
 - firmware decryption and A/B updates
 
-## Common options
+## Endpoint selection and common options
+
+For normal use, set the same environment variable used by the NXP Provider so `-b 0` does not need to be repeated for every command.
+
+```sh
+export EX_SSS_BOOT_SSS_PORT=/dev/i2c-0:0x48
+se050ctl status
+```
+
+`se050ctl` and `se050-kitting-export` accept direct-I2C environment endpoints in `/dev/i2c-N[:0xADDR]` form. AccessManager `host:port` values such as `127.0.0.1:8040` are rejected because they are not direct-I2C endpoints.
+
+Resolution rules:
+
+1. With explicit `-b/--bus`, use that bus. Do not inherit the environment endpoint address; use `-a/--address` or default `0x48`.
+2. Without `-b/--bus`, get the bus from `EX_SSS_BOOT_SSS_PORT`. Address precedence is `-a/--address`, environment endpoint address, then default `0x48`.
+3. If neither CLI nor the environment supplies a bus, fail instead of guessing.
 
 ```text
--b, --bus       I2C bus number, e.g. 0 for /dev/i2c-0
+-b, --bus       I2C bus number; otherwise EX_SSS_BOOT_SSS_PORT
 -a, --address   SE050 I2C address, default: 0x48
 -d, --debug     Print T=1 over I2C frames
 ```
@@ -44,7 +60,7 @@ Use exactly one form:
 
 Areas are `vendor`, `customer`, `dev`, `nxp`, and `internal`.
 
-## Basic commands
+## Basic and diagnostic commands
 
 ```sh
 se050ctl uid -b 0
@@ -56,6 +72,50 @@ se050ctl list -b 0 --area dev --annotate
 ```
 
 Random length is 1..255 bytes. `exists --quiet` uses the exit status without printing.
+
+### `product-info`
+
+Read GlobalPlatform IDENTIFY data plus Applet information to identify the installed SE050 variant from the device itself.
+
+```sh
+se050ctl product-info
+```
+
+The output includes product name, OEF ID, Configuration ID, Applet version/config, Patch ID, JCOP Platform ID, Platform Build ID, FIPS mode, pre-perso state, and ROM ID. Known OEF IDs map to product names; unknown IDs remain `unknown` rather than being guessed. The tested Athena SE050E2 reports OEF `0xA921`.
+
+### `status`
+
+Show a consolidated read-only diagnostic view:
+
+```sh
+se050ctl status
+```
+
+The summary covers endpoint, product/OEF, Applet, UID, P-256/P-384/P-521 curve state, factory ECC/RSA identities, attestation identity, and currently present managed TLS identity slots. Algorithm families disabled by the Applet are reported as unsupported rather than merely missing.
+
+Non-essential diagnostics that are unavailable because of object policy are reported and the remaining checks continue; failure of basic device identification is fatal.
+
+### Detailed object listing
+
+The normal `list` command remains lightweight. Add `-l/--long` to query each listed Object for type, persistence, and size.
+
+```sh
+se050ctl list --long
+se050ctl list --long --annotate
+```
+
+An Object may appear in `ReadIDList` while refusing `ReadType` because of `ALLOW_READ` policy. Such entries are shown as `unavailable(SW=...)` and listing continues. Transport and protocol failures remain fatal.
+
+### `read`
+
+Read a Secure Object when its policy permits it. Without `--out`, data is shown as a 16-byte hex dump rather than raw binary on the terminal.
+
+```sh
+se050ctl read --id 0xF0000013
+se050ctl read --id 0xF0000013 --out /tmp/object.bin
+```
+
+With `--out`, raw bytes are written to the file. `BINARY_FILE` uses the existing chunked read path; other types use the normal ReadObject path. A policy-denied read is an error because the user explicitly selected that Object. No generic write command is provided.
 
 ## NXP factory-provisioned cloud identities
 

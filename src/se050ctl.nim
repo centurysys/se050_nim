@@ -86,27 +86,6 @@ type
 # Utility
 # =============================================================================
 
-proc parseBusNumber(s: string): int =
-  let v = parseInt(s.strip())
-  if v < 0:
-    raise newException(ValueError, &"I2C bus number must be >= 0: {s}")
-  result = v
-
-proc parseI2cAddress(s: string): uint8 =
-  ## Parses a 7-bit I2C address.
-  ##
-  ## The value is treated as hexadecimal to preserve the existing se050_uid
-  ## behavior. Both "48" and "0x48" mean 0x48.
-  var t = s.strip()
-  if t.startsWith("0x") or t.startsWith("0X"):
-    t = t[2 .. ^1]
-
-  let v = parseHexInt(t)
-  if v < 0 or v > 0x7F:
-    raise newException(ValueError, &"I2C address must be in 7-bit range: {s}")
-
-  result = uint8(v)
-
 proc parseLength(s: string, minValue: int, maxValue: int): int =
   let v = parseInt(s.strip())
   if v < minValue or v > maxValue:
@@ -719,15 +698,27 @@ proc printResolvedObjectRef(objectRef: ObjectRef) =
   if objectRef.source != "id":
     echo &"ref: {objectRef.source}"
 
+proc printHexDump(data: openArray[uint8]) =
+  ## Prints readable hexadecimal output without writing raw binary to a terminal.
+  const BytesPerLine = 16
+
+  var offset = 0
+  while offset < data.len:
+    let lineEnd = min(offset + BytesPerLine, data.len)
+    var line = offset.toHex(8)
+    for i in offset ..< lineEnd:
+      line.add &" {data[i].toHex(2)}"
+    echo line
+    offset = lineEnd
+
 # =============================================================================
 # Commands
 # =============================================================================
 
 proc openAndRequestAtr(busText: string, addressText: string, debug: bool): Se050Transport =
-  let bus = parseBusNumber(busText)
-  let address = parseI2cAddress(addressText)
+  let endpoint = resolveSe050I2cEndpoint(busText, addressText)
 
-  result = openSe050(bus, address = address, debug = debug)
+  result = openSe050(endpoint.bus, address = endpoint.address, debug = debug)
 
   let atr = result.requestAtr()
   if not atr.ok:
@@ -1435,6 +1426,58 @@ proc runCurveProvisionP384(
   echo "NIST P-384 curve provisioning: OK"
   result = 0
 
+proc fipsModeText(value: uint8): string =
+  result = case value
+  of 0x00'u8: "disabled"
+  of 0x01'u8: "enabled"
+  else: &"unknown (0x{value.toHex(2)})"
+
+proc runProductInfo(
+    busText: string,
+    addressText: string,
+    debug: bool
+): int =
+  let se = openAndRequestAtr(busText, addressText, debug)
+
+  # IDENTIFY is a Card Manager command. Run it before selecting the SE05x IoT
+  # Applet for GetVersion below.
+  let product = se.getProductInfo()
+  if not product.ok:
+    printSe050Error("GetDataIdentify failed", product.error)
+    return 1
+
+  let version = se.getVersionInfo(selectFirst = true)
+  if not version.ok:
+    printSe050Error("GetVersion failed", version.error)
+    return 1
+
+  let info = product.value
+  let v = version.value
+  let configurationIdText = bytesToHex(info.configurationId, " ")
+  let patchIdText = bytesToHex(info.patchId, " ")
+  let platformBuildIdText = bytesToHex(info.platformBuildId, " ")
+  let romIdText = bytesToHex(info.romId, " ")
+
+  echo &"product: {se050ProductName(info.oefId)}"
+  echo &"OEF ID: 0x{info.oefId.toHex(4)}"
+  echo &"configuration ID: {configurationIdText}"
+  echo &"applet version: {v.major}.{v.minor}.{v.patch}"
+  echo &"applet config: 0x{v.appletConfig.toHex(4)}"
+  echo &"patch ID: {patchIdText}"
+
+  let platformId = info.jcopPlatformId()
+  if platformId.len > 0:
+    echo &"JCOP platform ID: {platformId}"
+  else:
+    echo "JCOP platform ID: n/a"
+
+  echo &"platform build ID: {platformBuildIdText}"
+  echo &"FIPS mode: {fipsModeText(info.fipsMode)}"
+  echo &"pre-perso state: 0x{info.prePersoState.toHex(2)}"
+  echo &"ROM ID: {romIdText}"
+
+  result = 0
+
 proc runVersion(
     busText: string,
     addressText: string,
@@ -1462,6 +1505,183 @@ proc runVersion(
     echo "  SE050 may reject ECDHGenerateSharedSecret with SW=0x6985 on this applet configuration."
 
   result = 0
+
+proc se050ErrorInline(e: Se050Error): string =
+  if e.sw != 0'u16:
+    result = &"{e.kind}: {e.message} (SW=0x{e.sw.toHex(4)})"
+  else:
+    result = &"{e.kind}: {e.message}"
+
+proc runStatus(
+    busText: string,
+    addressText: string,
+    debug: bool
+): int =
+  ## Shows a compact read-only health/status summary for one connected SE050.
+  ##
+  ## Core product/version reads are required. Optional diagnostic sections keep
+  ## going when possible so one protected or unavailable object does not hide
+  ## the rest of the device state. A partial diagnostic failure is reflected in
+  ## the final exit code.
+  let endpoint = resolveSe050I2cEndpoint(busText, addressText)
+  let se = openSe050(endpoint.bus, address = endpoint.address, debug = debug)
+
+  let atr = se.requestAtr()
+  if not atr.ok:
+    printSe050Error("ATR failed", atr.error)
+    return 1
+
+  echo &"endpoint: /dev/i2c-{endpoint.bus}:0x{endpoint.address.toHex(2)}"
+
+  # IDENTIFY is a Card Manager command and must run before selecting the IoT
+  # Applet for the remaining status queries.
+  let product = se.getProductInfo()
+  if not product.ok:
+    printSe050Error("GetDataIdentify failed", product.error)
+    return 1
+
+  let version = se.getVersionInfo(selectFirst = true)
+  if not version.ok:
+    printSe050Error("GetVersion failed", version.error)
+    return 1
+
+  let info = product.value
+  let v = version.value
+  echo &"product: {se050ProductName(info.oefId)} (OEF 0x{info.oefId.toHex(4)})"
+  echo &"applet: {v.major}.{v.minor}.{v.patch} (config 0x{v.appletConfig.toHex(4)})"
+
+  var hadDiagnosticError = false
+
+  let uid = se.readUidRaw(selectFirst = false)
+  if uid.ok:
+    echo &"UID: {bytesToHex(uid.value)}"
+  else:
+    echo &"UID: unavailable ({se050ErrorInline(uid.error)})"
+    hadDiagnosticError = true
+
+  echo "curves:"
+  let curves = se.readEcCurveList(selectFirst = false)
+  if curves.ok:
+    for curveId in [
+        Se050CurveNistP256,
+        Se050CurveNistP384,
+        Se050CurveNistP521
+    ]:
+      let state = curves.value.ecCurveSetState(curveId)
+      if state.ok:
+        let stateText =
+          if state.value == ecCurveSet:
+            "set"
+          else:
+            "not-set"
+        echo &"  {ecCurveName(curveId)}: {stateText}"
+      else:
+        echo &"  {ecCurveName(curveId)}: unavailable ({se050ErrorInline(state.error)})"
+        hadDiagnosticError = true
+  else:
+    echo &"  unavailable ({se050ErrorInline(curves.error)})"
+    hadDiagnosticError = true
+
+  echo "factory identities:"
+  for profile in factoryCloudIdentityProfiles():
+    if profile.kind == fciRsa2048 and
+        not v.hasFeature(ConfigRsaPlain) and
+        not v.hasFeature(ConfigRsaCrt):
+      echo &"  {profile.name}: unsupported by applet"
+      continue
+
+    let keyExists = se.objectExists(
+      objectId = profile.keyObjectId,
+      selectFirst = false
+    )
+    if not keyExists.ok:
+      echo &"  {profile.name}: unavailable ({se050ErrorInline(keyExists.error)})"
+      hadDiagnosticError = true
+      continue
+
+    let certificateExists = se.objectExists(
+      objectId = profile.certificateObjectId,
+      selectFirst = false
+    )
+    if not certificateExists.ok:
+      echo &"  {profile.name}: unavailable ({se050ErrorInline(certificateExists.error)})"
+      hadDiagnosticError = true
+      continue
+
+    let state =
+      if keyExists.value and certificateExists.value:
+        "ready"
+      elif not keyExists.value and not certificateExists.value:
+        "missing"
+      elif keyExists.value:
+        "partial (key only)"
+      else:
+        "partial (certificate only)"
+
+    echo &"  {profile.name}: {state}"
+
+  let attestationKey = se.objectExists(
+    objectId = Se050AttestationKeyObjectId,
+    selectFirst = false
+  )
+  let attestationCertificate = se.objectExists(
+    objectId = Se050AttestationCertificateObjectId,
+    selectFirst = false
+  )
+
+  if attestationKey.ok and attestationCertificate.ok:
+    let state =
+      if attestationKey.value and attestationCertificate.value:
+        "ready"
+      elif not attestationKey.value and not attestationCertificate.value:
+        "missing"
+      elif attestationKey.value:
+        "partial (key only)"
+      else:
+        "partial (certificate only)"
+    echo &"  attestation: {state}"
+  else:
+    if not attestationKey.ok:
+      echo &"  attestation: unavailable ({se050ErrorInline(attestationKey.error)})"
+    else:
+      echo &"  attestation: unavailable ({se050ErrorInline(attestationCertificate.error)})"
+    hadDiagnosticError = true
+
+  echo "managed TLS identities:"
+  let ids = se.listObjectIds(selectFirst = false)
+  if not ids.ok:
+    echo &"  unavailable ({se050ErrorInline(ids.error)})"
+    hadDiagnosticError = true
+  else:
+    var foundManagedIdentity = false
+    for objectId in ids.value:
+      let profileMatch = tlsIdentityProfileForObjectId(objectId)
+      if profileMatch.isNone:
+        continue
+
+      foundManagedIdentity = true
+      let profile = profileMatch.get()
+      let typ = se.readObjectType(objectId = objectId, selectFirst = false)
+      if typ.ok:
+        let persistence =
+          if typ.value.transientIndicator.isSome:
+            transientIndicatorName(typ.value.transientIndicator.get())
+          else:
+            "n/a"
+        echo &"  {profile.name} {profile.identity}/{profile.slot.slotName()} " &
+          &"{objectIdHex(objectId)}: {objectTypeName(typ.value.objectType)}, {persistence}"
+      elif typ.error.kind == seApduStatusError:
+        echo &"  {profile.name} {profile.identity}/{profile.slot.slotName()} " &
+          &"{objectIdHex(objectId)}: present, details unavailable (SW=0x{typ.error.sw.toHex(4)})"
+      else:
+        echo &"  {profile.name} {profile.identity}/{profile.slot.slotName()} " &
+          &"{objectIdHex(objectId)}: unavailable ({se050ErrorInline(typ.error)})"
+        hadDiagnosticError = true
+
+    if not foundManagedIdentity:
+      echo "  none"
+
+  result = if hadDiagnosticError: 1 else: 0
 
 proc runExists(
     busText: string,
@@ -1536,13 +1756,81 @@ proc runInfo(
 
   result = 0
 
+proc runRead(
+    busText: string,
+    addressText: string,
+    debug: bool,
+    idText: string,
+    areaText: string,
+    indexText: string,
+    nameText: string,
+    outputPath: string
+): int =
+  ## Reads the policy-permitted value of one Secure Object.
+  ##
+  ## BinaryFile objects are read in bounded chunks using their reported size.
+  ## Other object types use the ordinary ReadObject path. Key-pair objects only
+  ## expose the public portion according to SE05x ReadObject semantics.
+  let objectRef = resolveObjectRef(idText, areaText, indexText, nameText)
+  let se = openAndRequestAtr(busText, addressText, debug)
+
+  let exists = se.objectExists(objectId = objectRef.objectId, selectFirst = true)
+  if not exists.ok:
+    printSe050Error("CheckObjectExists failed", exists.error)
+    return 1
+
+  if not exists.value:
+    stderr.writeLine &"read failed: {objectIdHex(objectRef.objectId)} does not exist"
+    return 1
+
+  let typ = se.readObjectType(objectId = objectRef.objectId, selectFirst = false)
+  if not typ.ok:
+    printSe050Error("ReadType failed", typ.error)
+    return 1
+
+  let objectData =
+    if typ.value.objectType == Se050TypeBinaryFile:
+      let size = se.readObjectSize(objectId = objectRef.objectId, selectFirst = false)
+      if not size.ok:
+        printSe050Error("ReadSize failed", size.error)
+        return 1
+
+      se.readBinaryObject(
+        objectId = objectRef.objectId,
+        objectSize = size.value,
+        selectFirst = false
+      )
+    else:
+      se.readSecureObject(objectId = objectRef.objectId, selectFirst = false)
+
+  if not objectData.ok:
+    printSe050Error("ReadObject failed", objectData.error)
+    return 1
+
+  if outputPath.strip().len > 0:
+    if not writeRawBytes(outputPath, objectData.value, "read"):
+      return 1
+
+    echo &"{objectIdHex(objectRef.objectId)}: raw object data written to {outputPath}"
+    echo &"type: {typeText(typ.value.objectType)}"
+    echo &"length: {objectData.value.len}"
+  else:
+    echo &"id: {objectIdHex(objectRef.objectId)}"
+    printResolvedObjectRef(objectRef)
+    echo &"type: {typeText(typ.value.objectType)}"
+    echo &"length: {objectData.value.len}"
+    printHexDump(objectData.value)
+
+  result = 0
+
 proc runList(
     busText: string,
     addressText: string,
     debug: bool,
     filterText: string,
     areaText: string,
-    annotate: bool
+    annotate: bool,
+    longFormat: bool
 ): int =
   let filter = parseHexByte(filterText)
   let areaFilter =
@@ -1569,10 +1857,53 @@ proc runList(
     if areaFilter.isSome and area != areaFilter.get():
       continue
 
-    if annotate:
-      echo &"{objectIdHex(objectId)}  {area.areaName()}  {knownObjectName(objectId)}"
+    if not longFormat:
+      if annotate:
+        echo &"{objectIdHex(objectId)}  {area.areaName()}  {knownObjectName(objectId)}"
+      else:
+        echo objectIdHex(objectId)
+      continue
+
+    let typ = se.readObjectType(objectId = objectId, selectFirst = false)
+
+    var objectTypeText: string
+    var persistenceText: string
+    var sizeText: string
+
+    if typ.ok:
+      objectTypeText =
+        &"0x{typ.value.objectType.toHex(2)}({objectTypeName(typ.value.objectType)})"
+      persistenceText =
+        if typ.value.transientIndicator.isSome:
+          transientIndicatorName(typ.value.transientIndicator.get())
+        else:
+          "n/a"
+
+      let size = se.readObjectSize(objectId = objectId, selectFirst = false)
+      if size.ok:
+        sizeText = $size.value
+      elif size.error.kind == seApduStatusError:
+        # Applet 7.2 requires ALLOW_READ for ReadSize. ReadIDList may still
+        # expose an object whose policy does not permit its details to be read.
+        sizeText = "-"
+      else:
+        printSe050Error(&"ReadSize failed for {objectIdHex(objectId)}", size.error)
+        return 1
+    elif typ.error.kind == seApduStatusError:
+      # Applet 7.2 also requires ALLOW_READ for ReadType. Keep --long useful
+      # for NXP/platform objects that are visible in ReadIDList but protected
+      # against property reads. Do not issue ReadSize after ReadType was denied.
+      objectTypeText = &"unavailable(SW=0x{typ.error.sw.toHex(4)})"
+      persistenceText = "n/a"
+      sizeText = "-"
     else:
-      echo objectIdHex(objectId)
+      printSe050Error(&"ReadType failed for {objectIdHex(objectId)}", typ.error)
+      return 1
+
+    if annotate:
+      echo &"{objectIdHex(objectId)}  {objectTypeText}  {persistenceText}  {sizeText}  {area.areaName()}  {knownObjectName(objectId)}"
+    else:
+      echo &"{objectIdHex(objectId)}  {objectTypeText}  {persistenceText}  {sizeText}"
 
   result = 0
 
@@ -2184,8 +2515,8 @@ proc main(): int =
 
     command("uid"):
       help("Read the SE050 unique ID object.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       flag("--colon", help = "Print UID as AA:BB:CC...")
       run:
@@ -2194,8 +2525,8 @@ proc main(): int =
 
     command("random"):
       help("Generate random bytes using SE050 GetRandom.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("-l", "--len", required = true, help = "Random byte length, 1..255")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       flag("--colon", help = "Print bytes as AA:BB:CC...")
@@ -2205,16 +2536,16 @@ proc main(): int =
 
     command("curve-list"):
       help("Read the currently instantiated SE05x Weierstrass EC curves.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
         quit(runCurveList(opts.bus, opts.address, opts.debug))
 
     command("curve-provision-p384"):
       help("Provision the fixed standard NIST P-384 curve parameters when currently not-set.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       flag("--yes", help = "Confirm modification of persistent global SE05x curve state")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
@@ -2227,16 +2558,32 @@ proc main(): int =
 
     command("version"):
       help("Read SE050 applet version and feature configuration.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
         quit(runVersion(opts.bus, opts.address, opts.debug))
 
+    command("product-info"):
+      help("Read SE05x product/variant and platform identification data.")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
+      flag("-d", "--debug", help = "Print T=1 over I2C frames")
+      run:
+        quit(runProductInfo(opts.bus, opts.address, opts.debug))
+
+    command("status"):
+      help("Show a compact read-only SE050 device and provisioning status summary.")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
+      flag("-d", "--debug", help = "Print T=1 over I2C frames")
+      run:
+        quit(runStatus(opts.bus, opts.address, opts.debug))
+
     command("factory-list"):
       help("Show known NXP factory-provisioned cloud and attestation objects.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
         quit(runFactoryList(opts.bus, opts.address, opts.debug))
@@ -2250,8 +2597,8 @@ proc main(): int =
 
     command("factory-cert"):
       help("Export an NXP factory-provisioned cloud identity certificate.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("--kind", default = some("ecc"), help = "Factory identity kind: ecc or rsa, default: ecc")
       option("--identity", default = some("0"), help = "Factory identity number: 0 or 1, default: 0")
       option("--format", default = some("pem"), help = "Output format: pem or der, default: pem")
@@ -2270,8 +2617,8 @@ proc main(): int =
 
     command("factory-pubkey"):
       help("Export the public key from an NXP factory cloud certificate.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("--kind", default = some("ecc"), help = "Factory identity kind: ecc or rsa, default: ecc")
       option("--identity", default = some("0"), help = "Factory identity number: 0 or 1, default: 0")
       option("--format", default = some("spki-der"), help = "Output format: spki-der or pem, default: spki-der")
@@ -2302,8 +2649,8 @@ proc main(): int =
 
     command("tls-key-ref-file"):
       help("Export an attestation-validated TLS identity as an NXP OpenSSL reference-key PEM.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("--profile", required = true, help = "TLS identity profile: test or production")
       option("--identity", default = some("0"), help = "TLS identity number, default: 0")
       option("--slot", required = true, help = "TLS identity slot: A or B")
@@ -2326,8 +2673,8 @@ proc main(): int =
 
     command("tls-key-pubkey"):
       help("Export an attestation-validated TLS identity public key.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("--profile", required = true, help = "TLS identity profile: test or production")
       option("--identity", default = some("0"), help = "TLS identity number, default: 0")
       option("--slot", required = true, help = "TLS identity slot: A or B")
@@ -2352,8 +2699,8 @@ proc main(): int =
 
     command("tls-key-import"):
       help("Import an external P-256 or P-384 private key into one empty SE050 TLS identity slot.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("--profile", required = true, help = "TLS identity profile: test or production")
       option("--identity", default = some("0"), help = "TLS identity number, default: 0")
       option("--slot", required = true, help = "TLS identity slot: A or B")
@@ -2376,8 +2723,8 @@ proc main(): int =
 
     command("tls-keygen"):
       help("Create or validate one fixed SE050 TLS client identity A/B key.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("--profile", required = true, help = "TLS identity profile: test or production")
       option("--identity", default = some("0"), help = "TLS identity number, default: 0")
       option("--slot", required = true, help = "TLS identity slot: A or B")
@@ -2394,8 +2741,8 @@ proc main(): int =
 
     command("tls-key-info"):
       help("Validate and show one fixed SE050 TLS client identity A/B key.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("--profile", required = true, help = "TLS identity profile: test or production")
       option("--identity", default = some("0"), help = "TLS identity number, default: 0")
       option("--slot", required = true, help = "TLS identity slot: A or B")
@@ -2416,8 +2763,8 @@ proc main(): int =
 
     command("exists"):
       help("Check whether an SE050 Secure Object identifier exists.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("--id", default = some(""), help = "Secure Object ID in hex, e.g. 0x30000100")
       option("--area", default = some(""), help = "Object area: dev, customer, vendor, nxp, internal")
       option("--index", default = some(""), help = "Area-relative object index, decimal or 0x-prefixed hex")
@@ -2429,8 +2776,8 @@ proc main(): int =
 
     command("info"):
       help("Read type and size information for an SE050 Secure Object identifier.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("--id", default = some(""), help = "Secure Object ID in hex, e.g. 0x30000100")
       option("--area", default = some(""), help = "Object area: dev, customer, vendor, nxp, internal")
       option("--index", default = some(""), help = "Area-relative object index, decimal or 0x-prefixed hex")
@@ -2439,21 +2786,52 @@ proc main(): int =
       run:
         quit(runInfo(opts.bus, opts.address, opts.debug, opts.id, opts.area, opts.index, opts.name))
 
+    command("read"):
+      help("Read the policy-permitted value of an SE050 Secure Object.")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
+      option("--id", default = some(""), help = "Secure Object ID in hex, e.g. 0xF0000013")
+      option("--area", default = some(""), help = "Object area: dev, customer, vendor, nxp, internal")
+      option("--index", default = some(""), help = "Area-relative object index, decimal or 0x-prefixed hex")
+      option("--name", default = some(""), help = "Known object name, currently: uid")
+      option("-o", "--out", default = some(""), help = "Write raw object bytes to this file instead of printing a hex dump")
+      flag("-d", "--debug", help = "Print T=1 over I2C frames")
+      run:
+        quit(runRead(
+          opts.bus,
+          opts.address,
+          opts.debug,
+          opts.id,
+          opts.area,
+          opts.index,
+          opts.name,
+          opts.out
+        ))
+
     command("list"):
       help("List visible SE050 Secure Object identifiers.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("--filter", default = some("0xFF"), help = "SecureObjectType filter byte, default: 0xFF for all types")
       option("--area", default = some(""), help = "Only show IDs in an area: dev, customer, vendor, nxp, internal")
       flag("--annotate", help = "Print area and known-name columns")
+      flag("-l", "--long", help = "Also read object type, persistence, and size")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
-        quit(runList(opts.bus, opts.address, opts.debug, opts.filter, opts.area, opts.annotate))
+        quit(runList(
+          opts.bus,
+          opts.address,
+          opts.debug,
+          opts.filter,
+          opts.area,
+          opts.annotate,
+          opts.long
+        ))
 
     command("keygen"):
       help("Generate a development SE050 key pair. Only area dev is allowed by this CLI.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("--id", default = some(""), help = "Development Secure Object ID in hex, e.g. 0x30000100")
       option("--area", default = some(""), help = "Object area. For keygen, only dev is allowed")
       option("--index", default = some(""), help = "Area-relative object index, decimal or 0x-prefixed hex")
@@ -2474,8 +2852,8 @@ proc main(): int =
 
     command("pubkey"):
       help("Read the public key from an SE050 EC key pair or EC public key object.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("--id", default = some(""), help = "Secure Object ID in hex, e.g. 0x30000100")
       option("--area", default = some(""), help = "Object area: dev, customer, vendor, nxp, internal")
       option("--index", default = some(""), help = "Area-relative object index, decimal or 0x-prefixed hex")
@@ -2499,8 +2877,8 @@ proc main(): int =
 
     command("attestation-cert"):
       help("Read the NXP-provisioned SE050 device attestation certificate.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("-o", "--out", required = true, help = "Write the DER certificate to this file")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
       run:
@@ -2513,8 +2891,8 @@ proc main(): int =
 
     command("attest-read"):
       help("Read an SE050 EC public key with NXP attestation and capture raw verification inputs.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("--id", default = some(""), help = "Secure Object ID in hex, e.g. 0x30000100")
       option("--area", default = some(""), help = "Object area: dev, customer, vendor, nxp, internal")
       option("--index", default = some(""), help = "Area-relative object index, decimal or 0x-prefixed hex")
@@ -2537,8 +2915,8 @@ proc main(): int =
 
     command("attest-verify"):
       help("Verify a configured kitting key, its NXP certificate chain, attestation signature, and signed object attributes.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("--id", default = some(""), help = "Secure Object ID in hex, e.g. 0x30000100")
       option("--area", default = some(""), help = "Object area: dev, customer, vendor, nxp, internal")
       option("--index", default = some(""), help = "Area-relative object index, decimal or 0x-prefixed hex")
@@ -2563,8 +2941,8 @@ proc main(): int =
 
     command("kitting-verify"):
       help("Verify this unit against an attested multi-device kitting CSV.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("--input", required = true, help = "Multi-device kitting CSV file")
       option("--profile", default = some("production"), help = "Kitting profile: production or test, default: production")
       flag("-d", "--debug", help = "Print T=1 over I2C frames")
@@ -2579,8 +2957,8 @@ proc main(): int =
 
     command("derive"):
       help("Derive an ECDH shared secret using an SE050 EC key pair and a peer public key file.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("--id", default = some(""), help = "Secure Object ID in hex, e.g. 0x30000100")
       option("--area", default = some(""), help = "Object area: dev, customer, vendor, nxp, internal")
       option("--index", default = some(""), help = "Area-relative object index, decimal or 0x-prefixed hex")
@@ -2606,8 +2984,8 @@ proc main(): int =
 
     command("delete"):
       help("Delete an SE050 Secure Object identifier. Destructive operation; reserved ranges are always guarded.")
-      option("-b", "--bus", required = true, help = "I2C bus number, e.g. 0 for /dev/i2c-0")
-      option("-a", "--address", default = some("0x48"), help = "SE050 I2C address in hex, default: 0x48")
+      option("-b", "--bus", default = some(""), help = "I2C bus number; otherwise use EX_SSS_BOOT_SSS_PORT")
+      option("-a", "--address", default = some(""), help = "SE050 I2C address in hex; default 0x48 or endpoint address from EX_SSS_BOOT_SSS_PORT")
       option("--id", default = some(""), help = "Secure Object ID in hex, e.g. 0x30000100")
       option("--area", default = some(""), help = "Object area: dev, customer, vendor, nxp, internal")
       option("--index", default = some(""), help = "Area-relative object index, decimal or 0x-prefixed hex")
